@@ -1,0 +1,1094 @@
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import OpenAI from 'openai';
+
+type Step = 'SERVICE' | 'DATE' | 'TIME' | 'CONFIRM';
+
+type SessionData = {
+  greeted?: boolean;
+  bookingActive?: boolean;
+  serviceId?: string;
+  serviceName?: string;
+  date?: string; // YYYY-MM-DD
+  time?: string; // HH:MM
+};
+
+@Injectable()
+export class BotService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  private openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
+
+  /**
+   * HER ZAMAN TwiML (XML) döndürür.
+   */
+  async handleVoice(params: {
+    tenantId: string;
+    callSid: string;
+    from: string;
+    input: string | null;
+    inputType: 'dtmf' | 'speech' | null;
+  }): Promise<string> {
+    const { tenantId, callSid, from, input, inputType } = params;
+
+    if (!tenantId) return this.twimlSay('tr-TR', 'tenantId eksik.');
+    if (!callSid) return this.twimlSay('tr-TR', 'CallSid eksik.');
+
+    // tenant doğrula
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { id: true },
+    });
+    if (!tenant) return this.twimlSay('tr-TR', 'Geçersiz tenant.');
+
+    // session
+    const session = await this.upsertCallSessionSafe(tenantId, callSid, from);
+    const data: SessionData = (session?.data ?? {}) as any;
+    const step: Step = (session?.step ?? 'SERVICE') as Step;
+
+    const raw = (input ?? '').trim();
+    const said = this.normalizeTR(raw);
+
+    // 0) İlk karşılama sadece 1 kere
+    if (!data.greeted) {
+      await this.updateSessionSafe(session, {
+        data: { ...(data || {}), greeted: true },
+      });
+
+      return this.twimlGather({
+        sayText:
+          'Merhaba, Ayşe Güzellik Merkezi’ne hoş geldiniz. Size nasıl yardımcı olabilirim?',
+        numDigits: 1,
+      });
+    }
+
+    // 1) Booking intent yakala (speech ile)
+    if (inputType === 'speech' && said && this.isBookingIntent(said)) {
+      const nextData: SessionData = { ...(data || {}), bookingActive: true };
+      await this.updateSessionSafe(session, { step: 'SERVICE', data: nextData });
+
+      return this.askServiceTwiml(tenantId);
+    }
+
+    // 2) Booking aktifse (step’e göre ilerle)
+    if (data.bookingActive) {
+      return await this.handleBookingFlow({
+        tenantId,
+        session,
+        step,
+        saidRaw: raw,
+        saidNorm: said,
+        inputType,
+      });
+    }
+
+    // 3) Booking değilse:
+    // - Speech: AI ile soru cevap
+    // - DTMF: “1 randevu / 2 fiyat” gibi basit menü
+    if (inputType === 'speech' && said) {
+      const answer = await this.answerWithAI_safe(tenantId, said);
+      return this.twimlGather({ sayText: answer, numDigits: 1 });
+    }
+
+    // DTMF fallback
+    const digits = (raw ?? '').trim();
+    if (!digits) {
+      return this.twimlGather({
+        sayText: 'Devam etmek için konuşabilir ya da 1 tuşlayarak randevu oluşturabilirsiniz.',
+        numDigits: 1,
+      });
+    }
+
+    if (digits === '1') {
+      const nextData: SessionData = { ...(data || {}), bookingActive: true };
+      await this.updateSessionSafe(session, { step: 'SERVICE', data: nextData });
+      return this.askServiceTwiml(tenantId);
+    }
+
+    return this.twimlGather({
+      sayText: 'Anlayamadım. Randevu için 1 tuşlayabilir ya da konuşabilirsiniz.',
+      numDigits: 1,
+    });
+  }
+
+  // -----------------------------
+  // BOOKING FLOW
+  // -----------------------------
+  private async handleBookingFlow(args: {
+    tenantId: string;
+    session: any;
+    step: Step;
+    saidRaw: string;
+    saidNorm: string;
+    inputType: 'dtmf' | 'speech' | null;
+  }): Promise<string> {
+    const { tenantId, session, step, saidRaw, saidNorm, inputType } = args;
+    const data: SessionData = (session?.data ?? {}) as any;
+
+    // Boş input
+    if (!saidNorm) {
+      return this.twimlGather({
+        sayText: 'Duyamadım. Lütfen tekrar eder misiniz?',
+        numDigits: 1,
+      });
+    }
+
+    // SERVICE
+    if (step === 'SERVICE') {
+      const services = await this.prisma.service.findMany({
+        where: { tenantId },
+        select: { id: true, name: true },
+      });
+
+      // Speech ile servis yakala
+      const picked = this.pickServiceFromText(services, saidNorm);
+
+      // DTMF ile seçim (1..n)
+      if (!picked && inputType === 'dtmf') {
+        const idx = parseInt((saidRaw || '').trim(), 10);
+        if (!Number.isNaN(idx) && idx >= 1 && idx <= services.length) {
+          const s = services[idx - 1];
+          await this.updateSessionSafe(session, {
+            step: 'DATE',
+            data: { ...(data || {}), serviceId: s.id, serviceName: s.name },
+          });
+          return this.twimlGather({
+            sayText: `${s.name} için hangi gün randevu istersiniz? Örnek: 20 Ocak ya da 20.01.`,
+            numDigits: 1,
+          });
+        }
+      }
+
+      if (!picked) {
+        // tekrar listele
+        if (!services.length) {
+          return this.twimlGather({
+            sayText: 'Şu an sistemde hizmet tanımı yok. İsterseniz tekrar deneyelim.',
+            numDigits: 1,
+          });
+        }
+        return this.listServicesTwiml(services);
+      }
+
+      await this.updateSessionSafe(session, {
+        step: 'DATE',
+        data: { ...(data || {}), serviceId: picked.id, serviceName: picked.name },
+      });
+
+      return this.twimlGather({
+        sayText: `${picked.name} için hangi gün randevu istersiniz? Örnek: 20 Ocak ya da 20.01.`,
+        numDigits: 1,
+      });
+    }
+
+    // DATE
+    if (step === 'DATE') {
+      const date = this.parseDateTR(saidNorm);
+      if (!date) {
+        return this.twimlGather({
+          sayText: 'Tarihi anlayamadım. Örnek: 20.01 ya da 20 Ocak şeklinde söyleyebilir misiniz?',
+          numDigits: 1,
+        });
+      }
+
+      await this.updateSessionSafe(session, {
+        step: 'TIME',
+        data: { ...(data || {}), date },
+      });
+
+      return this.TtwimlGather({
+        sayText: 'Harika. Saat kaç olsun? Örnek: 14:30 ya da 15.',
+        numDigits: 1,
+      });
+    }
+
+    // TIME
+    if (step === 'TIME') {
+      const time = this.parseTimeTR(saidNorm);
+      if (!time) {
+        return this.twimlGather({
+          sayText: 'Saati anlayamadım. Örnek: 14:30 ya da 15 şeklinde söyleyebilir misiniz?',
+          numDigits: 1,
+        });
+      }
+
+      await this.updateSessionSafe(session, {
+        step: 'CONFIRM',
+        data: { ...(data || {}), time },
+      });
+
+      const sName = data.serviceName || 'seçtiğiniz hizmet';
+      const d = (data.date || '').replace(/-/g, '.');
+      return this.twimlGather({
+        sayText: `${sName} için ${d} tarihinde saat ${time} uygun. Onaylıyor musunuz? Evet ya da hayır deyin.`,
+        numDigits: 1,
+      });
+    }
+
+    // CONFIRM
+    if (step === 'CONFIRM') {
+      const yes = this.isYesTR(saidNorm);
+      const no = this.isNoTR(saidNorm);
+
+      if (!yes && !no) {
+        return this.twimlGather({
+          sayText: 'Onay için “evet” ya da “hayır” diyebilir misiniz?',
+          numDigits: 1,
+        });
+      }
+
+      if (no) {
+        // yeniden saat iste
+        await this.updateSessionSafe(session, { step: 'TIME' });
+        return this.twimlGather({
+          sayText: 'Tamam. Yeni bir saat söyleyin lütfen. Örnek: 16:00',
+          numDigits: 1,
+        });
+      }
+
+      // yes => burada gerçek appointment create bağlayacaksın (şimdilik demo)
+      const sName = data.serviceName || 'hizmet';
+      const date = data.date || '';
+      const time = data.time || '';
+
+      // Booking bitti
+      await this.updateSessionSafe(session, {
+        step: 'SERVICE',
+        data: { greeted: true, bookingActive: false },
+      });
+
+      return this.twimlGather({
+        sayText: `Tamamdır, randevunuzu oluşturdum. ${sName}, ${date} ${time}. Başka nasıl yardımcı olabilirim?`,
+        numDigits: 1,
+      });
+    }
+
+    // fallback
+    await this.updateSessionSafe(session, { step: 'SERVICE' });
+    return this.askServiceTwiml(tenantId);
+  }
+
+  private async askServiceTwiml(tenantId: string): Promise<string> {
+    const services = await this.prisma.service.findMany({
+      where: { tenantId },
+      select: { id: true, name: true },
+    });
+
+    if (!services.length) {
+      return this.twimlGather({
+        sayText: 'Hangi hizmet için randevu istersiniz? Şu an sistemde hizmet tanımı yok gibi görünüyor.',
+        numDigits: 1,
+      });
+    }
+
+    return this.listServicesTwiml(services);
+  }
+
+  private listServicesTwiml(services: { id: string; name: string }[]): string {
+    const lines = services.slice(0, 9).map((s, i) => `${i + 1}. ${s.name}`).join('. ');
+    return this.twimlGather({
+      sayText: `Hangi hizmet için randevu istersiniz? Tuşlayarak seçebilirsiniz: ${lines}. Ya da hizmet adını söyleyin.`,
+      numDigits: 1,
+    });
+  }
+
+  // -----------------------------
+  // AI (Q&A)
+  // -----------------------------
+  private async answerWithAI_safe(tenantId: string, said: string): Promise<string> {
+    try {
+      const services = await this.prisma.service.findMany({
+        where: { tenantId },
+        select: { name: true },
+      });
+
+      const systemPrompt = `
+Sen Ayşe Güzellik Merkezi için çalışan profesyonel bir telefon asistanısın.
+Kısa, net, doğal cevap ver.
+
+Kurallar:
+- Türkçe konuş
+- En fazla 2 cümle
+- Satışçı gibi değil, yardımcı bir ton
+- Eğer kullanıcı randevu istiyorsa: "Randevu oluşturalım" de ve tek bir soru sor (ör: "Hangi hizmet?")
+- Eğer kullanıcı fiyat soruyorsa: net bilgi ver, net değilse 1 kısa soru sor
+- Booking aktif DEĞİLKEN en sonda 1 kez "İstersen randevu da oluşturabilirim." ekleyebilirsin
+
+Mevcut hizmetler:
+${services.map((s) => `- ${s.name}`).join('\n') || 'Tanımlı değil'}
+`.trim();
+
+      const completion = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.4,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: said },
+        ],
+      });
+
+      return completion.choices?.[0]?.message?.content?.trim() || 'Anlayamadım, tekrar eder misiniz?';
+    } catch {
+      return 'Şu an kısa bir teknik sorun var. İstersen tuşlayarak devam edebiliriz.';
+    }
+  }
+
+  // -----------------------------
+  // SESSION HELPERS
+  // -----------------------------
+  private async upsertCallSessionSafe(tenantId: string, callSid: string, from: string): Promise<any> {
+    try {
+      return await (this.prisma as any).callSession.upsert({
+        where: { tenantId_callSid: { tenantId, callSid } },
+        create: { tenantId, callSid, phone: from, step: 'SERVICE', data: {} },
+        update: { phone: from },
+      });
+    } catch {
+      try {
+        const existing = await (this.prisma as any).callSession.findFirst({
+          where: { tenantId, callSid },
+        });
+
+        if (existing?.id) {
+          return await (this.prisma as any).callSession.update({
+            where: { id: existing.id },
+            data: { phone: from },
+          });
+        }
+
+        return await (this.prisma as any).callSession.create({
+          data: { tenantId, callSid, phone: from, step: 'SERVICE', data: {} },
+        });
+      } catch {
+        return { id: 'no-session', tenantId, callSid, phone: from, step: 'SERVICE', data: {} };
+      }
+    }
+  }
+
+  private async updateSessionSafe(session: any, patch: { step?: Step; data?: SessionData }) {
+    if (!session?.id || session.id === 'no-session') return;
+    try {
+      await (this.prisma as any).callSession.update({
+        where: { id: session.id },
+        data: {
+          ...(patch.step ? { step: patch.step } : {}),
+          ...(patch.data ? { data: patch.data } : {}),
+        },
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  // -----------------------------
+  // INTENT + PARSE HELPERS
+  // -----------------------------
+  private normalizeTR(s: string) {
+    return (s || '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private isBookingIntent(s: string) {
+    const t = this.normalizeTR(s);
+    return (
+      t.includes('randevu') ||
+      t.includes('rezerv') ||
+      t.includes('ayarla') ||
+      t.includes('oluştur') ||
+      t.includes('almak istiyorum')
+    );
+  }
+
+  private isYesTR(s: string) {
+    const t = this.normalizeTR(s);
+    return t === 'evet' || t.includes('evet') || t.includes('onay');
+  }
+
+  private isNoTR(s: string) {
+    const t = this.normalizeTR(s);
+    return t === 'hayır' || t.includes('hayir') || t.includes('istemiyorum') || t.includes('iptal');
+  }
+
+  private pickServiceFromText(services: { id: string; name: string }[], saidNorm: string) {
+    const t = this.normalizeTR(saidNorm);
+    // en uzun eşleşeni seç (lazer epilasyon vs)
+    let best: { id: string; name: string } | null = null;
+    for (const s of services) {
+      const n = this.normalizeTR(s.name);
+      if (n && t.includes(n)) {
+        if (!best || n.length > this.normalizeTR(best.name).length) best = s;
+      }
+    }
+    return best;
+  }
+
+  private parseDateTR(s: string): string | null {
+    const t = this.normalizeTR(s);
+
+    // 20.01 / 20/01 / 20-01
+    const m1 = t.match(/\b(\d{1,2})[.\-\/](\d{1,2})(?:[.\-\/](\d{2,4}))?\b/);
+    if (m1) {
+      const dd = String(m1[1]).padStart(2, '0');
+      const mm = String(m1[2]).padStart(2, '0');
+      let yyyy = m1[3] ? String(m1[3]) : '';
+      if (!yyyy) {
+        // yıl yoksa bu yıl
+        yyyy = String(new Date().getFullYear());
+      } else if (yyyy.length === 2) {
+        yyyy = '20' + yyyy;
+      }
+      return `${yyyy}-${mm}-${dd}`;
+    }
+
+    // "20 ocak"
+    const months: Record<string, string> = {
+      ocak: '01',
+      şubat: '02',
+      subat: '02',
+      mart: '03',
+      nisan: '04',
+      mayıs: '05',
+      mayis: '05',
+      haziran: '06',
+      temmuz: '07',
+      ağustos: '08',
+      agustos: '08',
+      eylül: '09',
+      eylul: '09',
+      ekim: '10',
+      kasım: '11',
+      kasim: '11',
+      aralık: '12',
+      aralik: '12',
+    };
+
+    const m2 = t.match(/\b(\d{1,2})\s+(ocak|şubat|subat|mart|nisan|mayıs|mayis|haziran|temmuz|ağustos|agustos|eylül|eylul|ekim|kasım|kasim|aralık|aralik)\b/);
+    if (m2) {
+      const dd = String(m2[1]).padStart(2, '0');
+      const mm = months[m2[2]];
+      const yyyy = String(new Date().getFullYear());
+      return `${yyyy}-${mm}-${dd}`;
+    }
+
+    return null;
+  }
+
+  private parseTimeTR(s: string): string | null {
+    const t = this.normalizeTR(s);
+
+    // 14:30
+    const m1 = t.match(/\b(\d{1,2})[:.](\d{2})\b/);
+    if (m1) {
+      const hh = String(m1[1]).padStart(2, '0');
+      const mm = String(m1[2]).padStart(2, '0');
+      return `${hh}:${mm}`;
+    }
+
+    // "15" -> 15:00
+    const m2 = t.match(/\b(\d{1,2})\b/);
+    if (m2) {
+      const hh = String(m2[1]).padStart(2, '0');
+      return `${hh}:00`;
+    }
+
+    return null;
+  }
+
+// =====================
+// TwiML helpers (SAFE)
+// =====================
+
+private twimlGather(opts: {
+  lang?: string;          // default tr-TR
+  sayText: string;        // required
+  numDigits?: number;     // default 1
+  actionUrl?: string;     // optional (absolute URL önerilir)
+}) {
+  const lang = opts.lang ?? 'tr-TR';
+  const safeText = this.escapeForSsmlText(opts.sayText);
+  const numDigits = opts.numDigits ?? 1;
+
+  // Twilio schema warning almamak için Gather içinde language KULLANMIYORUZ.
+  // language sadece Say içinde kalıyor.
+  const actionAttr = opts.actionUrl ? ` action="${this.escapeXml(opts.actionUrl)}"` : '';
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech dtmf"
+          speechTimeout="auto"
+          numDigits="${numDigits}"
+          timeout="6"
+          method="POST"${actionAttr}>
+    <Say voice="Polly.Ayse" language="${this.escapeXml(lang)}">
+      <speak>${safeText}<break time="250ms"/></speak>
+    </Say>
+  </Gather>
+  <Say voice="Polly.Ayse" language="${this.escapeXml(lang)}">Yanıt alamadım. Hoşça kal.</Say>
+</Response>`;
+}
+
+/**
+ * Uyumlu kullanım:
+ * 1) this.twimlSay('tr-TR', 'text')
+ * 2) this.twimlSay({ lang: 'tr-TR', sayText: 'text' })
+ */
+private twimlSay(arg1: any, arg2?: any) {
+  // object form
+  if (arg1 && typeof arg1 === 'object') {
+    const lang = arg1.lang ?? 'tr-TR';
+    const safeText = this.escapeForSsmlText(String(arg1.sayText ?? ''));
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Ayse" language="${this.escapeXml(lang)}">
+    <speak>${safeText}<break time="250ms"/></speak>
+  </Say>
+</Response>`;
+  }
+
+  // (lang, text) form
+  const lang = String(arg1 ?? 'tr-TR');
+  const text = String(arg2 ?? '');
+  const safeText = this.escapeForSsmlText(text);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Ayse" language="${this.escapeXml(lang)}">
+    <speak>${safeText}<break time="250ms"/></speak>
+  </Say>
+</Response>`;
+}
+
+/**
+ * Twilio <Say> / SSML içine girecek metin:
+ * - kontrol karakter temizliği
+ * - whitespace normalize
+ * - aşırı uzun metni kısalt
+ */
+private sanitizeForTwilioText(input: string) {
+  if (!input) return '';
+  let s = String(input);
+
+  // kontrol karakterleri temizle
+  s = s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ');
+
+  // whitespace normalize
+  s = s.replace(/\s+/g, ' ').trim();
+
+  // güvenli limit
+  if (s.length > 900) s = s.slice(0, 900);
+
+  return s;
+}
+
+private escapeForSsmlText(input: string) {
+  const s = this.sanitizeForTwilioText(input);
+  return this.escapeXml(s);
+}
+
+private escapeXml(str: string) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# /etc/systemd/system/beauty-api.service
+[Unit]
+Description=Beauty SaaS NestJS API
+After=network.target
+
+[Service]
+Type=simple
+User=dev
+WorkingDirectory=/home/dev/beauty-saas/apps/api/api
+Environment=NODE_ENV=production
+Environment=PORT=3001
+Environment=PATH=/home/dev/.nvm/versions/node/v20.20.0/bin:/usr/local/sbin:/usr/local/bin:/>
+ExecStart=/home/dev/.nvm/versions/node/v20.20.0/bin/node dist/src/main.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# /etc/systemd/system/beauty-api.service
+[Unit]
+Description=Beauty SaaS NestJS API
+After=network.target
+
+[Service]
+Type=simple
+User=dev
+WorkingDirectory=/home/dev/beauty-saas/apps/api/api
+Environment=NODE_ENV=production
+Environment=PORT=3001
+Environment=PATH=/home/dev/.nvm/versions/node/v20.20.0/bin:/usr/local/sbin:/usr/local/bin:/>
+ExecStart=/home/dev/.nvm/versions/node/v20.20.0/bin/node dist/src/main.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ grep -n "CDATA" -n src/bot/bot.service.ts | head
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ cd ~/beauty-saas/apps/api/api
+npm run build
+sudo systemctl restart beauty-api
+
+> api@0.0.1 build
+> nest build
+
+src/bot/bot.service.ts:60:19 - error TS2554: Expected 2-4 arguments, but got 1.
+
+60       return this.twimlGather({
+                     ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:92:19 - error TS2554: Expected 2-4 arguments, but got 1.
+
+92       return this.twimlGather({ sayText: answer, numDigits: 1 });
+                     ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:98:19 - error TS2554: Expected 2-4 arguments, but got 1.
+
+98       return this.twimlGather({
+                     ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:110:17 - error TS2554: Expected 2-4 arguments, but got 1.
+
+110     return this.twimlGather({
+                    ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:132:19 - error TS2554: Expected 2-4 arguments, but got 1.
+
+132       return this.twimlGather({
+                      ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:157:23 - error TS2554: Expected 2-4 arguments, but got 1.
+
+157           return this.twimlGather({
+                          ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:167:23 - error TS2554: Expected 2-4 arguments, but got 1.
+
+167           return this.twimlGather({
+                          ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:180:19 - error TS2554: Expected 2-4 arguments, but got 1.
+
+180       return this.twimlGather({
+                      ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:190:21 - error TS2554: Expected 2-4 arguments, but got 1.
+
+190         return this.twimlGather({
+                        ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:201:19 - error TS2554: Expected 2-4 arguments, but got 1.
+
+201       return this.twimlGather({
+                      ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:211:21 - error TS2554: Expected 2-4 arguments, but got 1.
+
+211         return this.twimlGather({
+                        ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:224:19 - error TS2554: Expected 2-4 arguments, but got 1.
+
+224       return this.twimlGather({
+                      ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:236:21 - error TS2554: Expected 2-4 arguments, but got 1.
+
+236         return this.twimlGather({
+                        ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:245:21 - error TS2554: Expected 2-4 arguments, but got 1.
+
+245         return this.twimlGather({
+                        ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:262:19 - error TS2554: Expected 2-4 arguments, but got 1.
+
+262       return this.twimlGather({
+                      ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:280:19 - error TS2554: Expected 2-4 arguments, but got 1.
+
+280       return this.twimlGather({
+                      ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:291:17 - error TS2554: Expected 2-4 arguments, but got 1.
+
+291     return this.twimlGather({
+                    ~~~~~~~~~~~
+
+  src/bot/bot.service.ts:503:35
+    503 private twimlGather(lang: string, text: string, numDigits?: number, actionUrl?: string) {
+                                          ~~~~~~~~~~~~
+    An argument for 'text' was not provided.
+src/bot/bot.service.ts:580:1 - error TS1005: '}' expected.
+
+580 
+    
+
+Found 18 error(s).
+
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ ^C
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ grep -n "CDATA" -n src/bot/bot.service.ts | head
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ nano src/bot/bot.service.ts
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ npm run build
+sudo systemctl restart beauty-api
+
+> api@0.0.1 build
+> nest build
+
+src/bot/bot.service.ts:36:50 - error TS2554: Expected 1 arguments, but got 2.
+
+36     if (!tenantId) return this.twimlSay('tr-TR', 'tenantId eksik.');
+                                                    ~~~~~~~~~~~~~~~~~
+src/bot/bot.service.ts:37:49 - error TS2554: Expected 1 arguments, but got 2.
+
+37     if (!callSid) return this.twimlSay('tr-TR', 'CallSid eksik.');
+                                                   ~~~~~~~~~~~~~~~~
+src/bot/bot.service.ts:44:48 - error TS2554: Expected 1 arguments, but got 2.
+
+44     if (!tenant) return this.twimlSay('tr-TR', 'Geçersiz tenant.');
+                                                  ~~~~~~~~~~~~~~~~~~
+src/bot/bot.service.ts:582:1 - error TS1005: '}' expected.
+
+582 
+    
+
+Found 4 error(s).
+
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ nano src/bot/bot.service.ts
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ tail -n 30 src/bot/bot.service.ts
+
+private sanitizeForTwilioText(input: string) {
+  if (!input) return '';
+  let s = String(input);
+
+  // control chars temizle
+  s = s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ');
+
+  // whitespace normalize
+  s = s.replace(/\s+/g, ' ').trim();
+
+  // çok uzunsa kısalt
+  if (s.length > 900) s = s.slice(0, 900);
+
+  return s;
+}
+
+private escapeForSsmlText(input: string) {
+  const s = this.sanitizeForTwilioText(input);
+  return this.escapeXml(s);
+}
+
+private escapeXml(str: string) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ npm run build
+sudo systemctl restart beauty-api
+
+> api@0.0.1 build
+> nest build
+
+src/bot/bot.service.ts:588:1 - error TS1005: '}' expected.
+
+588 
+    
+
+Found 1 error(s).
+
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ nano src/bot/bot.service.ts
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ }
+-bash: syntax error near unexpected token `}'
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ npm run build
+sudo systemctl restart beauty-api
+
+> api@0.0.1 build
+> nest build
+
+dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ curl -i -X POST "https://bot.sibelizmimarlik.com/bot/voice?tenantId=cmkeas8p500056hpg59gmkquc" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data "CallSid=TEST123&From=%2B905000000000"
+HTTP/2 200 
+date: Fri, 16 Jan 2026 08:24:49 GMT
+content-type: text/xml; charset=utf-8
+content-length: 452
+etag: W/"1c4-RxQN7nMHHhcfiqA/+y92gC+BbD4"
+x-powered-by: Express
+cf-cache-status: DYNAMIC
+nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=9gM4r4TAL6cpcrlCC9Kn9Jc15zY0DgQRmeunu7QLniYLmucdIa8%2FxFxyltFua%2Fj3rIm279nf2Yv9EiEbSrtVA0io%2FgnX%2B%2FlcfGpAwyv%2BJtg7dZHwzDmvZ%2FjnhKVplOqZNrPo"}]}
+server: cloudflare
+cf-ray: 9bec37fffed9194d-FRA
+alt-svc: h3=":443"; ma=86400
+
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech dtmf"
+          speechTimeout="auto"
+          numDigits="1"
+          timeout="6"
+          method="POST"
+          language="tr-TR">
+    <Say voice="Polly.Ayse" language="tr-TR">
+      <speak>Duyamadım. Lütfen tekrar eder misiniz?<break time="250ms"/></speak>
+    </Say>
+  </Gather>
+  <Say voice="Polly.Ayse" language="tr-TR">Yanıt alamadım. Hoşça kal.</Say>
+</Response>dev@ubuntu-8gb-nbg1-1:~/beauty-saas/apps/api/api$ sudo systemctl restart beauty-apilizmimarlik.com/bot/voice?tenantId=cmkeas8p50005nano src/bot/bot.service.ts
+
+
+  GNU nano 7.2                       src/bot/bot.service.ts *                               
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Ayse" language="${this.escapeXml(lang)}">
+    <speak>${safeText}<break time="250ms"/></speak>
+  </Say>
+</Response>`;
+}
+
+private sanitizeForTwilioText(input: string) {
+  if (!input) return '';
+  let s = String(input);
+
+  // control chars temizle
+  s = s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ');
+
+  // whitespace normalize
+  s = s.replace(/\s+/g, ' ').trim();
+
+  // çok uzunsa kısalt
+  if (s.length > 900) s = s.slice(0, 900);
+
+  return s;
+}
+
+private escapeForSsmlText(input: string) {
+  const s = this.sanitizeForTwilioText(input);
+  return this.escapeXml(s);
+}
+
+private escapeXml(str: string) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+}
+

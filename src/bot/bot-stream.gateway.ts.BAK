@@ -1,0 +1,30 @@
+import { Logger } from '@nestjs/common';
+import {
+  WebSocketGateway,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+} from '@nestjs/websockets';
+import type { IncomingMessage } from 'http';
+import type WebSocket from 'ws';
+import { RealtimeBridgeService } from './realtime-bridge.service';
+
+@WebSocketGateway({ path: '/bot/stream' })
+export class BotStreamGateway implements OnGatewayConnection, OnGatewayDisconnect {
+  private readonly logger = new Logger(BotStreamGateway.name);
+
+  constructor(private readonly bridge: RealtimeBridgeService) {}
+
+  handleConnection(client: WebSocket, request: IncomingMessage) {
+    const url = new URL(request.url || '/', 'http://localhost');
+    const tenantId = (url.searchParams.get('tenantId') || '').trim();
+
+    this.logger.log(`WS CONNECT path=/bot/stream tenantId=${tenantId || '-'}`);
+
+    // client zaten WebSocket; request zaten IncomingMessage
+    this.bridge.attachTwilioSocket(client, request, tenantId);
+  }
+
+  handleDisconnect() {
+    this.logger.log('WS DISCONNECT path=/bot/stream');
+  }
+}
