@@ -106,8 +106,6 @@ class VoiceBridgeSession {
   private lastBargeInAt = 0;
   private lastSpeechStoppedAt = 0;
 
-  private autoFilledName = false;
-
   private playbackToken = 0;
   private playbackTimer: NodeJS.Timeout | null = null;
   private currentTtsAbort: AbortController | null = null;
@@ -306,9 +304,12 @@ class VoiceBridgeSession {
 
         if (!this.greeted) {
           this.greeted = true;
-          await this.speakReply(
-            'Merhaba, ben işletmenin sesli asistanıyım. Size nasıl yardımcı olabilirim?',
+          const openingGreeting =
+            'Merhaba, ben işletmenin sesli asistanıyım. Size nasıl yardımcı olabilirim?';
+          this.parentLogger.log(
+            `[voice] opening_greeting callId=${this.meta.callId} text="${openingGreeting}"`,
           );
+          await this.speakReply(openingGreeting);
         }
         return;
 
@@ -379,14 +380,6 @@ class VoiceBridgeSession {
 
         const reply = await this.callAgentBrain(transcript);
         if (!reply) return;
-
-        if (isNamePrompt(reply)) {
-          const bypassReply = await this.handleNameBypass();
-          if (bypassReply) {
-            await this.speakReply(bypassReply);
-            return;
-          }
-        }
 
         await this.speakReply(reply);
         return;
@@ -520,27 +513,6 @@ class VoiceBridgeSession {
 
     this.assistantSpeaking = false;
     this.activeResponse = false;
-  }
-
-  private async handleNameBypass(): Promise<string> {
-    if (this.autoFilledName) {
-      return 'İsminizi telefonda almadan devam edelim. Uygun gün ve saati söyler misiniz?';
-    }
-
-    this.autoFilledName = true;
-
-    this.parentLogger.warn(
-      `[voice] auto name bypass callId=${this.meta.callId}`,
-    );
-
-    const syntheticName = 'Adım Telefon Müşterisi';
-    const reply = await this.callAgentBrain(syntheticName);
-
-    if (reply && !isNamePrompt(reply)) {
-      return reply;
-    }
-
-    return 'Tamam, isim almadan devam edelim. Uygun gün ve saati söyler misiniz?';
   }
 
   private async callAgentBrain(userText: string): Promise<string> {
@@ -828,21 +800,6 @@ function extractReplyText(result: any): string {
   return '';
 }
 
-function isNamePrompt(text: string) {
-  const lower = String(text || '').toLocaleLowerCase('tr-TR');
-
-  return (
-    lower.includes('adın ne') ||
-    lower.includes('adiniz ne') ||
-    lower.includes('adınız ne') ||
-    lower.includes('adın ve soyadın nedir') ||
-    lower.includes('adınız ve soyadınız nedir') ||
-    lower.includes('ismin nedir') ||
-    lower.includes('isminiz nedir') ||
-    lower.includes('soyad')
-  );
-}
-
 function normalizeTranscriptForAgent(
   raw: string,
   lastBotReplyText: string,
@@ -1033,13 +990,6 @@ function rewriteAgentReplyForVoice(replyText: string) {
   text = text.replace(/\(E\/H\)/gi, '');
   text = text.replace(/\bE\/H\b/gi, '');
 
-  if (
-    lower.includes('en son') &&
-    lower.includes('randevu ayarlayayım mı')
-  ) {
-    return 'En son lazer işleminiz vardı. Yine lazer için devam edelim mi?';
-  }
-
   if (lower.startsWith('randevu özeti:')) {
     return 'Randevu bilgileri doğruysa onaylıyor musunuz?';
   }
@@ -1082,14 +1032,6 @@ function rewriteAgentReplyForVoice(replyText: string) {
     return 'Randevu oluşturulamadı. Başka bir saat deneyelim.';
   }
 
-  if (
-    lower.includes('adın ne') ||
-    lower.includes('adınız ve soyadınız') ||
-    lower.includes('isminizi alabilir miyim')
-  ) {
-    return 'İsim almadan devam edelim. Gün ve saat söyleyebilirsiniz.';
-  }
-
   text = text
     .replace(/[•]/g, ' ')
     .replace(/[()]/g, ' ')
@@ -1105,8 +1047,6 @@ function shortenReplyForPhone(text: string) {
     .replace(/\s+/g, ' ')
     .trim();
   if (!out) return out;
-
-  out = out.replace(/nas[ıi]l yard[ıi]mc[ıi] olabilirim\??/gi, '').trim();
 
   const numberedItems = [...out.matchAll(/\b\d\)\s*[^\n]+/g)];
   if (numberedItems.length > 2) {
