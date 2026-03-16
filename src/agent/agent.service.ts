@@ -307,11 +307,12 @@ private humanizeConfirmNeedEH(seed?: string) {
   // =========================
   // MAIN
   // =========================
-  async replyText(opts: { tenantId: string; from: string; text: string }): Promise<string> {
+  async replyText(opts: { tenantId: string; from: string; text: string; channel?: string; source?: string }): Promise<string> {
     const { tenantId, from } = opts;
     const raw = (opts.text ?? '').trim();
     const msg = normalizeTr(raw);
 
+    const isVoice = String(opts.channel || opts.source || '').toLowerCase() === 'voice';
     const key = `${tenantId}:${from}`;
     const session = this.getOrInitSession(key, tenantId, from);
 
@@ -474,9 +475,18 @@ private humanizeConfirmNeedEH(seed?: string) {
         return this.safeReply(session, 'Merhaba, hoş geldiniz. Nasıl yardımcı olayım?');
       }
 
-      this.extractSlotsFromMessage({ session, raw, services, staff });
+      this.extractSlotsFromMessage({ session, raw, services, staff, isVoice });
 
-      const learned = await this.safeGetLearnedCustomerContext(tenantId, from, services);
+      const learned = isVoice
+        ? { name: null, summary: '' }
+        : await this.safeGetLearnedCustomerContext(tenantId, from, services);
+
+      if (isVoice) {
+        this.logAction('voice_previous_service_suggestion_bypassed', {
+          tenantId,
+          phone: from,
+        });
+      }
 
       if (learned?.name && !session.draft.customerName) {
         session.draft.customerName = String(learned.name);
@@ -493,6 +503,7 @@ private humanizeConfirmNeedEH(seed?: string) {
           raw,
           services,
           staff,
+          isVoice,
         });
         this.saveSession(key, session);
         return this.safeReply(session, reply);
@@ -905,8 +916,9 @@ if (mPick && (parsedInline?.hasTime || onlyTimeInline)) {
     raw: string;
     services: any[];
     staff: any[];
+    isVoice: boolean;
   }): Promise<string> {
-    const { key, session, tenantId, from, msg, raw, services, staff } = opts;
+    const { key, session, tenantId, from, msg, raw, services, staff, isVoice } = opts;
 
 // ✅ Booking/edit akışındayken kullanıcı bilgi sorarsa akıştan çık (ama draft kalsın)
 if (!session.editMode && session.state !== WaState.IDLE) {
@@ -1273,7 +1285,7 @@ if (wantsTimeInline || parsed2?.hasTime) {
       session.pendingDateOnly = parsedEarly.dateOnly;
     }
 
-    this.extractSlotsFromMessage({ session, raw, services, staff });
+    this.extractSlotsFromMessage({ session, raw, services, staff, isVoice });
     this.logAction('extracted_slots', {
       tenantId,
       phone: from,
@@ -1282,6 +1294,18 @@ if (wantsTimeInline || parsed2?.hasTime) {
       startAt: session.draft.startAt || null,
       customerName: session.draft.customerName || null,
       pendingDateOnly: session.pendingDateOnly || null,
+    });
+    this.logAction('merged_booking_draft', {
+      tenantId,
+      phone: from,
+      state: session.state,
+      draft: {
+        serviceId: session.draft.serviceId || null,
+        staffId: session.draft.staffId || null,
+        customerName: session.draft.customerName || null,
+        startAt: session.draft.startAt || null,
+        pendingDateOnly: session.pendingDateOnly || null,
+      },
     });
     this.logAction('next_missing_slot_selection', {
       tenantId,
@@ -1449,10 +1473,13 @@ if (wantsTimeInline || parsed2?.hasTime) {
         }
 
         session.draft.startAt = undefined;
-        return this.pickOne(
-          ['Randevu kontrolünde bir sorun oldu 😕 Farklı bir saat dener misin?', 'Bir şey takıldı 😕 Başka bir saat deneyelim mi?'],
-          raw,
-        );
+        this.logAction('time_rejected_or_unavailable', {
+          tenantId,
+          phone: from,
+          reason: pre.code || 'PRECHECK_FAILED',
+          requestedStartAt: session.draft.startAt || null,
+        });
+        return 'Bu saat uygun görünmüyor. Lütfen başka bir saat söyleyin. Örneğin 14:30.';
       }
 
       session.pendingSummary = session.editMode ? `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}` : pre.summary!;
@@ -2839,7 +2866,12 @@ ${historyText}
   // =========================
   // Matching
   // =========================
-  private tryAutofillService(draft: BookingDraft, services: any[], msg: string) {
+  private tryAutofillService(
+    draft: BookingDraft,
+    services: any[],
+    msg: string,
+    ctx?: { tenantId?: string; phone?: string; isVoice?: boolean },
+  ) {
     // Always attempt to extract a service from the user's message and update the draft.
     // In voice bookings, the user may correct or override a previously selected service (e.g. "hayır lazer değil, protez tırnak").
     // Therefore we do not bail out when draft.serviceId is already set. Instead we detect a new service name and override.
@@ -2849,20 +2881,39 @@ ${historyText}
     const t = normalizeTr(msg);
     const negPatterns = ['degil', 'değil', 'istemiyorum', 'istemem', 'baska', 'başka', 'onun icin degil', 'onun için değil', 'farkli', 'farklı'];
     const hasNegation = negPatterns.some((p) => t.includes(p));
+    const prev = draft.serviceId ? String(draft.serviceId) : null;
     // Always set the serviceId to the detected hit; this allows overriding a previous choice when the user specifies a new service.
     draft.serviceId = String(hit.id);
+    this.logAction('explicit_service_detected', {
+      tenantId: ctx?.tenantId || draft.tenantId,
+      phone: ctx?.phone || draft.customerPhone,
+      serviceId: String(hit.id),
+      raw: msg,
+      isVoice: Boolean(ctx?.isVoice),
+    });
     if (hasNegation) {
       // Clear any suggested service tracking so that the flow does not ask about the old service again.
       (draft as any).suggestedServiceId = undefined;
       (draft as any).suggestedServiceName = undefined;
+      this.logAction('service_override_triggered', {
+        tenantId: ctx?.tenantId || draft.tenantId,
+        phone: ctx?.phone || draft.customerPhone,
+        fromServiceId: prev,
+        toServiceId: String(hit.id),
+        raw: msg,
+      });
     }
   }
 
-  private extractSlotsFromMessage(opts: { session: SessionState; raw: string; services: any[]; staff: any[] }) {
-    const { session, raw, services, staff } = opts;
+  private extractSlotsFromMessage(opts: { session: SessionState; raw: string; services: any[]; staff: any[]; isVoice: boolean }) {
+    const { session, raw, services, staff, isVoice } = opts;
     const draft = session.draft;
 
-    this.tryAutofillService(draft, services, raw);
+    this.tryAutofillService(draft, services, raw, {
+      tenantId: draft.tenantId,
+      phone: draft.customerPhone,
+      isVoice,
+    });
 
     const hasCorrection = /\b(hayir|hayır)\b/.test(normalizeTr(raw)) && /\b(degil|değil)\b/.test(normalizeTr(raw));
     if (hasCorrection) {
@@ -2883,6 +2934,14 @@ ${historyText}
 
     const parsed = parseDateTimeTR(raw);
     const tNorm = normalizeTr(raw);
+    this.logAction('datetime_slots_extracted', {
+      tenantId: draft.tenantId,
+      phone: draft.customerPhone,
+      raw,
+      hasTime: parsed?.hasTime || false,
+      hasDate: parsed?.hasDate || false,
+      dateOnly: parsed?.dateOnly || null,
+    });
     if (parsed?.hasTime) {
       let nextIso = toIstanbulIso(clampToFuture(parsed.dateUtc));
       // Keep existing date when caller only updates the time ("iki", "saat iki", "iki buçuk").
@@ -2939,17 +2998,34 @@ ${historyText}
   private detectServiceFromMessage(raw: string, services: any[]) {
     if (!services || services.length === 0) return null;
     const t = normalizeTr(raw);
-    const words = t.split(/\s+/).filter(Boolean);
+    if (!t) return null;
 
-    const direct = services.find((s: any) => normalizeTr(String(s?.name || '')).includes(t));
+    const direct = services.find((s: any) => {
+      const name = normalizeTr(String(s?.name || ''));
+      return name && (t.includes(name) || name.includes(t));
+    });
     if (direct) return direct;
 
-    const best = services.find((s: any) => {
-      const name = normalizeTr(String(s?.name || ''));
-      return words.some((w) => w.length >= 3 && name.includes(w));
-    });
+    const userWords = t.split(/\s+/).filter((w) => w.length >= 3);
+    if (!userWords.length) return null;
 
-    return best || null;
+    let best: any = null;
+    let bestScore = 0;
+    for (const s of services) {
+      const name = normalizeTr(String(s?.name || ''));
+      if (!name) continue;
+      const svcWords = name.split(/\s+/).filter((w) => w.length >= 3);
+      if (!svcWords.length) continue;
+      const overlap = svcWords.filter((w) => userWords.includes(w)).length;
+      const score = overlap / svcWords.length;
+      if (overlap >= 1 && score > bestScore) {
+        best = s;
+        bestScore = score;
+      }
+    }
+
+    if (bestScore >= 0.6) return best;
+    return null;
   }
 
   private hasExplicitUnknownServiceRequest(raw: string, services: any[]) {
@@ -3526,9 +3602,9 @@ function parseDateTimeTR(raw: string): ParsedTRDateTime | null {
     return null;
   }
 
-  // If no explicit time was found yet, try a loose parse for standalone numbers
-  // Only attempt this when there is no explicit date and no recognised time
-  if (!hasTime && !mNumeric && !mMonth && weekdayIdx == null && !hasTomorrow && !hasToday) {
+  // If no explicit time was found yet, try a loose parse for standalone numbers.
+  // Keep numeric-date phrases excluded to avoid parsing day/month as hour.
+  if (!hasTime && !mNumeric && !mMonth) {
     const loose = parseTimeLoose(t);
     if (loose) {
       timeOnly = loose;
