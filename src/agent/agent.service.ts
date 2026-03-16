@@ -140,6 +140,13 @@ type SessionState = {
     serviceName?: string;
     staffName?: string;
   };
+
+  lastBookingContext?: {
+    startAtIso?: string;
+    serviceName?: string;
+    staffName?: string;
+    customerName?: string;
+  };
 };
 
 type LearnedCustomerContext = {
@@ -282,10 +289,8 @@ private humanizeConfirmNeedEH(seed?: string) {
   }
 
   private formatBookingSuccess(startAtIso: string, apptId: string, seed?: string) {
-    // For voice calls, return a consistent and concise success message. Include the date and time,
-    // and let the caller know a reminder message will be sent. Avoid reading registration numbers aloud.
     const pretty = prettyIstanbul(startAtIso);
-    return `Rezervasyonunuzu başarıyla oluşturdum. Tarih: ${pretty}. Rezervasyondan 2 saat önce telefonunuza bir hatırlatma mesajı gönderilecektir. Görüşmek üzere.`;
+    return `${pretty} için rezervasyonunuzu oluşturdum.\nRezervasyondan 2 saat önce telefonunuza bir hatırlatma mesajı gönderilecektir. Görüşmek üzere.`;
   }
 
   private formatEditSuccess(startAtIso: string, apptId: string, seed?: string) {
@@ -327,6 +332,7 @@ private humanizeConfirmNeedEH(seed?: string) {
 
     this.recordHistory(session, 'user', raw);
 
+
     // ====================================================
     // Follow-up memory: if the caller asks about the recent reservation, answer without starting a new booking flow
     // Recognize queries such as "Randevuyu oluşturdun mu?", "Hangi saate aldık?", "Ben neye randevu aldım?", "Kimleydi?".
@@ -338,7 +344,16 @@ private humanizeConfirmNeedEH(seed?: string) {
         const hasFollow = followKeywords.some((k) => q.includes(k));
         const hasQuestion = questionKeywords.some((k) => q.includes(k));
         if (hasFollow && hasQuestion) {
-          // Respond with the last booking summary without altering the session state
+          const ctx = session.lastBookingContext;
+          if (ctx?.startAtIso && (q.includes('saat') || q.includes('hangi saate') || q.includes('kacta') || q.includes('kaçta'))) {
+            return this.safeReply(session, `Randevunuz ${prettyIstanbul(ctx.startAtIso)} olarak görünüyor.`);
+          }
+          if (ctx?.staffName && (q.includes('kimle') || q.includes('kimleydi') || q.includes('kiminle'))) {
+            return this.safeReply(session, `Randevunuz ${ctx.staffName} ile görünüyor.`);
+          }
+          if (ctx?.serviceName && (q.includes('hangi hizmet') || q.includes('neye') || q.includes('hangi islem') || q.includes('hangi işlem'))) {
+            return this.safeReply(session, `Hizmetiniz ${ctx.serviceName} olarak görünüyor.`);
+          }
           return this.safeReply(session, (session as any).lastBookingSummary as string);
         }
       }
@@ -454,6 +469,8 @@ private humanizeConfirmNeedEH(seed?: string) {
       const business = await (this.prisma as any).businessProfile?.findUnique({ where: { tenantId } }).catch(() => null);
       const services = await this.safeListServices(tenantId);
       const staff = await this.safeListStaff(tenantId);
+
+      this.extractSlotsFromMessage({ session, raw, services, staff });
 
       const learned = await this.safeGetLearnedCustomerContext(tenantId, from, services);
 
@@ -1257,8 +1274,7 @@ if (wantsTimeInline || parsed2?.hasTime) {
       session.pendingDateOnly = parsedEarly.dateOnly;
     }
 
-    this.tryAutofillService(session.draft, services, raw);
-    if (!isNoPreferenceStaff(raw)) this.tryAutofillStaff(session.draft, staff, raw);
+    this.extractSlotsFromMessage({ session, raw, services, staff });
 
     const picked = this.pickFromSuggestions(session, raw);
     if (picked?.type === 'staff' && picked.staffId) session.draft.staffId = picked.staffId;
@@ -1526,6 +1542,12 @@ appointmentId: String(session.targetAppointmentId),
         const newIso = upd.data.startAt;
         const apptId = upd.data.appointmentId;
 
+        session.lastBookingContext = {
+          startAtIso: newIso,
+          serviceName: session.targetApptSnapshot?.serviceName,
+          staffName: session.targetApptSnapshot?.staffName,
+          customerName: session.draft.customerName || undefined,
+        };
         this.softResetSession(session, tenantId, from, { keepIdempotency: true });
         this.saveSession(key, session);
         const reply = this.formatEditSuccess(newIso, apptId, from + newIso);
@@ -1589,6 +1611,14 @@ appointmentId: String(session.targetAppointmentId),
 
       await this.learnFromSuccessfulBooking(tenantId, from, session.draft);
 
+      session.lastBookingContext = {
+        startAtIso: created.data.startAt,
+        serviceName: services.find((s: any) => String(s?.id) === String(session.draft.serviceId))?.name,
+        staffName:
+          staff.find((p: any) => String(p?.id) === String(session.draft.staffId))?.name ||
+          session.draft.requestedStaffName,
+        customerName: session.draft.customerName || undefined,
+      };
       this.softResetSession(session, tenantId, from, { keepIdempotency: true });
       this.saveSession(key, session);
       const successMsg = this.formatBookingSuccess(created.data.startAt, created.data.appointmentId, from + created.data.startAt);
@@ -1852,9 +1882,7 @@ ${staffNamesShort || 'YOK'}
   }
 
   private askService(services: any[], opts: { gentle: boolean }) {
-    const list = servicesToTextShort(services);
-    if (!list) return this.humanizeAsk('service');
-    return opts.gentle ? `Hangi hizmet için yardımcı olayım?\n${list}` : `Hangi hizmeti istersiniz?\n${list}`;
+    return opts.gentle ? 'Hangi hizmet için yardımcı olayım?' : 'Hangi hizmeti istersiniz?';
   }
 
   // =========================
@@ -2814,6 +2842,43 @@ ${historyText}
     }
   }
 
+  private extractSlotsFromMessage(opts: { session: SessionState; raw: string; services: any[]; staff: any[] }) {
+    const { session, raw, services, staff } = opts;
+    const draft = session.draft;
+
+    this.tryAutofillService(draft, services, raw);
+
+    const hasCorrection = /\b(hayir|hayır)\b/.test(normalizeTr(raw)) && /\b(degil|değil)\b/.test(normalizeTr(raw));
+    if (hasCorrection) {
+      session.suggestedServiceId = undefined;
+      session.suggestedServiceName = undefined;
+    }
+
+    if (!isNoPreferenceStaff(raw)) {
+      this.tryAutofillStaff(draft, staff, raw);
+      if (!draft.staffId) {
+        const maybeSpoken = extractLikelyStaffName(raw);
+        if (maybeSpoken) {
+          draft.requestedStaffName = maybeSpoken;
+          if (staff?.[0]?.id) draft.staffId = String(staff[0].id);
+        }
+      }
+    }
+
+    const parsed = parseDateTimeTR(raw);
+    if (parsed?.hasTime) {
+      draft.startAt = toIstanbulIso(clampToFuture(parsed.dateUtc));
+      session.pendingStartAt = draft.startAt;
+      session.pendingDateOnly = undefined;
+    } else if (parsed?.dateOnly) {
+      session.pendingDateOnly = parsed.dateOnly;
+    }
+
+    const maybeName = extractName(raw);
+    const looksLikeStaffName = staff?.some((p: any) => normalizePersonName(String(p?.name || '')) === normalizePersonName(raw));
+    if (!looksLikeStaffName && maybeName) draft.customerName = maybeName;
+  }
+
   private tryAutofillStaff(draft: BookingDraft, staff: any[], msg: string) {
     if (draft.staffId) return;
     const t = normalizePersonName(msg);
@@ -3187,6 +3252,17 @@ function extractName(raw: string) {
   const name = m[2].trim();
   if (name.length < 2) return null;
   return name;
+}
+
+function extractLikelyStaffName(raw: string): string | null {
+  const t = raw.trim();
+  if (!t) return null;
+  const m = t.match(/([A-Za-zÇĞİÖŞÜçğıöşü']{2,})(?:['’]?(?:ten|tan|le|la)|\s+ile)\b/i);
+  if (!m?.[1]) return null;
+  const candidate = m[1].replace(/['’]$/, '').trim();
+  if (!candidate) return null;
+  if (candidate.length < 2) return null;
+  return candidate;
 }
 
 // ===== TZ + Working hours helpers =====
@@ -3637,4 +3713,4 @@ function toSchemaDateTime(startAtIso: string, durationMinutes?: number) {
 // - “işlem iptal”
 // - “randevu değiştir 2. randevu 18:00”
 // - “pazartesi 12:00 uygun mu?”
-root@ubuntu:~/beauty-saas/apps/api/api# 
+
