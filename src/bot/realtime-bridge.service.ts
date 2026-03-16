@@ -1,513 +1,1138 @@
 import { Injectable, Logger } from '@nestjs/common';
 import WebSocket from 'ws';
+import { AgentService } from '../agent/agent.service';
 
-/**
- * Twilio message payload type. Media events carry base64 encoded μ-law audio
- * while start/stop notify the stream SID.
- */
-type TwilioMsg =
-  | { event: 'connected' }
+type BridgeMeta = {
+  tenantId: string;
+  callId: string;
+  from?: string;
+  to?: string;
+  streamSid?: string;
+};
+
+type BridgeInboundMessage =
   | {
       event: 'start';
       start: {
-        streamSid: string;
-        callSid?: string;
-        customParameters?: Record<string, string>;
+        callId: string;
+        tenantId: string;
+        from?: string;
+        to?: string;
+        streamSid?: string;
       };
     }
-  | { event: 'media'; streamSid: string; media: { payload: string } }
-  | { event: 'stop'; streamSid: string };
+  | {
+      event: 'media';
+      media: {
+        payload: string; // base64 g711 ulaw
+      };
+    }
+  | { event: 'stop' }
+  | { event: 'mark'; mark?: any }
+  | { event: 'clear' };
 
-type SessionState = {
-  key: string; // internal map key
-  tenantId: string;
-  closed: boolean;
-  aiHasActiveResponse: boolean;
-
-  // Twilio WS
-  twilio?: WebSocket;
-  streamSid?: string;
-  twilioFrames: number;
-
-  // OpenAI WS
-  openai?: WebSocket;
-  openaiReady: boolean;
-  openaiAppends: number;
-  openaiDeltas: number;
-  openaiLastError?: string;
-
-  // "How much audio since last commit?"
-  lastCommittedAppends: number;
-
-  /**
-   * Accumulates the total duration (in milliseconds) of audio appended
-   * since the last time we successfully committed the buffer. This is
-   * calculated from the size of incoming Twilio media frames. OpenAI
-   * requires at least ~100 ms of audio to commit; tracking ms directly
-   * avoids committing an empty buffer when openaiAppends has advanced
-   * but the buffer has been cleared.
-   */
-  appendedMsSinceCommit: number;
-
-  // Barge-in flags
-  aiSpeaking: boolean;
-  responseInProgress: boolean;
-
-  // Debounce
-  lastResponseCreateAt: number;
-
-  // Greet once
-  greeted: boolean;
+type OpenAiEvent = {
+  type: string;
+  [key: string]: any;
 };
 
 @Injectable()
 export class RealtimeBridgeService {
   private readonly logger = new Logger(RealtimeBridgeService.name);
-  private readonly sessions = new Map<string, SessionState>();
 
-  // OpenAI realtime endpoint + model query param
-  private readonly openaiUrl =
-    process.env.OPENAI_REALTIME_URL ||
-    'wss://api.openai.com/v1/realtime?model=gpt-realtime-mini';
+  constructor(private readonly agentService: AgentService) {}
 
-  private readonly apiKey = process.env.OPENAI_API_KEY || '';
-
-  /**
-   * main.ts içindeki raw WS upgrade handler burayı çağırıyor.
-   * - ws: Twilio Media Stream WebSocket
-   * - requestUrl: örn "/bot/stream?tenantId=xxx"
-   */
-  handleTwilioWebSocket(ws: WebSocket, requestUrl: string) {
-    const tenantIdFromQuery = this.getQueryParam(requestUrl, 'tenantId') || '';
-    const tenantId = tenantIdFromQuery || 'default';
-
-    // IMPORTANT: do NOT key sessions only by tenantId (parallel calls collide)
-    const tempKey = `tmp:${tenantId}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
-
-    const state: SessionState = {
-      key: tempKey,
-      tenantId,
-      closed: false,
-      twilio: ws,
-      twilioFrames: 0,
-
-      openaiReady: false,
-      openaiAppends: 0,
-      openaiDeltas: 0,
-      lastCommittedAppends: 0,
-      appendedMsSinceCommit: 0,
-
-      // Initialize barge-in tracking flag. This flag is true only while an audio delta is in-flight
-      // and ensures we call response.cancel only when there is an active response.
-      aiHasActiveResponse: false,
-
-      aiSpeaking: false,
-      responseInProgress: false,
-      lastResponseCreateAt: 0,
-
-      greeted: false,
-    };
-
-    this.sessions.set(tempKey, state);
-
-    this.logger.log(`WS CONNECT url=${requestUrl} tenantId(query)=${tenantIdFromQuery || '-'}`);
-
-    ws.on('message', (raw) => {
-      try {
-        const msg = JSON.parse(String(raw)) as TwilioMsg;
-
-        if (msg.event === 'start') {
-          const streamSid = msg.start?.streamSid;
-          const tenantIdFromStart = msg.start?.customParameters?.tenantId || '';
-          const finalTenantId = tenantIdFromStart || tenantId;
-
-          state.tenantId = finalTenantId;
-          state.streamSid = streamSid;
-
-          // Move session key to stable streamSid-based key
-          const newKey = `sid:${finalTenantId}:${streamSid}`;
-          this.sessions.delete(state.key);
-          state.key = newKey;
-          this.sessions.set(newKey, state);
-
-          this.logger.log(
-            `Twilio start tenantId=${state.tenantId} streamSid=${streamSid} customTenant=${tenantIdFromStart || '-'}`
-          );
-
-          // OpenAI socket’i hazırla
-          this.ensureOpenAI(state.key);
-          return;
-        }
-
-        if (msg.event === 'media') {
-          state.twilioFrames++;
-
-          // Calculate the duration of this audio chunk. Twilio media
-          // messages carry base64 encoded μ-law at 8 kHz with 1 byte per sample.
-          try {
-            const payload = msg.media?.payload || '';
-            const byteLen = Buffer.from(payload, 'base64').length;
-            // Convert samples to milliseconds. 8k samples per second.
-            const ms = Math.round((byteLen / 8000) * 1000);
-            state.appendedMsSinceCommit += ms;
-          } catch (err) {
-            // ignore errors when computing duration
-          }
-
-          // OpenAI hazır olunca audio append et
-          if (state.openai && state.openaiReady) {
-            state.openai.send(
-              JSON.stringify({
-                type: 'input_audio_buffer.append',
-                audio: msg.media.payload, // base64 g711_ulaw
-              })
-            );
-            state.openaiAppends++;
-          }
-
-          if (state.twilioFrames === 1 || state.twilioFrames % 200 === 0) {
-            this.logger.log(
-              `Twilio media tenantId=${state.tenantId} frames=${state.twilioFrames} openaiReady=${state.openaiReady} appends=${state.openaiAppends}`
-            );
-          }
-
-          return;
-        }
-
-        if (msg.event === 'stop') {
-          this.detach(state.key, 'twilio-stop');
-          return;
-        }
-      } catch (e: any) {
-        this.logger.error(`twilio message parse error: ${e?.message || e}`);
-      }
-    });
-
-    ws.on('close', () => this.detach(state.key, 'twilio-close'));
-    ws.on('error', (e) => this.detach(state.key, `twilio-error:${(e as any)?.message || e}`));
+  handleBridgeSocket(clientWs: WebSocket, meta: BridgeMeta) {
+    const session = new VoiceBridgeSession(
+      this.agentService,
+      this.logger,
+      clientWs,
+      meta,
+    );
+    session.start();
   }
 
-  // --------------------------
-  // OpenAI realtime
-  // --------------------------
+  handleTwilioWebSocket(ws: WebSocket, url: string) {
+    const qs = new URL(url, 'http://localhost').searchParams;
 
-  private ensureOpenAI(sessionKey: string) {
-    const state = this.sessions.get(sessionKey);
-    if (!state || state.closed) return;
+    const tenantId =
+      qs.get('tenantId') ||
+      qs.get('customTenant') ||
+      process.env.DEFAULT_TENANT_ID ||
+      'cmkeas8p500056hpg59gmkquc';
 
-    if (!this.apiKey) {
-      state.openaiLastError = 'OPENAI_API_KEY missing';
-      this.logger.error(`OpenAI key missing. sessionKey=${sessionKey}`);
+    const callId =
+      qs.get('callId') || qs.get('streamSid') || `ws-${Date.now()}`;
+    const from = qs.get('from') || undefined;
+    const to = qs.get('to') || undefined;
+    const streamSid = qs.get('streamSid') || callId;
+
+    this.logger.log(
+      `[voice] compat handleTwilioWebSocket tenantId=${tenantId} callId=${callId}`,
+    );
+
+    return this.handleBridgeSocket(ws, {
+      tenantId,
+      callId,
+      from,
+      to,
+      streamSid,
+    });
+  }
+}
+
+class VoiceBridgeSession {
+  private readonly openaiUrl: string;
+  private openaiWs: WebSocket | null = null;
+  private closed = false;
+
+  private sessionReady = false;
+  private greeted = false;
+
+  private lastAssistantAudioAt = 0;
+  private assistantSpeaking = false;
+  private assistantStartedAt = 0;
+  private activeResponse = false;
+
+  private speechEnergyFrames = 0;
+  private readonly speechEnergyThreshold = 1700;
+  private readonly speechFramesForBargeIn = 3;
+  private readonly assistantGuardMs = 120;
+
+  private lastTranscriptAt = 0;
+  private lastTranscriptText = '';
+  private lastBotReplyText = '';
+
+  private autoFilledName = false;
+
+  private playbackToken = 0;
+  private playbackTimer: NodeJS.Timeout | null = null;
+  private currentTtsAbort: AbortController | null = null;
+
+  // 20ms @ 8kHz μ-law = 160 bytes
+  private readonly ulawFrameBytes = 160;
+  private readonly ulawFrameMs = 20;
+
+  private readonly ghostRegex =
+    /^(ad[ií]os|bye|bye-bye|thank you|thank you very much|all y['’]all|hallo|hello|alo)\.?$/i;
+
+  constructor(
+    private readonly agentService: AgentService,
+    private readonly parentLogger: Logger,
+    private readonly clientWs: WebSocket,
+    private readonly meta: BridgeMeta,
+  ) {
+    const model =
+      process.env.JARVIS_REALTIME_MODEL || 'gpt-4o-realtime-preview';
+    this.openaiUrl =
+      `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
+  }
+
+  start() {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      this.parentLogger.error('[voice] OPENAI_API_KEY missing');
+      this.safeClose();
       return;
     }
 
-    if (
-      state.openai &&
-      (state.openai.readyState === WebSocket.OPEN || state.openai.readyState === WebSocket.CONNECTING)
-    ) {
-      return;
-    }
-
-    const ws = new WebSocket(this.openaiUrl, {
+    this.openaiWs = new WebSocket(this.openaiUrl, {
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         'OpenAI-Beta': 'realtime=v1',
       },
     });
 
-    state.openai = ws;
-    state.openaiReady = false;
+    this.openaiWs.on('open', () => {
+      this.parentLogger.log(
+        `[voice] OpenAI realtime connected callId=${this.meta.callId}`,
+      );
+      this.configureOpenAiSession();
+    });
 
-    ws.on('open', () => {
-      state.openaiReady = true;
-      this.logger.log(`OpenAI WS connected tenantId=${state.tenantId} sessionKey=${sessionKey}`);
-
-      // ===============================
-      // 🔥 VOICE AYARI
-      // ===============================
-      const VOICE = 'cedar';
-
-      // VAD tuning: less trigger-happy
-      const sessionUpdate = {
-        type: 'session.update',
-        session: {
-          model: 'gpt-realtime-mini',
-          modalities: ['audio', 'text'],
-          input_audio_format: 'g711_ulaw',
-          output_audio_format: 'g711_ulaw',
-          voice: VOICE,
-
-          // VAD + barge-in
-          turn_detection: {
-            type: 'server_vad',
-            prefix_padding_ms: 250,
-            silence_duration_ms: 450,
-            create_response: false, // we trigger manually
-            interrupt_response: true,
-          },
-
-          instructions:
-            'Sen sadece bir güzellik merkezi randevu asistanısın. Türkçe konuş. ' +
-            'Konuşmaya "Merhaba, Güzellik Merkezi’ne hoş geldiniz. Size nasıl yardımcı olabilirim?" diye başla. ' +
-            'Sadece hizmetler, fiyat bilgisi (genel), uygunluk, randevu alma, saat-tarih, şube, adres ve iletişim konularında konuş. ' +
-            'Konu güzellik merkezi dışına çıkarsa kısa şekilde tekrar randevu konusuna yönlendir: ' +
-            '"Bu hatta sadece randevu ve hizmet bilgisi verebilirim. Hangi işlem için randevu istiyorsunuz?" ' +
-            'Cevaplar 1-2 cümle, net ve premium tonda olsun.',
-        },
-      };
-
-      this.logger.log(`[RealtimeBridgeService] session.update tenantId=${state.tenantId} voice=${VOICE}`);
-      ws.send(JSON.stringify(sessionUpdate));
-
-      // ✅ Greeting: DO NOT commit empty audio buffer.
-      // Instead: create a conversation item and ask for audio response.
-      if (!state.greeted) {
-        state.greeted = true;
-        state.responseInProgress = true;
-        state.lastResponseCreateAt = Date.now();
-
-        ws.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'message',
-              role: 'user',
-              content: [
-                {
-                  type: 'input_text',
-                  text: 'Merhaba.',
-                },
-              ],
-            },
-          })
+    this.openaiWs.on('message', async (buf) => {
+      try {
+        const evt = JSON.parse(buf.toString()) as OpenAiEvent;
+        await this.onOpenAiEvent(evt);
+      } catch (err: any) {
+        this.parentLogger.error(
+          `[voice] OpenAI event parse error callId=${this.meta.callId}: ${err?.message || err}`,
         );
-
-        ws.send(
-          JSON.stringify({
-            type: 'response.create',
-            response: {
-              modalities: ['audio', 'text'],
-              instructions:
-                'Görüşmeyi sen başlat. Tek cümle: "Merhaba, Güzellik Merkezi’ne hoş geldiniz. Size nasıl yardımcı olabilirim?"',
-            },
-          })
-        );
-
-        this.logger.log(`response.create (greeting) tenantId=${state.tenantId}`);
       }
     });
 
-    ws.on('message', (raw) => {
-      let msg: any;
+    this.openaiWs.on('close', () => {
+      this.parentLogger.warn(
+        `[voice] OpenAI WS closed callId=${this.meta.callId}`,
+      );
+      this.safeClose();
+    });
+
+    this.openaiWs.on('error', (err) => {
+      this.parentLogger.error(
+        `[voice] OpenAI WS error callId=${this.meta.callId}: ${String(err)}`,
+      );
+    });
+
+    this.clientWs.on('message', async (raw) => {
       try {
-        msg = JSON.parse(String(raw));
-      } catch {
-        return;
+        const msg = JSON.parse(raw.toString()) as BridgeInboundMessage;
+        await this.onBridgeMessage(msg);
+      } catch (err: any) {
+        this.parentLogger.error(
+          `[voice] bridge message parse error callId=${this.meta.callId}: ${err?.message || err}`,
+        );
       }
+    });
 
-      const t = msg?.type;
+    this.clientWs.on('close', () => {
+      this.parentLogger.warn(
+        `[voice] bridge WS closed callId=${this.meta.callId}`,
+      );
+      this.safeClose();
+    });
 
-      if (
-        t === 'error' ||
-        t === 'session.created' ||
-        t === 'session.updated' ||
-        t === 'input_audio_buffer.speech_started' ||
-        t === 'input_audio_buffer.speech_stopped'
-      ) {
-        this.logger.log(`OpenAI event tenantId=${state?.tenantId || '-'} type=${t}`);
-      }
+    this.clientWs.on('error', (err) => {
+      this.parentLogger.error(
+        `[voice] bridge WS error callId=${this.meta.callId}: ${String(err)}`,
+      );
+    });
+  }
 
-      if (t === 'error') {
-        const em = msg?.error?.message || JSON.stringify(msg);
-        this.logger.error(`OpenAI error tenantId=${state?.tenantId || '-'}: ${em}`);
-        const s = this.sessions.get(sessionKey);
-        if (s) {
-          s.openaiLastError = em;
-          // If buffer too small, clear to avoid repeated failures
-          s.openai?.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
-          // Reset counters because the buffer has been cleared due to an error
-          s.appendedMsSinceCommit = 0;
-          s.lastCommittedAppends = s.openaiAppends;
-          s.responseInProgress = false;
-          s.aiSpeaking = false;
-          s.aiHasActiveResponse = false;
-        }
-        return;
-      }
+  private configureOpenAiSession() {
+    this.sendOpenAi({
+      type: 'session.update',
+      session: {
+        instructions: [
+          'You are the voice layer for a premium Turkish beauty center assistant.',
+          'You do not decide business logic.',
+          'You only speak the exact approved reply text provided by the app.',
+          'Speak in Turkish unless the caller clearly speaks another language.',
+          'Speak naturally, calmly, warmly, professionally, and slightly slower than default phone assistants.',
+          'Keep sentences very short.',
+          'Do not add extra filler.',
+          'Do not invent bookings, confirmations, prices, or availability.',
+          'Never read emojis, markdown, symbols, or decorative characters.',
+        ].join(' '),
 
-      const s = this.sessions.get(sessionKey);
-      if (!s || s.closed) return;
+        modalities: ['audio', 'text'],
+        voice: process.env.JARVIS_REALTIME_VOICE || 'cedar',
 
-      // BARGE-IN: user started speaking while AI speaking -> cancel + clear
-if (t === 'input_audio_buffer.speech_started') {
-  const s = this.sessions.get(sessionKey);
-  if (!s || s.closed) return;
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
 
-  // 🔥 KRİTİK: yeni konuşma başlarken referansları sıfırla
-  s.lastCommittedAppends = s.openaiAppends;
-  // Reset accumulated ms since commit because the buffer will be cleared
-  s.appendedMsSinceCommit = 0;
+        input_audio_transcription: {
+          model: process.env.JARVIS_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
+          language: 'tr',
+          prompt:
+            'Bu bir Türkiye telefon görüşmesi. Güzellik merkezi, randevu, rezervasyon, lazer epilasyon, cilt bakımı, protez tırnak, saç, kaş, kirpik, tarih, saat, personel gibi kelimeler beklenir. Türkçe özel isimleri doğru yaz. Kısa isimleri ve personel isimlerini mümkün olduğunca doğru yaz.',
+        },
 
-if (s.aiSpeaking && s.aiHasActiveResponse) {
-  this.logger.log(`[BARGE-IN] speech_started -> cancel+clear tenantId=${s.tenantId}`);
-  s.openai?.send(JSON.stringify({ type: 'response.cancel' }));
-} else {
-  this.logger.log(`[BARGE-IN] speech_started -> clear-only (no active response) tenantId=${s.tenantId}`);
-}
-s.openai?.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
-if (s.twilio && s.streamSid) {
-  s.twilio.send(JSON.stringify({ event: 'clear', streamSid: s.streamSid }));
-}
-s.aiSpeaking = false;
-s.responseInProgress = false;
-s.aiHasActiveResponse = false;
-return;
-}
+        turn_detection: {
+          type: 'server_vad',
+          create_response: false,
+          interrupt_response: false,
+          threshold: 0.68,
+          prefix_padding_ms: 180,
+          silence_duration_ms: 260,
+        },
+      },
+    });
+  }
 
-      // User stopped speaking -> create response ONLY if we have enough audio
-      if (t === 'input_audio_buffer.speech_stopped') {
-        // If the OpenAI socket isn't ready, do nothing.
-        if (!s.openai || !s.openaiReady) return;
-        // Avoid overlapping responses
-        if (s.responseInProgress) {
-          this.logger.log(`response.create skipped (already in progress) tenantId=${s.tenantId}`);
-          return;
-        }
-
-        const now = Date.now();
-        // Debounce successive response.create calls
-        if (now - s.lastResponseCreateAt < 900) return;
-
-        // Attempt to commit the buffer. This will clear the buffer and skip
-        // committing if there isn't enough audio accumulated (see
-        // tryCommitInput for details). When it returns false we abort.
-        const committed = this.tryCommitInput(s, 'speech_stopped');
-        if (!committed) {
-          return;
-        }
-
-        // We have successfully committed the buffer; begin generating a response.
-        s.responseInProgress = true;
-        s.lastResponseCreateAt = now;
-        s.openai?.send(JSON.stringify({ type: 'response.create' }));
-        this.logger.log(`response.create tenantId=${s.tenantId}`);
-        return;
-      }
-
-      // Response done -> reset flags
-      if (
-        t === 'response.done' ||
-        t === 'response.audio.done' ||
-        t === 'response.output_audio.done' ||
-        t === 'response.end'
-      ) {
-s.aiSpeaking = false;
-s.responseInProgress = false;
-s.aiHasActiveResponse = false;
+  private async onBridgeMessage(msg: BridgeInboundMessage) {
+    if (
+      this.closed ||
+      !this.openaiWs ||
+      this.openaiWs.readyState !== WebSocket.OPEN
+    ) {
       return;
+    }
+
+    if (msg.event === 'start') {
+      this.parentLogger.log(
+        `[voice] bridge start callId=${this.meta.callId} tenantId=${this.meta.tenantId}`,
+      );
+      return;
+    }
+
+    if (msg.event === 'stop') {
+      this.parentLogger.log(`[voice] bridge stop callId=${this.meta.callId}`);
+      this.safeClose();
+      return;
+    }
+
+    if (msg.event === 'clear') {
+      this.parentLogger.log(`[voice] bridge clear callId=${this.meta.callId}`);
+      return;
+    }
+
+    if (msg.event === 'media') {
+      const payload = msg.media?.payload;
+      if (!payload) return;
+
+      this.handlePossibleBargeIn(payload);
+
+      if (
+        this.assistantSpeaking &&
+        !this.shouldPassInboundDuringAssistant(payload)
+      ) {
+        return;
       }
 
-      // OpenAI audio delta -> forward to Twilio
-      if (t === 'response.audio.delta' || t === 'response.output_audio.delta') {
-        const delta = msg?.delta;
-             
-       s.aiHasActiveResponse = true;
-s.aiSpeaking = true;
+      this.sendOpenAi({
+        type: 'input_audio_buffer.append',
+        audio: payload,
+      });
+    }
+  }
 
-        if (typeof delta === 'string' && s.twilio && s.streamSid) {
-          s.openaiDeltas++;
+  private async onOpenAiEvent(evt: OpenAiEvent) {
+    switch (evt.type) {
+      case 'session.created':
+        this.parentLogger.log(
+          `[voice] session.created callId=${this.meta.callId}`,
+        );
+        return;
 
-          s.twilio.send(
-            JSON.stringify({
-              event: 'media',
-              streamSid: s.streamSid,
-              media: { payload: delta },
-            })
+      case 'session.updated':
+        this.sessionReady = true;
+        this.parentLogger.log(
+          `[voice] session.updated callId=${this.meta.callId}`,
+        );
+
+        if (!this.greeted) {
+          this.greeted = true;
+          await this.speakReply(
+            'Merhaba, ben işletmenin sesli asistanıyım. Size nasıl yardımcı olabilirim?',
           );
+        }
+        return;
 
-          if (s.openaiDeltas === 1 || s.openaiDeltas % 50 === 0) {
-            this.logger.log(
-              `OpenAI audio.delta tenantId=${s.tenantId} deltas=${s.openaiDeltas} twilioFrames=${s.twilioFrames}`
-            );
+      case 'response.created':
+        this.assistantSpeaking = true;
+        this.activeResponse = true;
+        this.assistantStartedAt = Date.now();
+        this.parentLogger.log(
+          `[voice] response.created callId=${this.meta.callId}`,
+        );
+        return;
+
+      case 'response.output_audio.delta':
+      case 'response.audio.delta':
+        if (!evt.delta) return;
+
+        this.lastAssistantAudioAt = Date.now();
+        this.assistantSpeaking = true;
+
+        // This path is only used when ElevenLabs fails and OpenAI TTS fallback is active.
+        this.sendBridge({
+          event: 'media',
+          media: { payload: evt.delta },
+        });
+        return;
+
+      case 'response.output_audio.done':
+      case 'response.audio.done':
+      case 'response.done':
+        this.assistantSpeaking = false;
+        this.activeResponse = false;
+        this.parentLogger.log(
+          `[voice] ${evt.type} callId=${this.meta.callId}`,
+        );
+        return;
+
+      case 'conversation.item.input_audio_transcription.completed': {
+        const rawTranscript = String(evt.transcript || '').trim();
+        if (!rawTranscript) return;
+
+        if (this.shouldDropTranscript(rawTranscript)) {
+          this.parentLogger.warn(
+            `[voice] dropped transcript callId=${this.meta.callId} text="${rawTranscript}"`,
+          );
+          return;
+        }
+
+        const transcript = normalizeTranscriptForAgent(
+          rawTranscript,
+          this.lastBotReplyText,
+        );
+
+        this.lastTranscriptAt = Date.now();
+        this.lastTranscriptText = transcript;
+
+        this.parentLogger.log(
+          `[voice] transcript callId=${this.meta.callId} raw="${rawTranscript}" normalized="${transcript}"`,
+        );
+
+        const reply = await this.callAgentBrain(transcript);
+        if (!reply) return;
+
+        if (isNamePrompt(reply)) {
+          const bypassReply = await this.handleNameBypass();
+          if (bypassReply) {
+            await this.speakReply(bypassReply);
+            return;
           }
         }
+
+        await this.speakReply(reply);
         return;
       }
-    });
 
-    ws.on('close', () => this.detach(sessionKey, 'openai-close'));
-    ws.on('error', (e) => this.detach(sessionKey, `openai-error:${(e as any)?.message || e}`));
-  }
+      case 'input_audio_buffer.speech_started':
+        this.parentLogger.log(
+          `[voice] speech_started callId=${this.meta.callId}`,
+        );
+        // Aggressive barge-in: stop any queued playback immediately.
+        this.cancelAssistantAudio();
+        return;
 
-  // --------------------------
-  // Helpers / cleanup
-  // --------------------------
+      case 'input_audio_buffer.speech_stopped':
+        this.parentLogger.log(
+          `[voice] speech_stopped callId=${this.meta.callId}`,
+        );
+        return;
 
-  private detach(sessionKey: string, reason: string) {
-    const state = this.sessions.get(sessionKey);
-    if (!state || state.closed) return;
+      case 'error': {
+        const code = String(evt?.error?.code || '');
+        if (code === 'response_cancel_not_active') return;
+        this.parentLogger.error(
+          `[voice] OpenAI error callId=${this.meta.callId}: ${JSON.stringify(
+            evt.error || evt,
+          )}`,
+        );
+        return;
+      }
 
-    state.closed = true;
-
-    this.logger.warn(
-      `Bridge close tenantId=${state.tenantId} sessionKey=${sessionKey} reason=${reason} twilioFrames=${state.twilioFrames} openaiAppends=${state.openaiAppends} openaiDeltas=${state.openaiDeltas} openaiErr=${state.openaiLastError || '-'}`
-    );
-
-    try {
-      state.openai?.close();
-    } catch {}
-    try {
-      state.twilio?.close();
-    } catch {}
-
-    this.sessions.delete(sessionKey);
-  }
-
-  private getQueryParam(url: string, key: string): string | null {
-    const idx = url.indexOf('?');
-    if (idx === -1) return null;
-    const qs = url.slice(idx + 1);
-    for (const part of qs.split('&')) {
-      const [k, v] = part.split('=');
-      if (k === key) return decodeURIComponent(v || '');
+      default:
+        return;
     }
-    return null;
   }
 
-  /**
-   * Try to commit the current OpenAI input audio buffer. OpenAI requires
-   * at least ~100 ms of audio to be present; committing less will return
-   * a `buffer too small` error. This helper checks the accumulated
-   * appendedMsSinceCommit on the session state and either commits and
-   * resets counters, or clears the buffer and skips committing if there
-   * isn't enough audio. The caller can decide whether to proceed with
-   * creating a response based on the return value.
-   *
-   * @param session Session state for which the commit should run.
-   * @param reason  Human-readable reason used in logs.
-   * @returns `true` if a commit was performed; otherwise `false`.
-   */
-private tryCommitInput(session: SessionState, reason: string): boolean {
-  const ms = session.appendedMsSinceCommit || 0;
+  private shouldDropTranscript(text: string) {
+    const normalized = text.trim();
 
-  if (ms < 100) {
-    this.logger.warn(
-      `[RealtimeBridgeService] skip create_response (<100ms) why=${reason} ms=${ms} tenantId=${session.tenantId}`,
-    );
-    // Short blips -> reset local counters; also clear to avoid stuck VAD
-    session.openai?.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
-    session.appendedMsSinceCommit = 0;
-    session.lastCommittedAppends = session.openaiAppends;
+    if (!normalized) return true;
+    if (normalized.length <= 1) return true;
+    if (this.ghostRegex.test(normalized)) return true;
+
+    const now = Date.now();
+    const msSinceAssistantAudio = now - this.lastAssistantAudioAt;
+
+    if (msSinceAssistantAudio < 450 && normalized.length < 12) {
+      return true;
+    }
+
+    if (
+      normalized.toLowerCase() === this.lastTranscriptText.toLowerCase() &&
+      now - this.lastTranscriptAt < 900
+    ) {
+      return true;
+    }
+
     return false;
   }
 
-  // IMPORTANT: server_vad already segments internally. DO NOT commit here.
-  session.appendedMsSinceCommit = 0;
-  session.lastCommittedAppends = session.openaiAppends;
+  private handlePossibleBargeIn(payloadB64: string) {
+    if (!this.assistantSpeaking) {
+      this.speechEnergyFrames = 0;
+      return;
+    }
 
-  this.logger.log(
-    `[RealtimeBridgeService] ok for response.create why=${reason} ms=${ms} tenantId=${session.tenantId}`,
-  );
-  return true;
+    const now = Date.now();
+    if (now - this.assistantStartedAt < this.assistantGuardMs) {
+      this.speechEnergyFrames = 0;
+      return;
+    }
+
+    const rms = pcmuBase64Rms(payloadB64);
+
+    if (rms >= this.speechEnergyThreshold) {
+      this.speechEnergyFrames += 1;
+    } else {
+      this.speechEnergyFrames = 0;
+    }
+
+    if (this.speechEnergyFrames >= this.speechFramesForBargeIn) {
+      this.parentLogger.warn(
+        `[voice] barge-in detected callId=${this.meta.callId}`,
+      );
+      this.cancelAssistantAudio();
+      this.speechEnergyFrames = 0;
+    }
+  }
+
+  private shouldPassInboundDuringAssistant(payloadB64: string) {
+    const rms = pcmuBase64Rms(payloadB64);
+    return rms >= this.speechEnergyThreshold;
+  }
+
+  private cancelAssistantAudio() {
+    this.playbackToken += 1;
+
+    if (this.playbackTimer) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+
+    if (this.currentTtsAbort) {
+      try {
+        this.currentTtsAbort.abort();
+      } catch {}
+      this.currentTtsAbort = null;
+    }
+
+    this.sendBridge({ event: 'clear' });
+
+    if (this.activeResponse) {
+      this.sendOpenAi({ type: 'response.cancel' });
+    }
+
+    this.assistantSpeaking = false;
+    this.activeResponse = false;
+  }
+
+  private async handleNameBypass(): Promise<string> {
+    if (this.autoFilledName) {
+      return 'İsminizi telefonda almadan devam edelim. Uygun gün ve saati söyler misiniz?';
+    }
+
+    this.autoFilledName = true;
+
+    this.parentLogger.warn(
+      `[voice] auto name bypass callId=${this.meta.callId}`,
+    );
+
+    const syntheticName = 'Adım Telefon Müşterisi';
+    const reply = await this.callAgentBrain(syntheticName);
+
+    if (reply && !isNamePrompt(reply)) {
+      return reply;
+    }
+
+    return 'Tamam, isim almadan devam edelim. Uygun gün ve saati söyler misiniz?';
+  }
+
+  private async callAgentBrain(userText: string): Promise<string> {
+    const customerPhone = normalizePhone(
+      this.meta.from ||
+        this.meta.streamSid ||
+        this.meta.callId ||
+        'voice-caller',
+    );
+
+    const payload = {
+      tenantId: this.meta.tenantId,
+      customerPhone,
+      text: userText,
+      channel: 'whatsapp',
+      from: this.meta.from,
+      to: this.meta.to,
+      callId: this.meta.callId,
+      streamSid: this.meta.streamSid,
+      source: 'voice',
+    };
+
+    try {
+      const svc: any = this.agentService as any;
+
+      let result: any = null;
+
+      if (typeof svc.handleIncomingMessage === 'function') {
+        result = await svc.handleIncomingMessage(payload);
+      } else if (typeof svc.processIncomingMessage === 'function') {
+        result = await svc.processIncomingMessage(payload);
+      } else if (typeof svc.processMessage === 'function') {
+        result = await svc.processMessage(payload);
+      } else if (typeof svc.replyText === 'function') {
+        result = await svc.replyText(payload);
+      } else {
+        throw new Error(
+          'AgentService üzerinde kullanılabilir bir public entrypoint bulunamadı',
+        );
+      }
+
+      const reply = extractReplyText(result);
+
+      this.parentLogger.log(
+        `[voice] agent reply callId=${this.meta.callId} customerPhone=${customerPhone} reply="${reply}"`,
+      );
+
+      return (
+        reply ||
+        'Üzgünüm, şu an uygun bir yanıt oluşturamadım. Tekrar söyler misiniz?'
+      );
+    } catch (err: any) {
+      this.parentLogger.error(
+        `[voice] AgentService error callId=${this.meta.callId}: ${
+          err?.stack || err?.message || err
+        }`,
+      );
+      return 'Üzgünüm, kısa bir teknik aksaklık oldu. Tekrar söyler misiniz?';
+    }
+  }
+
+  private async speakReply(replyText: string) {
+    const spoken = rewriteAgentReplyForVoice(replyText);
+    const clean = sanitizeReplyForVoice(spoken);
+    if (!clean || !this.sessionReady) return;
+
+    // Interrupt any previous playback before starting the next answer.
+    this.cancelAssistantAudio();
+
+    this.lastBotReplyText = clean;
+    this.assistantSpeaking = true;
+    this.assistantStartedAt = Date.now();
+
+    this.parentLogger.log(
+      `[voice] speakReply callId=${this.meta.callId} text="${clean}"`,
+    );
+
+    try {
+      const token = ++this.playbackToken;
+      const audioBuffer = await this.generateElevenLabsAudio(clean);
+
+      if (audioBuffer && token === this.playbackToken) {
+        this.parentLogger.log(
+          `[voice] ElevenLabs audio ok callId=${this.meta.callId} bytes=${audioBuffer.length}`,
+        );
+        this.streamUlawBuffer(audioBuffer, token);
+        return;
+      }
+    } catch (err) {
+      this.parentLogger.error(`[voice] ElevenLabs TTS error: ${err}`);
+    }
+
+    // Fallback to OpenAI realtime TTS only if ElevenLabs fails.
+    this.parentLogger.warn(
+      `[voice] ElevenLabs unavailable, falling back to OpenAI TTS callId=${this.meta.callId}`,
+    );
+
+    this.sendOpenAi({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text:
+              'Aşağıdaki metni aynen seslendir. Ekstra kelime ekleme. Tek bir ses ve tek bir persona kullan. Türkçe, sakin, net ve doğal konuş. Saati doğal telaffuz et; 14:00 için saat iki, 16:30 için dört buçuk de. Parantez, emoji, madde imi ve sembolleri okuma:\n' +
+              clean,
+          },
+        ],
+      },
+    });
+
+    this.sendOpenAi({
+      type: 'response.create',
+      response: {
+        modalities: ['audio', 'text'],
+      },
+    });
+  }
+
+  private async generateElevenLabsAudio(
+    text: string,
+  ): Promise<Buffer | null> {
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    const voiceId = process.env.ELEVENLABS_VOICE_ID;
+    if (!apiKey || !voiceId) {
+      this.parentLogger.error(
+        '[voice] ElevenLabs API key or voice ID missing',
+      );
+      return null;
+    }
+
+    const controller = new AbortController();
+    this.currentTtsAbort = controller;
+
+    try {
+      const modelId =
+        process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
+
+      const response = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'xi-api-key': apiKey,
+          },
+          body: JSON.stringify({
+            text,
+            model_id: modelId,
+            language_code: 'tr',
+            voice_settings: {
+              stability: 0.35,
+              similarity_boost: 0.8,
+              speed: 1.08,
+            },
+          }),
+          signal: controller.signal,
+        },
+      );
+
+      if (!response.ok) {
+        const bodyText = await response.text();
+        this.parentLogger.error(
+          `[voice] ElevenLabs TTS error: ${response.status} ${bodyText}`,
+        );
+        return null;
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      return Buffer.from(arrayBuffer);
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        this.parentLogger.warn(
+          `[voice] ElevenLabs synthesis aborted callId=${this.meta.callId}`,
+        );
+        return null;
+      }
+      this.parentLogger.error(`[voice] ElevenLabs TTS error: ${err}`);
+      return null;
+    } finally {
+      if (this.currentTtsAbort === controller) {
+        this.currentTtsAbort = null;
+      }
+    }
+  }
+
+  private streamUlawBuffer(buf: Buffer, token: number) {
+    if (!buf.length || token !== this.playbackToken) return;
+
+    let offset = 0;
+    const tick = () => {
+      if (this.closed) return;
+      if (token !== this.playbackToken) return;
+
+      if (!this.assistantSpeaking) return;
+
+      const chunk = buf.subarray(offset, offset + this.ulawFrameBytes);
+      if (!chunk.length) {
+        this.assistantSpeaking = false;
+        this.playbackTimer = null;
+        return;
+      }
+
+      this.lastAssistantAudioAt = Date.now();
+
+      this.sendBridge({
+        event: 'media',
+        media: { payload: chunk.toString('base64') },
+      });
+
+      offset += this.ulawFrameBytes;
+      this.playbackTimer = setTimeout(tick, this.ulawFrameMs);
+    };
+
+    tick();
+  }
+
+  private sendOpenAi(obj: any) {
+    if (!this.openaiWs || this.openaiWs.readyState !== WebSocket.OPEN) return;
+    this.openaiWs.send(JSON.stringify(obj));
+  }
+
+  private sendBridge(obj: any) {
+    if (this.clientWs.readyState !== WebSocket.OPEN) return;
+    this.clientWs.send(JSON.stringify(obj));
+  }
+
+  private safeClose() {
+    if (this.closed) return;
+    this.closed = true;
+
+    this.cancelAssistantAudio();
+
+    try {
+      if (this.openaiWs && this.openaiWs.readyState === WebSocket.OPEN) {
+        this.openaiWs.close();
+      }
+    } catch {}
+
+    try {
+      if (this.clientWs.readyState === WebSocket.OPEN) {
+        this.clientWs.close();
+      }
+    } catch {}
+  }
 }
+
+function extractReplyText(result: any): string {
+  if (!result) return '';
+
+  if (typeof result === 'string') return result.trim();
+
+  const candidates = [
+    result.text,
+    result.reply,
+    result.message,
+    result.finalText,
+    result.replyText,
+    result.assistantText,
+    result.outputText,
+    result.content,
+  ];
+
+  for (const item of candidates) {
+    if (typeof item === 'string' && item.trim()) {
+      return item.trim();
+    }
+  }
+
+  if (Array.isArray(result.messages) && result.messages.length) {
+    const last = result.messages[result.messages.length - 1];
+    if (typeof last === 'string' && last.trim()) return last.trim();
+    if (typeof last?.text === 'string' && last.text.trim())
+      return last.text.trim();
+    if (typeof last?.content === 'string' && last.content.trim())
+      return last.content.trim();
+  }
+
+  return '';
+}
+
+function isNamePrompt(text: string) {
+  const lower = String(text || '').toLocaleLowerCase('tr-TR');
+
+  return (
+    lower.includes('adın ne') ||
+    lower.includes('adiniz ne') ||
+    lower.includes('adınız ne') ||
+    lower.includes('adın ve soyadın nedir') ||
+    lower.includes('adınız ve soyadınız nedir') ||
+    lower.includes('ismin nedir') ||
+    lower.includes('isminiz nedir') ||
+    lower.includes('soyad')
+  );
+}
+
+function normalizeTranscriptForAgent(
+  raw: string,
+  lastBotReplyText: string,
+): string {
+  let text = String(raw || '').trim();
+
+  text = text
+    .replace(/[“”"']/g, '')
+    .replace(/[،,;!?]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const lastBot = String(lastBotReplyText || '').toLocaleLowerCase('tr-TR');
+
+  if (
+    /^evet[.!]*$/i.test(text) ||
+    /^onayl[ıi]yorum[.!]*$/i.test(text) ||
+    /^tamam[.!]*$/i.test(text)
+  ) {
+    return 'evet';
+  }
+
+  if (
+    /^hay[ıi]r[.!]*$/i.test(text) ||
+    /^istemiyorum[.!]*$/i.test(text)
+  ) {
+    return 'hayır';
+  }
+
+  if (/^\d{1,2}[.:]\d{2}[.]?$/.test(text)) {
+    return text.replace(/\./g, ':').replace(/:+/g, ':').replace(/:$/, '');
+  }
+
+  const askedService =
+    lastBot.includes('hangi hizmet') || lastBot.includes('hangi işlem');
+  if (askedService) {
+    if (/^lazer[.!]*$/i.test(text)) return 'Lazer epilasyon';
+    return text;
+  }
+
+  const askedStaff =
+    lastBot.includes('hangi personel') ||
+    lastBot.includes('kiminle olsun') ||
+    lastBot.includes('isim söyleyebilirsiniz');
+  if (askedStaff) {
+    return text
+      .replace(/\bhan[ıi]m\b/gi, '')
+      .replace(/\bbey\b/gi, '')
+      .replace(/[.!?]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  const askedTime =
+    lastBot.includes('uygun saati') ||
+    lastBot.includes('saat kaç') ||
+    lastBot.includes('saat alayım') ||
+    lastBot.includes('gün ve saat') ||
+    lastBot.includes('hangi gün/saat') ||
+    lastBot.includes('hangi gün ve saatte');
+  if (askedTime) {
+    const normalizedTime = parseTurkishVoiceDateTime(text);
+    if (normalizedTime) return normalizedTime;
+  }
+
+  const askedConfirmation =
+    lastBot.includes('onaylıyor musunuz') ||
+    lastBot.includes('randevu bilgileri doğruysa') ||
+    lastBot.includes('doğru mu');
+  if (askedConfirmation) {
+    const lower = text.toLocaleLowerCase('tr-TR');
+    if (lower.includes('evet') || lower.includes('onay')) return 'evet';
+    if (lower.includes('hayır') || lower.includes('iptal')) return 'hayır';
+  }
+
+  return text;
+}
+
+function normalizeTurkishForTime(s: string) {
+  return String(s || '')
+    .toLocaleLowerCase('tr-TR')
+    .replace(/ç/g, 'c')
+    .replace(/ğ/g, 'g')
+    .replace(/ı/g, 'i')
+    .replace(/ö/g, 'o')
+    .replace(/ş/g, 's')
+    .replace(/ü/g, 'u')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseTurkishVoiceDateTime(text: string): string | null {
+  const t = normalizeTurkishForTime(text)
+    .replace(/\buygundur\b/g, '')
+    .replace(/\bolsun\b/g, '')
+    .replace(/\brandevu\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const explicit = t.match(/\b(\d{1,2})[:.](\d{2})\b/);
+  let hh: number | null = null;
+  let mm = 0;
+
+  if (explicit) {
+    hh = Number(explicit[1]);
+    mm = Number(explicit[2]);
+  } else {
+    const numberWordMap: Record<string, number> = {
+      oniki: 12,
+      'on iki': 12,
+      onbir: 11,
+      'on bir': 11,
+      on: 10,
+      dokuz: 9,
+      sekiz: 8,
+      yedi: 7,
+      alti: 6,
+      bes: 5,
+      dort: 4,
+      uc: 3,
+      iki: 2,
+      bir: 1,
+    };
+
+    for (const [word, value] of Object.entries(numberWordMap)) {
+      if (new RegExp(`\\b${word}\\b`).test(t)) {
+        hh = value;
+        break;
+      }
+    }
+
+    if (hh == null) {
+      const numeric = t.match(/\b(\d{1,2})\b/);
+      if (numeric) hh = Number(numeric[1]);
+    }
+
+    if (t.includes('bucuk')) mm = 30;
+    if (t.includes('ceyrek')) mm = 15;
+  }
+
+  if (hh == null) return null;
+
+  const hasMorning = t.includes('sabah');
+  const hasNoon = t.includes('ogle') || t.includes('oglen');
+  const hasEvening = t.includes('aksam') || t.includes('gece');
+  const hasTomorrow = t.includes('yarin');
+  const hasToday = t.includes('bugun');
+
+  if (hasEvening && hh >= 1 && hh <= 11) hh += 12;
+  else if (hasNoon && hh >= 1 && hh <= 5) hh += 12;
+  else if (!hasMorning && !hasNoon && !hasEvening && hh >= 1 && hh <= 7)
+    hh += 12;
+
+  const timeText = `${String(hh).padStart(2, '0')}:${String(mm).padStart(
+    2,
+    '0',
+  )}`;
+
+  if (hasTomorrow) return `yarın ${timeText}`;
+  if (hasToday) return `bugün ${timeText}`;
+  return timeText;
+}
+
+function sanitizeReplyForVoice(text: string) {
+  return String(text || '')
+    .replace(/\*\*/g, '')
+    .replace(/[_`#]/g, '')
+    .replace(/[\u{1F300}-\u{1FAFF}]/gu, '')
+    .replace(/[•·]/g, ' ')
+    .replace(/[“”]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function rewriteAgentReplyForVoice(replyText: string) {
+  let text = String(replyText || '').trim();
+  const lower = text.toLocaleLowerCase('tr-TR');
+
+  text = text
+    .replace(/[\u{1F300}-\u{1FAFF}]/gu, '')
+    .replace(/\*\*/g, '')
+    .replace(/[_`#]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  text = text.replace(/yazar mısınız/gi, 'söyler misiniz');
+  text = text.replace(/yazar misiniz/gi, 'söyler misiniz');
+  text = text.replace(/\(E\/H\)/gi, '');
+  text = text.replace(/\bE\/H\b/gi, '');
+
+  if (
+    lower.includes('en son') &&
+    lower.includes('randevu ayarlayayım mı')
+  ) {
+    return 'En son lazer işleminiz vardı. Yine lazer için devam edelim mi?';
+  }
+
+  if (lower.startsWith('randevu özeti:')) {
+    return 'Randevu bilgileri doğruysa onaylıyor musunuz?';
+  }
+
+  if (
+    lower.includes('kiminle olsun') ||
+    lower.includes('hangi personeli')
+  ) {
+    return 'Hangi personeli tercih edersiniz? İsim söyleyebilirsiniz ya da fark etmez diyebilirsiniz.';
+  }
+
+  if (lower.includes('o saat dolu') || lower.includes('şunlar uygun')) {
+    const slots = [
+      ...text.matchAll(/\b(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\b/g),
+    ].slice(0, 3);
+
+    if (slots.length) {
+      const spoken = slots.map((m) => naturalTimeSpeech(m[2])).join(', ');
+      return `O saat dolu. En yakın uygun saatler ${spoken}. Başka bir saat de söyleyebilirsiniz.`;
+    }
+
+    return 'O saat dolu. Yakın bir saat söyleyebilir misiniz?';
+  }
+
+  if (
+    lower.includes('randevu tamam') ||
+    lower.includes('randevunuz oluşturuldu') ||
+    lower.includes('kayıt:')
+  ) {
+    const m = text.match(/\b(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\b/);
+    if (m) return `Randevunuz onaylandı. ${m[1]} ${naturalTimeSpeech(m[2])}.`;
+    return 'Randevunuz onaylandı.';
+  }
+
+  if (
+    lower.includes('randevu oluştururken bir şey ters gitti') ||
+    lower.includes('başka bir saat dener misin') ||
+    lower.includes('bir hata oldu')
+  ) {
+    return 'Randevu oluşturulamadı. Başka bir saat deneyelim.';
+  }
+
+  if (
+    lower.includes('adın ne') ||
+    lower.includes('adınız ve soyadınız') ||
+    lower.includes('isminizi alabilir miyim')
+  ) {
+    return 'İsim almadan devam edelim. Gün ve saat söyleyebilirsiniz.';
+  }
+
+  text = text
+    .replace(/[•]/g, ' ')
+    .replace(/[()]/g, ' ')
+    .replace(/\s*\/\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return text;
+}
+
+function naturalTimeSpeech(hhmm: string) {
+  const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return hhmm;
+
+  let hh = Number(m[1]);
+  const mm = Number(m[2]);
+
+  if (hh > 12) hh -= 12;
+  if (hh === 0) hh = 12;
+
+  const hourWords = [
+    'sıfır',
+    'bir',
+    'iki',
+    'üç',
+    'dört',
+    'beş',
+    'altı',
+    'yedi',
+    'sekiz',
+    'dokuz',
+    'on',
+    'on bir',
+    'on iki',
+  ];
+
+  const base = hourWords[hh] || String(hh);
+
+  if (mm === 0) return `saat ${base}`;
+  if (mm === 15) return `saat ${base} on beş`;
+  if (mm === 30) return `${base} buçuk`;
+
+  return `saat ${base} ${String(mm).padStart(2, '0')}`;
+}
+
+function normalizePhone(input: string) {
+  const raw = String(input || '').trim();
+  if (!raw) return 'voice-caller';
+
+  const digits = raw.replace(/\D/g, '');
+  if (!digits) return 'voice-caller';
+
+  if (digits.startsWith('90')) return `+${digits}`;
+  if (digits.startsWith('0')) return `+9${digits}`;
+  return `+${digits}`;
+}
+
+function pcmuBase64Rms(payloadB64: string) {
+  const buf = Buffer.from(payloadB64, 'base64');
+  if (!buf.length) return 0;
+
+  let sumSq = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const sample = ulawToLinear16(buf[i]);
+    sumSq += sample * sample;
+  }
+
+  return Math.sqrt(sumSq / buf.length);
+}
+
+function ulawToLinear16(uVal: number) {
+  uVal = ~uVal & 0xff;
+  const sign = uVal & 0x80;
+  const exponent = (uVal >> 4) & 0x07;
+  const mantissa = uVal & 0x0f;
+  let sample = ((mantissa << 3) + 0x84) << exponent;
+  sample -= 0x84;
+  return sign ? -sample : sample;
 }

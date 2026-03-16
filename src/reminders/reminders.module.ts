@@ -1,16 +1,12 @@
 import { Module } from '@nestjs/common';
-import { ScheduleModule } from '@nestjs/schedule';
 import { RemindersService } from './reminders.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { NotificationsModule } from '../notifications/notifications.module';
+import { RemindersController } from './reminders.controller';
+import { WhatsappModule } from '../whatsapp/whatsapp.module';
 
 @Module({
-  imports: [
-    // Not: ScheduleModule.forRoot() genelde AppModule'da 1 kez olur.
-    // Ama şu an hızlı fix için burada kalsa da çalışır.
-    ScheduleModule.forRoot(),
-    NotificationsModule,
-  ],
+  imports: [WhatsappModule],
+  controllers: [RemindersController],
   providers: [RemindersService, PrismaService],
   exports: [RemindersService],
 })

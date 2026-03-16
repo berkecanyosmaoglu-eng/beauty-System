@@ -4,9 +4,10 @@ import { BotService } from './bot.service';
 import { RealtimeBridgeService } from './realtime-bridge.service';
 import { AppointmentsModule } from '../appointments/appointments.module';
 import { NotifyModule } from '../notify/notify.module';
+import { AgentModule } from '../agent/agent.module';
 
 @Module({
-  imports: [AppointmentsModule, NotifyModule],
+  imports: [AppointmentsModule, NotifyModule, AgentModule],
   controllers: [BotController],
   providers: [BotService, RealtimeBridgeService],
 })

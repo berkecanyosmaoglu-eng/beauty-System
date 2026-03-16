@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Param, Body, Query, BadRequestException } from '@nestjs/common';
 import { StaffService } from './staff.service';
 import { CreateStaffDto } from './dto/create-staff.dto';
 import { UpdateStaffDto } from './dto/update-staff.dto';
@@ -8,27 +8,30 @@ export class StaffController {
   constructor(private readonly staffService: StaffService) {}
 
   @Post()
-  create(@Body() dto: CreateStaffDto) {
+  async create(@Body() dto: CreateStaffDto) {
+    // create zaten dto içinden tenantId/fullName kontrol ediyor
     return this.staffService.create(dto);
   }
 
   @Get()
-  findAll(@Query('tenantId') tenantId?: string) {
-    return this.staffService.findAll(tenantId);
+  async findAll(@Query('tenantId') tenantId?: string) {
+    const tid = String(tenantId || '').trim();
+    if (!tid) throw new BadRequestException('tenantId gerekli');
+    return this.staffService.findAll(tid);
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string) {
+  async findOne(@Param('id') id: string) {
     return this.staffService.findOne(id);
   }
 
   @Patch(':id')
-  update(@Param('id') id: string, @Body() dto: UpdateStaffDto) {
+  async update(@Param('id') id: string, @Body() dto: UpdateStaffDto) {
     return this.staffService.update(id, dto);
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string) {
+  async remove(@Param('id') id: string) {
     return this.staffService.remove(id);
   }
 }

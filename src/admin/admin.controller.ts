@@ -67,10 +67,6 @@ export class AdminController {
     return this.admin.metrics({ tenantId, from, to });
   }
 
-  /**
-   * WhatsApp grafik datası
-   * GET /admin/whatsapp/series?tenantId=...&from=...&to=...&bucket=day|hour
-   */
   @Get('whatsapp/series')
   async whatsappSeries(
     @Query('tenantId') tenantId: string,
@@ -82,10 +78,6 @@ export class AdminController {
     return this.admin.whatsappSeries({ tenantId, from, to, bucket });
   }
 
-  /**
-   * WhatsApp inbox (konuşma listesi)
-   * GET /admin/whatsapp/conversations?tenantId=...&from=...&to=...&q=...&page=1&limit=30
-   */
   @Get('whatsapp/conversations')
   async whatsappConversations(
     @Query('tenantId') tenantId: string,
@@ -107,10 +99,6 @@ export class AdminController {
     });
   }
 
-  /**
-   * WhatsApp mesajlar (tek müşteri/peer ile)
-   * GET /admin/whatsapp/messages?tenantId=...&peer=...&from=...&to=...&page=1&limit=50
-   */
   @Get('whatsapp/messages')
   async whatsappMessages(
     @Query('tenantId') tenantId: string,

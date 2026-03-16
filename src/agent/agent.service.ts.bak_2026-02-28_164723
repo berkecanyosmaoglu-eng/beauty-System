@@ -1,0 +1,2689 @@
+import { Injectable, Logger } from '@nestjs/common';
+import OpenAI from 'openai';
+import { PrismaService } from '../prisma/prisma.service';
+import * as crypto from 'crypto';
+
+type BookingDraft = {
+  tenantId: string;
+  customerPhone: string;
+  customerName?: string | null;
+
+  serviceId?: string;
+  staffId?: string;
+
+  // ISO string (+03:00)
+  startAt?: string;
+};
+
+enum WaState {
+  IDLE = 'IDLE',
+
+  // booking
+  WAIT_SERVICE = 'WAIT_SERVICE',
+  WAIT_STAFF = 'WAIT_STAFF',
+  WAIT_NAME = 'WAIT_NAME',
+  WAIT_DATETIME = 'WAIT_DATETIME',
+  WAIT_CONFIRM = 'WAIT_CONFIRM',
+
+  // edit (change/cancel)
+  WAIT_APPT_PICK = 'WAIT_APPT_PICK',
+  WAIT_EDIT_ACTION = 'WAIT_EDIT_ACTION',
+}
+
+type HistoryTurn = {
+  role: 'user' | 'assistant';
+  text: string;
+  ts: number;
+};
+
+type SuggestionItem = {
+  id?: string;
+  label: string;
+  value: string;
+};
+
+type Suggestions = {
+  type: 'staff' | 'slot' | 'appt' | 'editAction';
+  items: SuggestionItem[];
+  ts: number;
+};
+
+type LearningProfile = {
+  preferredServiceId?: string | null;
+  preferredStaffId?: string | null;
+  preferredTimeHint?: string | null;
+  lastServiceId?: string | null;
+  lastStaffId?: string | null;
+  lastStartAt?: string | null;
+  updatedAt?: number;
+};
+
+type SessionState = {
+  state: WaState;
+  draft: BookingDraft;
+
+  pendingStartAt?: string;
+  pendingDateOnly?: string; // YYYY-MM-DD (TR)
+  pendingSummary?: string;
+
+  updatedAt: number;
+  history: HistoryTurn[];
+
+  lastAssistantReply?: string;
+  lastTopic?: string;
+  lastServiceId?: string;
+  repeatCount?: number;
+
+  lastUserTextNorm?: string;
+  lastUserAt?: number;
+
+  lastCreatedBookingKey?: string;
+  lastCreatedAppointmentId?: string;
+  lastCreatedAt?: number;
+
+  lastSuggestions?: Suggestions;
+
+  learningProfile?: LearningProfile;
+  learningLoadedAt?: number;
+
+  suggestedServiceId?: string;
+  suggestedServiceName?: string;
+
+  lastAssistantText?: string;
+
+  // ✅ Edit flow (change/cancel)
+  editMode?: 'RESCHEDULE' | 'CANCEL';
+  targetAppointmentId?: string;
+  targetApptSnapshot?: {
+    serviceId: string;
+    staffId: string;
+    startAtIso: string;
+    serviceName?: string;
+    staffName?: string;
+  };
+};
+
+type LearnedCustomerContext = {
+  customerId?: string;
+  name?: string | null;
+  summary?: string;
+  topServiceId?: string;
+  topServiceName?: string;
+};
+
+type UpcomingAppt = {
+  id: string;
+  serviceId: string;
+  staffId: string;
+  date: Date;
+  time: string;
+  startAtIso: string;
+  serviceName?: string;
+  staffName?: string;
+};
+
+@Injectable()
+export class AgentService {
+  private readonly logger = new Logger(AgentService.name);
+  private readonly openai =
+    process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+
+  constructor(private readonly prisma: PrismaService) {}
+
+  private sessions = new Map<string, SessionState>();
+
+  // =========================
+  // ✅ mini metin motoru
+  // =========================
+  private pickOne(list: string[], seedText?: string) {
+    if (!list?.length) return '';
+    const seed = normalizeTr(seedText || '') || String(Date.now());
+    let h = 0;
+    for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+    return list[h % list.length];
+  }
+
+private softYesNoHint(seed?: string) {
+  return this.pickOne(
+    [
+      'Onaylıyor musun?',
+      'Tamam mı, onaylayayım mı?',
+      'Bunu böyle kaydediyorum, doğru mu?',
+    ],
+    seed,
+  );
+}
+  private humanizeAsk(kind: 'service' | 'staff' | 'name' | 'datetime', seed?: string) {
+    if (kind === 'service') {
+      return this.pickOne(
+        ['Harika 🙂 Hangi işlem için randevu oluşturalım?', 'Tamam 👍 Hangi hizmeti istersiniz?', 'Süper. Hangi işlem için yardımcı olayım?'],
+        seed,
+      );
+    }
+    if (kind === 'staff') {
+      return this.pickOne(
+        [
+          'Kiminle olsun istersiniz? (İsterseniz “fark etmez” de diyebilirsiniz.)',
+          'Hangi personeli tercih edersiniz? (Fark etmez derseniz ben seçeyim.)',
+        ],
+        seed,
+      );
+    }
+    if (kind === 'name') {
+      return this.pickOne(['Randevuyu kimin adına yazalım? (Ad soyad)', 'İsminizi alabilir miyim? (Ad soyad yeterli)'], seed);
+    }
+    return this.pickOne(
+      [
+        'Hangi gün/saat uygun olur? (08:00-22:00, örn: “yarın 16:00”)',
+        'Ne zamana ayarlayalım? (Örn: “Salı 15:30” / “yarın 16:00”)',
+        'Gün ve saat alayım 🙂 (08:00-22:00, örn: “yarın 16:00”)',
+      ],
+      seed,
+    );
+  }
+
+  private humanizeAskTimeOnly(seed?: string) {
+    return this.pickOne(
+      ['Tamam 👍 Kaça ayarlayalım? (08:00-22:00, örn: “16:00”)', 'Süper. Saat kaç olsun? (Örn: “16:00”)', 'Harika 🙂 Saat alayım: (08:00-22:00)'],
+      seed,
+    );
+  }
+
+private humanizeConfirmNeedEH(seed?: string) {
+  return this.pickOne(
+    [
+      'Onay için “evet” ya da “hayır” yazar mısın?',
+      'Tamamsa “evet”, istemezsen “hayır” yazabilirsin.',
+    ],
+    seed,
+  );
+}
+  private formatBookingSuccess(startAtIso: string, apptId: string, seed?: string) {
+    return this.pickOne(
+      [
+        `Tamamdır ✅ Randevunuzu ayarladım.\n📅 ${prettyIstanbul(startAtIso)}\n🧾 Kayıt: ${apptId}`,
+        `Süper 🙂 Randevu tamam.\n📅 ${prettyIstanbul(startAtIso)}\n🧾 Kayıt: ${apptId}`,
+        `Harika ✅ Kaydettim.\n📅 ${prettyIstanbul(startAtIso)}\n🧾 Kayıt: ${apptId}`,
+      ],
+      seed || startAtIso + apptId,
+    );
+  }
+
+  private formatEditSuccess(startAtIso: string, apptId: string, seed?: string) {
+    return this.pickOne(
+      [
+        `Tamam ✅ Güncelledim.\n📅 ${prettyIstanbul(startAtIso)}\n🧾 Kayıt: ${apptId}`,
+        `Süper 🙂 Randevuyu güncelledim.\n📅 ${prettyIstanbul(startAtIso)}\n🧾 Kayıt: ${apptId}`,
+        `Harika ✅ Değişiklik kaydedildi.\n📅 ${prettyIstanbul(startAtIso)}\n🧾 Kayıt: ${apptId}`,
+      ],
+      seed || startAtIso + apptId,
+    );
+  }
+
+  // =========================
+  // MAIN
+  // =========================
+  async replyText(opts: { tenantId: string; from: string; text: string }): Promise<string> {
+    const { tenantId, from } = opts;
+    const raw = (opts.text ?? '').trim();
+    const msg = normalizeTr(raw);
+
+    const key = `${tenantId}:${from}`;
+    const session = this.getOrInitSession(key, tenantId, from);
+
+    if (this.isLikelyDuplicateInbound(session, raw)) {
+      const prev = session.lastAssistantReply || session.lastAssistantText || 'Tamam 👍';
+      return this.safeReply(session, prev);
+    }
+
+    this.recordHistory(session, 'user', raw);
+
+    try {
+      if (isCancel(msg)) {
+        this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+        this.saveSession(key, session);
+        return this.safeReply(session, 'Tamam 👍 İptal ettim. Yeni randevu için “randevu” yazabilirsin.');
+      }
+
+      if (isRestart(msg)) {
+        this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+        session.state = WaState.WAIT_SERVICE;
+        this.saveSession(key, session);
+
+        const services = await this.safeListServices(tenantId);
+        const reply = this.askService(services, { gentle: true });
+        return this.safeReply(session, reply);
+      }
+
+      const business = await (this.prisma as any).businessProfile?.findUnique({ where: { tenantId } }).catch(() => null);
+
+      const services = await this.safeListServices(tenantId);
+      const staff = await this.safeListStaff(tenantId);
+
+      const learned = await this.safeGetLearnedCustomerContext(tenantId, from, services);
+
+      if (learned?.name && !session.draft.customerName) {
+        session.draft.customerName = String(learned.name);
+      }
+
+      // ✅ Eğer bir flow içindeysek (booking/edit) state machine’e gir
+      if (session.state !== WaState.IDLE) {
+        const reply = await this.handleBookingFlow({
+          key,
+          session,
+          tenantId,
+          from,
+          msg,
+          raw,
+          services,
+          staff,
+        });
+        this.saveSession(key, session);
+        return this.safeReply(session, reply);
+      }
+
+
+// =========================
+// ✅ Upcoming appointment inquiry (IDLE iken): "randevum ne zaman / randevumu göster"
+// =========================
+if (looksLikeUpcomingQuery(raw)) {
+  const list = await this.safeListUpcomingAppointmentsByPhone(tenantId, from, 6);
+
+  if (!list?.length) {
+    return this.safeReply(session, 'Şu an görünen bir randevun yok 🙂');
+  }
+
+  if (list.length === 1) {
+    const a = list[0];
+    const line =
+      `Randevun şurada görünüyor:\n` +
+      `• ${prettyIstanbul(a.startAtIso)}` +
+      (a.serviceName ? ` • ${a.serviceName}` : '') +
+      (a.staffName ? ` • ${a.staffName}` : '');
+
+    return this.safeReply(session, line);
+  }
+
+  // birden fazlaysa listele
+  const lines = list
+    .slice(0, 6)
+    .map(
+      (a, i) =>
+        `${i + 1}) ${prettyIstanbul(a.startAtIso)}${a.serviceName ? ` • ${a.serviceName}` : ''}${a.staffName ? ` • ${a.staffName}` : ''}`,
+    )
+    .join('\n');
+
+  return this.safeReply(session, `Randevuların:\n${lines}\n\nDeğiştirmek/iptal etmek istersen “randevu değiştir” yaz 🙂`);
+}
+
+
+
+      // =========================
+      // ✅ Edit intent (IDLE iken): randevu iptal/değiştir
+      // =========================
+      if (looksLikeCancelIntent(raw) || looksLikeRescheduleIntent(raw) || looksLikeGenericEditIntent(raw)) {
+        const list = await this.safeListUpcomingAppointmentsByPhone(tenantId, from, 6);
+        if (!list?.length) return this.safeReply(session, 'Görünen bir randevunuz yok 🙂');
+
+        if (list.length === 1) {
+          // tek randevu -> direkt aksiyon sor
+          const a = list[0];
+          session.targetAppointmentId = String(a.id);
+          session.targetApptSnapshot = {
+            serviceId: String(a.serviceId),
+            staffId: String(a.staffId),
+            startAtIso: String(a.startAtIso),
+            serviceName: a.serviceName,
+            staffName: a.staffName,
+          };
+
+          // draft'ı mevcut randevudan doldur (edit yapacağız)
+          session.draft.serviceId = String(a.serviceId);
+          session.draft.staffId = String(a.staffId);
+          session.draft.startAt = String(a.startAtIso);
+
+          session.state = WaState.WAIT_EDIT_ACTION;
+          this.saveSession(key, session);
+          return this.safeReply(session, this.askEditActionMenu(session, a));
+        }
+
+        // çok randevu -> listele seçtir
+        session.state = WaState.WAIT_APPT_PICK;
+        this.saveSession(key, session);
+        return this.safeReply(session, this.askAppointmentPickMenu(session, list));
+      }
+
+      // =========================
+      // Booking intent
+      // =========================
+      if (looksLikeBookingIntent(raw)) {
+        const svc = this.detectServiceFromMessage(raw, services);
+        if (svc?.id) session.draft.serviceId = String(svc.id);
+
+        const parsed = parseDateTimeTR(raw);
+        if (parsed?.hasTime) {
+          session.pendingStartAt = toIstanbulIso(clampToFuture(parsed.dateUtc));
+          if (!session.draft.startAt && session.pendingStartAt) session.draft.startAt = session.pendingStartAt;
+          session.pendingDateOnly = undefined;
+        } else if (parsed?.dateOnly) {
+          session.pendingDateOnly = parsed.dateOnly;
+        }
+
+        if (!isNoPreferenceStaff(raw)) this.tryAutofillStaff(session.draft, staff, raw);
+
+        // Eğer hizmet yoksa, öğrenilmiş “en sık” hizmete E/H öner
+        if (!session.draft.serviceId && learned?.topServiceId && learned?.topServiceName) {
+          session.state = WaState.WAIT_SERVICE;
+          session.suggestedServiceId = learned.topServiceId;
+          session.suggestedServiceName = learned.topServiceName;
+          this.saveSession(key, session);
+
+          const q = this.pickOne(
+            [
+              `Geçen sefer ${learned.topServiceName} almıştınız. Yine aynı işlem için randevu olsun mu? (E/H)`,
+              `En son ${learned.topServiceName} yaptırmıştınız 🙂 Yine onun için randevu ayarlayayım mı? (E/H)`,
+            ],
+            from + learned.topServiceId,
+          );
+          return this.safeReply(session, q);
+        }
+
+        if (!session.draft.serviceId) {
+          session.state = WaState.WAIT_SERVICE;
+          this.saveSession(key, session);
+          return this.safeReply(session, await this.naturalAsk(session, 'service', { services, staff, business }));
+        }
+
+        if (staff && staff.length > 0 && !session.draft.staffId) {
+          session.state = WaState.WAIT_STAFF;
+          this.saveSession(key, session);
+          return this.safeReply(session, this.askStaffMenu(session, staff));
+        }
+
+        session.state = WaState.WAIT_NAME;
+        this.saveSession(key, session);
+        return this.safeReply(session, await this.naturalAsk(session, 'name', { services, staff, business }));
+      }
+
+      // =========================
+      // info flows
+      // =========================
+      if (looksLikePriceQuestion(msg)) {
+        const svc = this.detectServiceFromMessage(raw, services);
+        if (svc) {
+          const name = String(svc.name || 'Hizmet');
+          const price = svc.price ?? null;
+          const dur = svc.duration ?? null;
+
+          const parts: string[] = [];
+          if (price != null) parts.push(`${name} fiyatı: ${price}₺`);
+          else parts.push(`${name} için fiyat bilgisi henüz eklenmemiş görünüyor.`);
+          if (dur != null) parts.push(`Süre: ${dur} dk`);
+
+          const nudge = this.shouldNudgeBooking(session) ? '\nİstersen “randevu oluştur” yaz, hemen ayarlayalım.' : '';
+          return this.safeReply(session, parts.join(' • ') + nudge);
+        }
+        return this.safeReply(session, 'Hangi hizmetin fiyatını soruyorsun? (Örn: “Lazer epilasyon fiyatı”)');
+      }
+
+      if (looksLikeServiceListRequest(msg)) {
+        const list = servicesToTextShort(services);
+        if (!list) return this.safeReply(session, 'Şu an hizmet listem görünmüyor 😕 Birazdan tekrar dener misin?');
+        return this.safeReply(session, `Hizmetlerimiz:\n${list}`);
+      }
+
+      if (looksLikeAddressOrHours(msg)) {
+        const addr = business?.address || business?.fullAddress || business?.location || null;
+        const parts: string[] = [];
+        if (addr) parts.push(`📍 Adres: ${String(addr)}`);
+        parts.push(`⏰ Çalışma saatleri: Her gün 08:00 - 22:00`);
+        return this.safeReply(session, parts.join('\n'));
+      }
+
+      if (looksLikeProcedureQuestion(msg)) {
+        const svc = this.detectServiceFromMessage(raw, services);
+        session.lastTopic = 'procedure';
+        session.lastServiceId = svc && svc.id ? String(svc.id) : undefined;
+
+        let out = await this.answerWithLLM({
+          raw,
+          business,
+          services,
+          staff,
+          history: this.getRecentHistory(session, 8),
+          mode: 'procedure',
+          focusService: svc ? { name: String(svc.name || ''), duration: svc.duration, price: svc.price } : null,
+          learnedCustomerSummary: learned?.summary || '',
+        });
+
+        if (!out) {
+          const base = svc
+            ? this.procedureTemplateForService(String(svc.name || ''), svc.duration, svc.price)
+            : 'Genel olarak süreç kişiye göre değişir. Hangi işlem için soruyorsun? (Örn: lazer, kaş, tırnak)';
+          return this.safeReply(session, base);
+        }
+
+        if (session.lastAssistantReply && normalizeTr(session.lastAssistantReply) === normalizeTr(out)) {
+          const alt = await this.answerWithLLM({
+            raw,
+            business,
+            services,
+            staff,
+            history: this.getRecentHistory(session, 8),
+            mode: 'procedure',
+            focusService: svc ? { name: String(svc.name || ''), duration: svc.duration, price: svc.price } : null,
+            avoidRepeat: true,
+            learnedCustomerSummary: learned?.summary || '',
+          });
+          if (alt && normalizeTr(alt) !== normalizeTr(session.lastAssistantReply || '')) out = alt;
+          else out = 'Hangi bölge için düşünüyorsunuz?';
+        }
+
+        return this.safeReply(session, out);
+      }
+
+      session.lastTopic = 'general';
+      session.lastServiceId = undefined;
+
+      let llmAnswer = await this.answerWithLLM({
+        raw,
+        business,
+        services,
+        staff,
+        history: this.getRecentHistory(session, 8),
+        mode: 'general',
+        focusService: null,
+        learnedCustomerSummary: learned?.summary || '',
+      });
+
+      if (!llmAnswer) llmAnswer = '';
+
+      if (llmAnswer && session.lastAssistantReply && normalizeTr(session.lastAssistantReply) === normalizeTr(llmAnswer)) {
+        const alt = await this.answerWithLLM({
+          raw,
+          business,
+          services,
+          staff,
+          history: this.getRecentHistory(session, 8),
+          mode: 'general',
+          focusService: null,
+          avoidRepeat: true,
+          learnedCustomerSummary: learned?.summary || '',
+        });
+        llmAnswer =
+          alt && normalizeTr(alt) !== normalizeTr(session.lastAssistantReply || '')
+            ? alt
+            : 'Tam olarak ne öğrenmek istiyorsunuz?';
+      }
+
+      return this.safeReply(session, llmAnswer || 'Anlayamadım 😕 İstersen ne yapmak istediğini kısaca yaz.');
+    } catch (e: any) {
+      this.logger.error(`[AgentService.replyText] ${e?.message || e}`);
+      return this.safeReply(session, 'Şu an bir hata oluştu 😕 Lütfen tekrar dener misin?');
+    }
+  }
+
+  // =========================
+  // Booking + Edit State Machine
+  // =========================
+  private async handleBookingFlow(opts: {
+    key: string;
+    session: SessionState;
+    tenantId: string;
+    from: string;
+    msg: string;
+    raw: string;
+    services: any[];
+    staff: any[];
+  }): Promise<string> {
+    const { key, session, tenantId, from, msg, raw, services, staff } = opts;
+
+    // ✅ Edit/Booking flow içinde “konu değişti” diye çıkma:
+    // sadece net iptal/restart vs ile çıkıyoruz. (shouldExitBookingFlow daha agresifti)
+    if (session.state !== WaState.WAIT_APPT_PICK && session.state !== WaState.WAIT_EDIT_ACTION) {
+      if (!session.editMode && shouldExitBookingFlow(msg, raw)) {
+        this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+        this.saveSession(key, session);
+        return 'Tamam 👍 Anladım. Nasıl yardımcı olayım?';
+      }
+    }
+
+    // ✅ Edit başlangıcı: randevu seçimi
+    if (session.state === WaState.WAIT_APPT_PICK) {
+      const list = await this.safeListUpcomingAppointmentsByPhone(tenantId, from, 6);
+      if (!list?.length) {
+        this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+        return 'Görünen bir randevunuz yok 🙂';
+      }
+
+      const picked = this.pickFromSuggestions(session, raw);
+      let apptId = '';
+      if (picked?.type === 'appt' && picked.apptId) apptId = picked.apptId;
+
+      // kullanıcı isim/tarih yazarak da seçmeye çalışabilir -> basit match
+      if (!apptId) {
+        const t = normalizeTr(raw);
+        const hit = list.find((a) => normalizeTr(`${a.serviceName || ''} ${a.staffName || ''} ${prettyIstanbul(a.startAtIso)}`).includes(t));
+        if (hit) apptId = hit.id;
+      }
+
+      const chosen = list.find((a) => String(a.id) === String(apptId)) || null;
+      if (!chosen) {
+        return this.askAppointmentPickMenu(session, list);
+      }
+
+      session.targetAppointmentId = String(chosen.id);
+      session.targetApptSnapshot = {
+        serviceId: String(chosen.serviceId),
+        staffId: String(chosen.staffId),
+        startAtIso: String(chosen.startAtIso),
+        serviceName: chosen.serviceName,
+        staffName: chosen.staffName,
+      };
+
+      // draft'ı seçilen randevudan doldur
+      session.draft.serviceId = String(chosen.serviceId);
+      session.draft.staffId = String(chosen.staffId);
+      session.draft.startAt = String(chosen.startAtIso);
+
+      session.state = WaState.WAIT_EDIT_ACTION;
+      return this.askEditActionMenu(session, chosen);
+    }
+
+    // ✅ Edit aksiyonu: neyi değiştirelim / iptal
+    if (session.state === WaState.WAIT_EDIT_ACTION) {
+      if (!session.targetAppointmentId || !session.targetApptSnapshot) {
+        session.state = WaState.IDLE;
+        return 'Bir şey kaçtı 😕 Tekrar “randevu değiştir” yazar mısın?';
+      }
+
+      // kullanıcı direkt "iptal" yazarsa
+      if (looksLikeCancelIntent(raw)) {
+        session.editMode = 'CANCEL';
+        session.pendingSummary = this.buildEditCancelSummary(session.targetApptSnapshot);
+        session.state = WaState.WAIT_CONFIRM;
+        return `${session.pendingSummary}\n${this.softYesNoHint(from + session.targetAppointmentId)}`;
+      }
+
+      // kullanıcı direkt yeni tarih/saat yazarsa -> saat değişikliği
+      const parsed = parseDateTimeTR(raw);
+      if (parsed?.hasTime) {
+        const iso = toIstanbulIso(clampToFuture(parsed.dateUtc));
+        session.editMode = 'RESCHEDULE';
+        session.draft.startAt = iso;
+        session.pendingDateOnly = undefined;
+        // onay hazırlığı
+        const pre = await this.precheckAndPrepareConfirm({ tenantId, draft: session.draft, ignoreAppointmentId: session.targetAppointmentId });
+        if (!pre.ok) {
+          if (pre.code === 'OUT_OF_HOURS' && pre.suggestions?.length) {
+            session.draft.startAt = undefined;
+            const isoList = pre.suggestions.map((s) => s.startAt);
+            return this.askSlotMenu(session, isoList, `Bu saatlerde çalışmıyoruz 😕 (08:00 - 22:00)\nŞunlar uygun:`);
+          }
+          if (pre.code === 'SLOT_TAKEN' && pre.suggestions?.length) {
+            session.draft.startAt = undefined;
+            const isoList = pre.suggestions.map((s) => s.startAt);
+            return this.askSlotMenu(session, isoList, `O saat dolu 😕 Şunlar uygun:`);
+          }
+          session.draft.startAt = undefined;
+          return 'O zamanı ayarlayamadım 😕 Başka bir tarih/saat dener misin?';
+        }
+        session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
+        session.state = WaState.WAIT_CONFIRM;
+        return `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+      } else if (parsed?.dateOnly) {
+        session.editMode = 'RESCHEDULE';
+        session.pendingDateOnly = parsed.dateOnly;
+        session.state = WaState.WAIT_DATETIME;
+        return this.humanizeAskTimeOnly(raw);
+      }
+
+      // menü seçimi
+      const picked = this.pickFromSuggestions(session, raw);
+      const act = picked?.type === 'editAction' ? picked.action : '';
+
+      const t = normalizeTr(raw);
+      const wantsTime =
+        act === 'TIME' || t.includes('saat') || t.includes('tarih') || t.includes('gun') || t.includes('gün') || t.includes('ertele') || t.includes('degis') || t.includes('değiş');
+      const wantsService =
+        act === 'SERVICE' || t.includes('hizmet') || t.includes('islem') || t.includes('işlem');
+      const wantsStaff =
+        act === 'STAFF' || t.includes('usta') || t.includes('personel') || t.includes('calisan') || t.includes('çalışan');
+      const wantsCancel =
+        act === 'CANCEL' || t === 'iptal' || t.includes('iptal');
+      const wantsAbort =
+        act === 'ABORT' || t.includes('vazgec') || t.includes('vazgeç') || t.includes('bosver') || t.includes('boşver');
+
+      if (wantsAbort) {
+        this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+        this.saveSession(key, session);
+        return 'Tamam 👍 Vazgeçtik. Nasıl yardımcı olayım?';
+      }
+
+      if (wantsCancel) {
+        session.editMode = 'CANCEL';
+        session.pendingSummary = this.buildEditCancelSummary(session.targetApptSnapshot);
+        session.state = WaState.WAIT_CONFIRM;
+        return `${session.pendingSummary}\n${this.softYesNoHint(from + session.targetAppointmentId)}`;
+      }
+
+      if (wantsService) {
+        session.editMode = 'RESCHEDULE';
+        session.state = WaState.WAIT_SERVICE;
+        // öneri id'leri reset
+        session.suggestedServiceId = undefined;
+        session.suggestedServiceName = undefined;
+        return this.askService(services, { gentle: true });
+      }
+
+      if (wantsStaff) {
+        session.editMode = 'RESCHEDULE';
+        session.state = WaState.WAIT_STAFF;
+        return this.askStaffMenu(session, staff);
+      }
+
+      if (wantsTime) {
+        session.editMode = 'RESCHEDULE';
+        session.state = WaState.WAIT_DATETIME;
+        session.draft.startAt = undefined; // yeni zaman al
+        session.pendingDateOnly = undefined;
+        session.pendingStartAt = undefined;
+        return this.humanizeAsk('datetime', raw);
+      }
+
+return this.askEditActionMenu(session, {
+  id: session.targetAppointmentId || '',
+  startAtIso: session.targetApptSnapshot.startAtIso,
+  serviceName: session.targetApptSnapshot.serviceName,
+  staffName: session.targetApptSnapshot.staffName,
+});    }
+
+    // =========================
+    // normal booking states (WAIT_SERVICE/STAFF/NAME/DATETIME/CONFIRM)
+    // BUT: editMode varsa CONFIRM’da CREATE değil UPDATE/CANCEL
+    // =========================
+
+    const parsedEarly = parseDateTimeTR(raw);
+    if (parsedEarly?.hasTime) {
+      session.pendingStartAt = toIstanbulIso(clampToFuture(parsedEarly.dateUtc));
+      if (!session.draft.startAt && session.pendingStartAt) session.draft.startAt = session.pendingStartAt;
+      session.pendingDateOnly = undefined;
+    } else if (parsedEarly?.dateOnly) {
+      session.pendingDateOnly = parsedEarly.dateOnly;
+    }
+
+    this.tryAutofillService(session.draft, services, raw);
+    if (!isNoPreferenceStaff(raw)) this.tryAutofillStaff(session.draft, staff, raw);
+
+    const picked = this.pickFromSuggestions(session, raw);
+    if (picked?.type === 'staff' && picked.staffId) session.draft.staffId = picked.staffId;
+    if (picked?.type === 'slot' && picked.startAt) {
+      session.draft.startAt = picked.startAt;
+      session.pendingStartAt = picked.startAt;
+      session.pendingDateOnly = undefined;
+    }
+
+    if (!session.draft.serviceId && services.length === 1 && services[0]?.id) session.draft.serviceId = String(services[0].id);
+    if (!session.draft.staffId && staff.length === 1 && staff[0]?.id) session.draft.staffId = String(staff[0].id);
+
+    if (session.state === WaState.WAIT_SERVICE) {
+      if (!session.draft.serviceId && session.suggestedServiceId) {
+        if (isYes(msg)) {
+          session.draft.serviceId = session.suggestedServiceId;
+          session.suggestedServiceId = undefined;
+          session.suggestedServiceName = undefined;
+        } else if (isNo(msg)) {
+          session.suggestedServiceId = undefined;
+          session.suggestedServiceName = undefined;
+          return await this.naturalAsk(session, 'service', { services, staff, business: null });
+        }
+      }
+
+      // edit mode: hizmet seçildi -> confirm’a git (mevcut staff+time ile)
+      if (session.editMode) {
+        if (!session.draft.serviceId) return await this.naturalAsk(session, 'service', { services, staff, business: null });
+
+        const pre = await this.precheckAndPrepareConfirm({
+          tenantId,
+          draft: session.draft,
+          ignoreAppointmentId: session.targetAppointmentId || undefined,
+        });
+
+        if (!pre.ok) {
+          session.draft.serviceId = undefined;
+          return 'Bu hizmetle şu anki randevu çakışıyor gibi 😕 Başka bir hizmet seçebilir misin?';
+        }
+
+        session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
+        session.state = WaState.WAIT_CONFIRM;
+        return `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+      }
+
+      if (!session.draft.serviceId) return await this.naturalAsk(session, 'service', { services, staff, business: null });
+      session.state = WaState.WAIT_STAFF;
+    }
+
+    if (session.state === WaState.WAIT_STAFF) {
+      if (!staff || staff.length === 0) {
+        return 'Şu an personel listem görünmüyor 😕 Birazdan tekrar dener misin?';
+      } else {
+        if (isNoPreferenceStaff(raw)) {
+          session.draft.staffId = String(staff[0].id);
+          session.state = session.editMode ? WaState.WAIT_CONFIRM : WaState.WAIT_NAME;
+        } else if (!session.draft.staffId) {
+          return this.askStaffMenu(session, staff);
+        } else {
+          session.state = session.editMode ? WaState.WAIT_CONFIRM : WaState.WAIT_NAME;
+        }
+      }
+
+      // edit moddaysak staff seçildi -> confirm hazırla
+      if (session.editMode) {
+        const pre = await this.precheckAndPrepareConfirm({
+          tenantId,
+          draft: session.draft,
+          ignoreAppointmentId: session.targetAppointmentId || undefined,
+        });
+        if (!pre.ok) {
+          session.draft.staffId = undefined;
+          if (pre.code === 'SLOT_TAKEN') return 'O personelin o saati dolu 😕 Başka bir personel seçelim mi?';
+          return 'Bu personelle şu anki randevu çakışıyor gibi 😕 Başka bir personel seçebilir misin?';
+        }
+        session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
+        session.state = WaState.WAIT_CONFIRM;
+        return `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+      }
+    }
+
+    if (session.state === WaState.WAIT_NAME) {
+      if (!session.draft.customerName) {
+        const maybeName = extractName(raw);
+        const looksLikeStaffName = staff?.some(
+          (p: any) => normalizePersonName(String(p?.name || '')) === normalizePersonName(raw),
+        );
+        if (!looksLikeStaffName && !session.draft.customerName && maybeName) session.draft.customerName = maybeName;
+      }
+
+      if (!session.draft.customerName) return await this.naturalAsk(session, 'name', { services, staff, business: null });
+      session.state = WaState.WAIT_DATETIME;
+    }
+
+    if (session.state === WaState.WAIT_DATETIME) {
+      let startIso = session.draft.startAt;
+
+// ✅ kullanıcı "yarın 10:40" gibi net tarih+saat verdiyse dateOnly'yi sıfırla
+if (parsedEarly?.hasTime) {
+  session.pendingDateOnly = undefined;
+}
+      if (!startIso) {
+        const parsed = parseDateTimeTR(raw);
+
+        if (!parsed && session.pendingDateOnly) return this.humanizeAskTimeOnly(raw);
+        if (parsed && !parsed.hasTime && session.pendingDateOnly) return this.humanizeAskTimeOnly(raw);
+
+        const onlyTime = parseTimeBest(normalizeTr(raw));
+        if (onlyTime && session.pendingDateOnly) {
+          const [yy, mm, dd] = session.pendingDateOnly.split('-').map(Number);
+          const dUtc = new Date(Date.UTC(yy, mm - 1, dd, onlyTime.hh - 3, onlyTime.mm, 0, 0));
+          const fixed = clampToFuture(dUtc);
+          startIso = toIstanbulIso(fixed);
+          session.draft.startAt = startIso;
+          session.pendingDateOnly = undefined;
+        } else if (parsed?.hasTime) {
+          const fixed = clampToFuture(parsed.dateUtc);
+          startIso = toIstanbulIso(fixed);
+          session.draft.startAt = startIso;
+          session.pendingDateOnly = undefined;
+        } else {
+          const picked2 = this.pickFromSuggestions(session, raw);
+          if (picked2?.type === 'slot' && picked2.startAt) {
+            startIso = picked2.startAt;
+            session.draft.startAt = startIso;
+          } else {
+            return this.humanizeAsk('datetime', raw);
+          }
+        }
+      }
+
+      if (startIso && !isWithinWorkingHoursIso(startIso)) {
+        session.draft.startAt = undefined;
+        session.pendingStartAt = undefined;
+
+        const suggestions = suggestWorkingHourAlternatives(startIso, 5);
+        return this.askSlotMenu(session, suggestions, `Bu saatlerde çalışmıyoruz 😕\n⏰ 08:00 - 22:00\nŞunlar uygun olabilir:`);
+      }
+
+      const pre = await this.precheckAndPrepareConfirm({
+        tenantId,
+        draft: session.draft,
+        ignoreAppointmentId: session.targetAppointmentId || undefined,
+      });
+
+      if (!pre.ok) {
+        if (pre.code === 'OUT_OF_HOURS' && pre.suggestions?.length) {
+          session.draft.startAt = undefined;
+          const isoList = pre.suggestions.map((s) => s.startAt);
+          return this.askSlotMenu(session, isoList, `Bu saatlerde çalışmıyoruz 😕 (08:00 - 22:00)\nŞunlar uygun:`);
+        }
+
+        if (pre.code === 'SLOT_TAKEN' && pre.suggestions?.length) {
+          session.draft.startAt = undefined;
+          const isoList = pre.suggestions.map((s) => s.startAt);
+          return this.askSlotMenu(session, isoList, `O saat dolu 😕 Şunlar uygun:`);
+        }
+
+        session.draft.startAt = undefined;
+        return this.pickOne(['Randevu kontrolünde bir sorun oldu 😕 Farklı bir saat dener misin?', 'Bir şey takıldı 😕 Başka bir saat deneyelim mi?'], raw);
+      }
+
+      session.pendingSummary = session.editMode ? `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}` : pre.summary!;
+      session.state = WaState.WAIT_CONFIRM;
+
+      return `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+    }
+
+    if (session.state === WaState.WAIT_CONFIRM) {
+      const parsed = parseDateTimeTR(raw);
+      if (parsed?.hasTime) {
+        const iso = toIstanbulIso(clampToFuture(parsed.dateUtc));
+        if (!isWithinWorkingHoursIso(iso)) {
+          const suggestions = suggestWorkingHourAlternatives(iso, 5);
+          return this.askSlotMenu(session, suggestions, `Bu saatlerde çalışmıyoruz 😕\n⏰ 08:00 - 22:00\nŞunlar uygun olabilir:`);
+        }
+        session.draft.startAt = iso;
+        session.state = WaState.WAIT_DATETIME;
+        return this.handleBookingFlow({ ...opts, session });
+      } else if (parsed?.dateOnly) {
+        session.pendingDateOnly = parsed.dateOnly;
+        return this.humanizeAskTimeOnly(raw);
+      }
+
+      const yes = isYes(msg);
+      const no = isNo(msg);
+
+      if (!yes && !no) return this.humanizeConfirmNeedEH(raw);
+
+      if (no) {
+        // edit confirm'da hayır -> edit menüsüne dön
+        if (session.editMode && session.targetApptSnapshot) {
+          session.pendingSummary = undefined;
+          // değişiklikte "hayır" -> tekrar aksiyon soralım
+          session.state = WaState.WAIT_EDIT_ACTION;
+          // draft'ı snapshot'a geri çek (temiz)
+          session.draft.serviceId = session.targetApptSnapshot.serviceId;
+          session.draft.staffId = session.targetApptSnapshot.staffId;
+          session.draft.startAt = session.targetApptSnapshot.startAtIso;
+          session.lastSuggestions = undefined;
+return this.askEditActionMenu(session, {
+  id: session.targetAppointmentId || '',
+  startAtIso: session.targetApptSnapshot.startAtIso,
+  serviceName: session.targetApptSnapshot.serviceName,
+  staffName: session.targetApptSnapshot.staffName,
+});
+        }
+
+        session.state = WaState.WAIT_DATETIME;
+        session.pendingSummary = undefined;
+        session.draft.startAt = undefined;
+        session.pendingStartAt = undefined;
+        session.lastSuggestions = undefined;
+        return this.humanizeAsk('datetime', raw);
+      }
+
+      // ✅ EDIT MODE: CANCEL / UPDATE
+      if (session.editMode && session.targetAppointmentId) {
+        if (session.editMode === 'CANCEL') {
+          const ok = await this.safeCancelAppointment(tenantId, session.targetAppointmentId);
+          this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+          this.saveSession(key, session);
+          return ok ? 'Tamam ✅ Randevunuzu iptal ettim.' : 'Bir şey takıldı 😕 İptal edemedim, tekrar dener misiniz?';
+        }
+
+        // update (service/staff/time değişebilir)
+        const upd = await this.updateAppointment({
+          tenantId,
+          appointmentId: session.targetAppointmentId,
+          draft: session.draft,
+        });
+
+        if (!upd.ok && upd.code === 'OUT_OF_HOURS' && upd.suggestions?.length) {
+          session.state = WaState.WAIT_DATETIME;
+          session.draft.startAt = undefined;
+          const isoList = upd.suggestions.map((s) => s.startAt);
+          return this.askSlotMenu(session, isoList, `Bu saatlerde çalışmıyoruz 😕 (08:00 - 22:00)\nŞunlar uygun:`);
+        }
+
+        if (!upd.ok && upd.code === 'SLOT_TAKEN' && upd.suggestions?.length) {
+          session.state = WaState.WAIT_DATETIME;
+          session.draft.startAt = undefined;
+          const isoList = upd.suggestions.map((s) => s.startAt);
+          return this.askSlotMenu(session, isoList, `O saat dolu 😕 Şunlar uygun:`);
+        }
+
+        if (!upd.ok) {
+          // tekrar edit menüsü
+          session.state = WaState.WAIT_EDIT_ACTION;
+          session.pendingSummary = undefined;
+          return 'Bir şey takıldı 😕 Ne yapalım: saat mi değişsin, hizmet mi, personel mi, iptal mi?';
+        }
+
+        const newIso = upd.data.startAt;
+        const apptId = upd.data.appointmentId;
+
+        this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+        this.saveSession(key, session);
+        return this.formatEditSuccess(newIso, apptId, from + newIso);
+      }
+
+      // ✅ NORMAL BOOKING CONFIRM (create)
+      const bookingKey = this.makeBookingKey(tenantId, from, session.draft);
+      if (
+        bookingKey &&
+        session.lastCreatedBookingKey === bookingKey &&
+        session.lastCreatedAppointmentId &&
+        session.lastCreatedAt &&
+        Date.now() - session.lastCreatedAt < 10 * 60 * 1000
+      ) {
+        const startAt = session.draft.startAt || new Date().toISOString();
+        const apptId = session.lastCreatedAppointmentId;
+        this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+        this.saveSession(key, session);
+        return this.formatBookingSuccess(startAt, apptId, from + startAt);
+      }
+
+      const created = await this.createAppointment({ tenantId, draft: session.draft, staffFallbackList: staff });
+
+      if (!created.ok && created.code === 'NEED_NAME') {
+        session.state = WaState.WAIT_NAME;
+        return await this.naturalAsk(session, 'name', { services, staff, business: null });
+      }
+
+      if (!created.ok) {
+        if (created.code === 'OUT_OF_HOURS' && created.suggestions?.length) {
+          session.state = WaState.WAIT_DATETIME;
+          session.draft.startAt = undefined;
+          const isoList = created.suggestions.map((s) => s.startAt);
+          return this.askSlotMenu(session, isoList, `Bu saatlerde çalışmıyoruz 😕 (08:00 - 22:00)\nŞunlar uygun:`);
+        }
+
+        if (created.code === 'SLOT_TAKEN' && created.suggestions?.length) {
+          session.state = WaState.WAIT_DATETIME;
+          session.draft.startAt = undefined;
+          const isoList = created.suggestions.map((s) => s.startAt);
+          return this.askSlotMenu(session, isoList, `O saat dolu 😕 Şunlar uygun:`);
+        }
+
+        session.state = WaState.WAIT_DATETIME;
+        session.draft.startAt = undefined;
+        return this.pickOne(['Randevu oluştururken bir şey ters gitti 😕 Başka bir saat dener misin?', 'Bir hata oldu 😕 Hangi saat uygun, tekrar deneyelim.'], raw);
+      }
+
+      session.lastCreatedBookingKey = bookingKey || undefined;
+      session.lastCreatedAppointmentId = created.data.appointmentId;
+      session.lastCreatedAt = Date.now();
+
+      await this.learnFromSuccessfulBooking(tenantId, from, session.draft);
+
+      this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+      this.saveSession(key, session);
+
+      return this.formatBookingSuccess(created.data.startAt, created.data.appointmentId, from + created.data.startAt);
+    }
+
+    session.state = WaState.WAIT_SERVICE;
+    return await this.naturalAsk(session, 'service', { services, staff, business: null });
+  }
+
+  // =========================
+  // Menus
+  // =========================
+  private askStaffMenu(session: SessionState, staff: any[]) {
+    const items = (staff || [])
+      .filter(Boolean)
+      .slice(0, 9)
+      .map((p: any) => ({
+        id: String(p.id),
+        label: String(p.name || 'Personel'),
+        value: String(p.id),
+      }));
+
+    session.lastSuggestions = { type: 'staff', items, ts: Date.now() };
+
+    const lines = items.map((it, i) => `${i + 1}) ${it.label}`).join('\n');
+const header = this.pickOne(
+  ['Tamam 🙂 Hangi personeli istersin?', 'Kiminle olsun istersin?', 'Personel tercihin var mı?'],
+  items.map((x) => x.label).join('|'),
+);
+
+    return `${header}\n${lines}\n\nİstersen “fark etmez” yazabilirsin.`;
+  }
+
+  private askSlotMenu(session: SessionState, isoList: string[], header: string) {
+    const items = (isoList || [])
+      .filter(Boolean)
+      .slice(0, 9)
+      .map((iso) => ({
+        label: prettyIstanbul(iso),
+        value: iso,
+      }));
+
+    session.lastSuggestions = { type: 'slot', items, ts: Date.now() };
+
+    const lines = items.map((it, i) => `${i + 1}) ${it.label}`).join('\n');
+const tail = this.pickOne(
+  ['Birini seç (1-9) ya da saati direkt yaz 🙂', '1-9 seçebilirsin, istersen saati yaz (örn: 17:15)'],
+  lines,
+);
+    return `${header}\n${lines}\n\n${tail}`;
+  }
+
+  private askAppointmentPickMenu(session: SessionState, appts: UpcomingAppt[]) {
+    const items = (appts || [])
+      .slice(0, 9)
+      .map((a) => {
+        const labelParts: string[] = [];
+        labelParts.push(prettyIstanbul(a.startAtIso));
+        if (a.serviceName) labelParts.push(String(a.serviceName));
+        if (a.staffName) labelParts.push(`(${String(a.staffName)})`);
+        return { label: labelParts.join(' • '), value: String(a.id) };
+      });
+
+    session.lastSuggestions = { type: 'appt', items, ts: Date.now() };
+
+    const lines = items.map((it, i) => `${i + 1}) ${it.label}`).join('\n');
+    const header = this.pickOne(
+      ['Birden fazla randevun var 🙂 Hangisini değiştirelim/iptal edelim?', 'Şu randevularını görüyorum. Hangisiyle işlem yapalım?'],
+      lines,
+    );
+
+    return `${header}\n${lines}\n\n1-9 yazman yeterli.`;
+  }
+
+  private askEditActionMenu(session: SessionState, appt: { startAtIso: string; serviceName?: string; staffName?: string; id: string }) {
+    const headerParts: string[] = [];
+headerParts.push('Tamam 🙂 Şu randevu için işlem yapacağız:');
+    headerParts.push(`• ${prettyIstanbul(appt.startAtIso)}${appt.serviceName ? ` • ${appt.serviceName}` : ''}${appt.staffName ? ` • ${appt.staffName}` : ''}`);
+
+    const items: SuggestionItem[] = [
+      { label: 'Tarih/Saat değiştir', value: 'TIME' },
+      { label: 'Hizmet değiştir', value: 'SERVICE' },
+      { label: 'Personel/Usta değiştir', value: 'STAFF' },
+      { label: 'Randevuyu iptal et', value: 'CANCEL' },
+      { label: 'Vazgeç', value: 'ABORT' },
+    ];
+
+    session.lastSuggestions = { type: 'editAction', items, ts: Date.now() };
+
+    const lines = items.map((it, i) => `${i + 1}) ${it.label}`).join('\n');
+const tail = 'İstersen 1-5 yaz, istersen direkt “saat değiştir / hizmet değiştir / personel değiştir / iptal” yaz 🙂';
+    return `${headerParts.join('\n')}\n\nNe yapmak istersin?\n${lines}\n\n${tail}`;
+  }
+
+  private pickFromSuggestions(
+    session: SessionState,
+    raw: string,
+  ):
+    | { type: 'staff'; staffId: string }
+    | { type: 'slot'; startAt: string }
+    | { type: 'appt'; apptId: string }
+    | { type: 'editAction'; action: 'TIME' | 'SERVICE' | 'STAFF' | 'CANCEL' | 'ABORT' }
+    | null {
+    const s = session.lastSuggestions;
+    if (!s?.items?.length) return null;
+    if (Date.now() - (s.ts || 0) > 20 * 60 * 1000) return null;
+
+    const t = normalizeTr(raw);
+    if (!t) return null;
+
+    const mNum = t.match(/^\s*([1-9])\s*$/);
+    if (mNum) {
+      const idx = Number(mNum[1]) - 1;
+      const it = s.items[idx];
+      if (!it) return null;
+      if (s.type === 'staff') return { type: 'staff', staffId: String(it.value) };
+      if (s.type === 'slot') return { type: 'slot', startAt: String(it.value) };
+      if (s.type === 'appt') return { type: 'appt', apptId: String(it.value) };
+      if (s.type === 'editAction') return { type: 'editAction', action: String(it.value) as any };
+      return null;
+    }
+
+    if (s.type === 'staff') {
+      const tn = normalizePersonName(raw);
+      const hit = s.items.find((it) => normalizePersonName(it.label) === tn);
+      if (hit) return { type: 'staff', staffId: String(hit.value) };
+    }
+
+    if (s.type === 'slot') {
+      const tm = parseTimeBest(t);
+      if (tm) {
+        const hhmm = `${String(tm.hh).padStart(2, '0')}:${String(tm.mm).padStart(2, '0')}`;
+        const hit = s.items.find((it) => normalizeTr(it.label).endsWith(hhmm));
+        if (hit) return { type: 'slot', startAt: String(hit.value) };
+      }
+      const hit2 = s.items.find((it) => normalizeTr(it.label) === normalizeTr(raw));
+      if (hit2) return { type: 'slot', startAt: String(hit2.value) };
+    }
+
+    return null;
+  }
+
+  // =========================
+  // Natural booking prompts
+  // =========================
+  private async naturalAsk(
+    session: SessionState,
+    slot: 'service' | 'staff' | 'name' | 'datetime',
+    ctx: { services: any[]; staff: any[]; business: any },
+  ): Promise<string> {
+    const fallback = () => {
+      if (slot === 'service') return this.humanizeAsk('service');
+      if (slot === 'staff') return this.askStaffMenu(session, ctx.staff);
+      if (slot === 'name') return this.humanizeAsk('name');
+      return this.humanizeAsk('datetime');
+    };
+
+    if (!this.openai) return fallback();
+
+    const missingHint =
+      slot === 'service'
+        ? 'Müşteriden sadece hangi hizmet istediğini sor.'
+        : slot === 'staff'
+          ? 'Müşteriden hangi personeli tercih ettiğini sor. “Fark etmez” diyebileceğini de söyle.'
+          : slot === 'name'
+            ? 'Müşteriden ad soyadını sor. Kısa ve doğal sor.'
+            : 'Müşteriden gün ve saat bilgisini sor. Örnek format ver ama çok uzun yazma. Saat aralığı 08:00-22:00.';
+
+    const staffNamesShort = staffToTextShort(ctx.staff) || '';
+
+    const sys = `
+Sen bir güzellik merkezi WhatsApp asistanısın. Türkçe konuş.
+Stil:
+- Samimi, kısa, WhatsApp dili.
+- Resmi dil yok, gereksiz uzunluk yok.
+- Parantez içinde talimat verme (E/H gibi) — sadece doğal bir soru sor.
+Kurallar:
+- Sadece TEK soru sor. 1 cümle ideal (maks 2 cümle).
+- Kullanıcıyı yormadan ilerlet.
+- Listeyi boca etme.
+`.trim();
+
+    const user = `
+Görev: Rezervasyon akışında eksik bilgi var.
+Eksik alan: ${slot}
+İpucu: ${missingHint}
+
+Mevcut seçimler:
+- serviceId: ${session.draft.serviceId || 'YOK'}
+- staffId: ${session.draft.staffId || 'YOK'}
+- name: ${session.draft.customerName || 'YOK'}
+- startAt: ${session.draft.startAt || 'YOK'}
+
+Personeller (kısa, sadece referans):
+${staffNamesShort || 'YOK'}
+`.trim();
+
+    try {
+      const resp = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.6,
+        messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: user },
+        ],
+      });
+
+      const out = (resp.choices?.[0]?.message?.content || '').trim();
+      if (!out || out.length < 2) return fallback();
+      return out;
+    } catch {
+      return fallback();
+    }
+  }
+
+  private askService(services: any[], opts: { gentle: boolean }) {
+    const list = servicesToTextShort(services);
+    if (!list) return this.humanizeAsk('service');
+    return opts.gentle ? `Hangi hizmet için yardımcı olayım?\n${list}` : `Hangi hizmeti istersiniz?\n${list}`;
+  }
+
+  // =========================
+  // ✅ Learned context (customers + appointments)
+  // =========================
+  private async safeGetLearnedCustomerContext(
+    tenantId: string,
+    phone: string,
+    services: any[],
+  ): Promise<LearnedCustomerContext> {
+    try {
+      const customer = await (this.prisma as any).customers
+        ?.findUnique({
+          where: { tenantId_phoneNumber: { tenantId, phoneNumber: phone } },
+          select: { id: true, name: true },
+        })
+        .catch(() => null);
+
+      if (!customer?.id) return { name: null, summary: '' };
+
+      const appts = await (this.prisma as any).appointments
+        ?.findMany({
+          where: { tenantId, customerId: String(customer.id) },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+          select: { serviceId: true },
+        })
+        .catch(() => []);
+
+      const serviceCount = new Map<string, { id: string; name: string; c: number }>();
+      for (const a of appts || []) {
+        const sid = a?.serviceId ? String(a.serviceId) : '';
+        if (!sid) continue;
+        const svc = services.find((x: any) => String(x.id) === sid);
+        const sname = svc?.name ? String(svc.name) : '';
+        if (!sname) continue;
+        const prev = serviceCount.get(sid) || { id: sid, name: sname, c: 0 };
+        prev.c += 1;
+        serviceCount.set(sid, prev);
+      }
+      const topSvc = [...serviceCount.values()].sort((x, y) => y.c - x.c)[0];
+
+      const name = customer?.name ? String(customer.name) : null;
+      const summaryParts: string[] = [];
+      if (name) summaryParts.push(`Müşteri adı: ${name}`);
+      if (topSvc?.name) summaryParts.push(`Müşteri en sık: ${topSvc.name}`);
+
+      return {
+        customerId: String(customer.id),
+        name,
+        summary: summaryParts.join(' • '),
+        topServiceId: topSvc?.id,
+        topServiceName: topSvc?.name,
+      };
+    } catch {
+      return { name: null, summary: '' };
+    }
+  }
+
+  // =========================
+  // Clash check (OVERLAP): date + staff + [time,endTime)
+  // =========================
+  private hhmmToMinutes(hhmm: string) {
+    const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+    return hh * 60 + mm;
+  }
+
+  private overlaps(aStart: string, aEnd: string, bStart: string, bEnd: string) {
+    const as = this.hhmmToMinutes(aStart);
+    const ae = this.hhmmToMinutes(aEnd);
+    const bs = this.hhmmToMinutes(bStart);
+    const be = this.hhmmToMinutes(bEnd);
+    if (as == null || ae == null || bs == null || be == null) return false;
+    return as < be && bs < ae;
+  }
+
+  private async findOverlapSafe(opts: {
+    tenantId: string;
+    staffId: string;
+    dateAtUtcMidnight: Date;
+    timeHHMM: string;
+    endTimeHHMM: string;
+    ignoreAppointmentId?: string;
+  }) {
+    const { tenantId, staffId, dateAtUtcMidnight, timeHHMM, endTimeHHMM, ignoreAppointmentId } = opts;
+
+    const existing = await (this.prisma as any).appointments
+      .findMany({
+        where: { tenantId, staffId, date: dateAtUtcMidnight },
+        select: { id: true, time: true, endTime: true },
+        take: 200,
+      })
+      .catch(() => []);
+
+    for (const a of existing || []) {
+      if (ignoreAppointmentId && String(a?.id) === String(ignoreAppointmentId)) continue;
+      const s = String(a?.time || '');
+      const e = String(a?.endTime || '');
+      if (!s || !e) continue;
+      if (this.overlaps(timeHHMM, endTimeHHMM, s, e)) return { id: String(a.id) };
+    }
+    return null;
+  }
+
+  private async precheckAndPrepareConfirm(opts: {
+    tenantId: string;
+    draft: BookingDraft;
+    ignoreAppointmentId?: string;
+  }): Promise<
+    | { ok: true; summary: string }
+    | { ok: false; code?: string; suggestions?: Array<{ startAt: string; endAt: string }> }
+  > {
+    const { tenantId, draft, ignoreAppointmentId } = opts;
+
+    if (!draft.serviceId || !draft.startAt || !draft.customerPhone) return { ok: false };
+
+    const service = await (this.prisma as any).services
+      .findFirst({
+        where: { id: String(draft.serviceId), tenantId },
+        select: { id: true, name: true, duration: true, price: true },
+      })
+      .catch(() => null);
+    if (!service) return { ok: false };
+
+    if (!draft.staffId) return { ok: false };
+
+    const staffRec = await (this.prisma as any).staff
+      ?.findFirst({
+        where: { id: String(draft.staffId), tenantId },
+        select: { id: true, name: true },
+      })
+      .catch(() => null);
+
+    const startIso = String(draft.startAt);
+    const startUtc = new Date(startIso);
+    const durationMinutes = Number(service.duration) || 30;
+
+    const endIso = toIstanbulIso(new Date(startUtc.getTime() + durationMinutes * 60000));
+    if (!isWithinWorkingHoursIso(startIso) || !isEndWithinWorkingHoursIso(endIso)) {
+      const suggestions = suggestWorkingHourAlternatives(startIso, 5).map((s) => ({ startAt: s, endAt: s }));
+      return { ok: false, code: 'OUT_OF_HOURS', suggestions };
+    }
+
+    const { dateAtUtcMidnight, timeHHMM, endTimeHHMM } = toSchemaDateTime(startIso, durationMinutes);
+
+    const clash = await this.findOverlapSafe({
+      tenantId,
+      staffId: String(draft.staffId),
+      dateAtUtcMidnight,
+      timeHHMM,
+      endTimeHHMM: endTimeHHMM || timeHHMM,
+      ignoreAppointmentId,
+    });
+
+    if (clash) {
+      const suggestions = await this.suggestSlotsSimple({
+        tenantId,
+        staffId: String(draft.staffId),
+        startFromIso: startIso,
+        durationMinutes,
+        stepMinutes: 15,
+        maxSuggestions: 5,
+        searchDays: 7,
+      });
+      return { ok: false, code: 'SLOT_TAKEN', suggestions };
+    }
+
+    const name = (draft.customerName || '').trim();
+    const serviceName = String(service.name || 'Hizmet');
+    const staffName = staffRec?.name ? String(staffRec.name) : null;
+
+    const lines: string[] = [];
+    lines.push('Randevu özeti:');
+    lines.push(`• Hizmet: ${serviceName}${service.price != null ? ` — ${service.price}₺` : ''}`);
+    if (staffName) lines.push(`• Personel: ${staffName}`);
+    lines.push(`• Tarih/Saat: ${prettyIstanbul(startIso)}`);
+    if (name) lines.push(`• İsim: ${name}`);
+
+    return { ok: true, summary: lines.join('\n') };
+  }
+
+  // =========================
+  // CREATE
+  // =========================
+  private async createAppointment(opts: {
+    tenantId: string;
+    draft: BookingDraft;
+    staffFallbackList: any[];
+  }): Promise<
+    | { ok: true; data: { appointmentId: string; startAt: string } }
+    | { ok: false; code?: string; suggestions?: Array<{ startAt: string; endAt: string }> }
+  > {
+    const { tenantId, draft, staffFallbackList } = opts;
+
+    try {
+      const serviceId = String(draft.serviceId || '');
+      let staffId = draft.staffId ? String(draft.staffId) : '';
+      const startAt = String(draft.startAt || '');
+      const customerPhone = String(draft.customerPhone || '');
+      const customerName = draft.customerName ? String(draft.customerName) : null;
+
+      if (!serviceId || !startAt || !customerPhone) return { ok: false };
+
+      if (!customerName || customerName.trim().length < 2) return { ok: false, code: 'NEED_NAME' };
+
+      if (!isWithinWorkingHoursIso(startAt)) {
+        const suggestions = suggestWorkingHourAlternatives(startAt, 5).map((s) => ({ startAt: s, endAt: s }));
+        return { ok: false, code: 'OUT_OF_HOURS', suggestions };
+      }
+
+      const service = await (this.prisma as any).services
+        .findFirst({
+          where: { id: serviceId, tenantId },
+          select: { id: true, name: true, duration: true },
+        })
+        .catch(() => null);
+      if (!service) return { ok: false };
+
+      if (!staffId) {
+        const list = staffFallbackList?.length ? staffFallbackList : await this.safeListStaff(tenantId);
+        if (!list?.length) return { ok: false };
+        staffId = String(list[0].id);
+      }
+
+      const fullName = customerName.trim();
+
+      // ✅ customers.id default yok -> create içine id basıyoruz
+      const now = new Date();
+
+      const customer = await (this.prisma as any).customers.upsert({
+        where: { tenantId_phoneNumber: { tenantId, phoneNumber: customerPhone } },
+        update: {
+          name: fullName,
+          updatedAt: now,
+        } as any,
+        create: {
+          id: crypto.randomUUID(),
+          tenantId,
+          phoneNumber: customerPhone,
+          name: fullName,
+          createdAt: now,
+          updatedAt: now,
+        } as any,
+        select: { id: true } as any,
+      });
+
+      const durationMinutes = Number(service.duration) || 30;
+      const endIso = toIstanbulIso(new Date(new Date(startAt).getTime() + durationMinutes * 60000));
+      if (!isEndWithinWorkingHoursIso(endIso)) {
+        const suggestions = suggestWorkingHourAlternatives(startAt, 5).map((s) => ({ startAt: s, endAt: s }));
+        return { ok: false, code: 'OUT_OF_HOURS', suggestions };
+      }
+
+      const { dateAtUtcMidnight, timeHHMM, endTimeHHMM } = toSchemaDateTime(startAt, durationMinutes);
+
+      const clash = await this.findOverlapSafe({
+        tenantId,
+        staffId,
+        dateAtUtcMidnight,
+        timeHHMM,
+        endTimeHHMM: endTimeHHMM || timeHHMM,
+      });
+
+      if (clash) {
+        const suggestions = await this.suggestSlotsSimple({
+          tenantId,
+          staffId,
+          startFromIso: startAt,
+          durationMinutes,
+          stepMinutes: 15,
+          maxSuggestions: 5,
+          searchDays: 7,
+        });
+        return { ok: false, code: 'SLOT_TAKEN', suggestions };
+      }
+
+      const appt = await (this.prisma as any).appointments.create({
+        data: {
+          tenantId,
+          customerId: String(customer.id),
+          serviceId: String(service.id),
+          staffId,
+          date: dateAtUtcMidnight,
+          time: timeHHMM,
+          endTime: endTimeHHMM,
+          status: 'PENDING',
+          channel: 'WHATSAPP',
+          updatedAt: new Date(),
+        } as any,
+        select: { id: true },
+      });
+
+      return { ok: true, data: { appointmentId: String(appt.id), startAt } };
+    } catch (e: any) {
+      this.logger.error(`[createAppointment] failed hard: ${e?.message || e}`);
+      return { ok: false, code: 'ERROR' };
+    }
+  }
+
+  // =========================
+  // UPDATE / CANCEL (EDIT)
+  // =========================
+  private buildEditCancelSummary(snap: NonNullable<SessionState['targetApptSnapshot']>) {
+    const parts: string[] = [];
+    parts.push('Şu randevunuzu iptal edeyim mi?');
+    parts.push(`• Tarih/Saat: ${prettyIstanbul(snap.startAtIso)}`);
+    if (snap.serviceName) parts.push(`• Hizmet: ${snap.serviceName}`);
+    if (snap.staffName) parts.push(`• Personel: ${snap.staffName}`);
+    return parts.join('\n');
+  }
+
+  private async safeCancelAppointment(tenantId: string, appointmentId: string): Promise<boolean> {
+    try {
+      await (this.prisma as any).appointments.update({
+        where: { id: String(appointmentId) },
+        data: { status: 'CANCELLED', updatedAt: new Date() } as any,
+      });
+      return true;
+    } catch {
+      try {
+        await (this.prisma as any).appointments.delete({
+          where: { id: String(appointmentId) },
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  private async updateAppointment(opts: {
+    tenantId: string;
+    appointmentId: string;
+    draft: BookingDraft;
+  }): Promise<
+    | { ok: true; data: { appointmentId: string; startAt: string } }
+    | { ok: false; code?: string; suggestions?: Array<{ startAt: string; endAt: string }> }
+  > {
+    const { tenantId, appointmentId, draft } = opts;
+
+    try {
+      // mevcut randevu
+      const current = await (this.prisma as any).appointments.findUnique({
+        where: { id: String(appointmentId) },
+        select: { id: true, tenantId: true, serviceId: true, staffId: true, date: true, time: true },
+      }).catch(() => null);
+
+      if (!current?.id) return { ok: false, code: 'NOT_FOUND' };
+      if (String(current.tenantId) !== String(tenantId)) return { ok: false, code: 'NOT_FOUND' };
+
+      const currentStartIso = this.schemaDateTimeToStartIso(current.date, String(current.time || '00:00'));
+
+      const newServiceId = draft.serviceId ? String(draft.serviceId) : String(current.serviceId);
+      const newStaffId = draft.staffId ? String(draft.staffId) : String(current.staffId);
+      const newStartAt = draft.startAt ? String(draft.startAt) : String(currentStartIso);
+
+      if (!isWithinWorkingHoursIso(newStartAt)) {
+        const suggestions = suggestWorkingHourAlternatives(newStartAt, 5).map((s) => ({ startAt: s, endAt: s }));
+        return { ok: false, code: 'OUT_OF_HOURS', suggestions };
+      }
+
+      const service = await (this.prisma as any).services.findFirst({
+        where: { tenantId, id: newServiceId },
+        select: { id: true, duration: true },
+      }).catch(() => null);
+      if (!service) return { ok: false, code: 'BAD_SERVICE' };
+
+      const durationMinutes = Number(service.duration) || 30;
+
+      const endIso = toIstanbulIso(new Date(new Date(newStartAt).getTime() + durationMinutes * 60000));
+      if (!isEndWithinWorkingHoursIso(endIso)) {
+        const suggestions = suggestWorkingHourAlternatives(newStartAt, 5).map((s) => ({ startAt: s, endAt: s }));
+        return { ok: false, code: 'OUT_OF_HOURS', suggestions };
+      }
+
+      const { dateAtUtcMidnight, timeHHMM, endTimeHHMM } = toSchemaDateTime(newStartAt, durationMinutes);
+
+      const clash = await this.findOverlapSafe({
+        tenantId,
+        staffId: newStaffId,
+        dateAtUtcMidnight,
+        timeHHMM,
+        endTimeHHMM: endTimeHHMM || timeHHMM,
+        ignoreAppointmentId: String(appointmentId),
+      });
+
+      if (clash) {
+        const suggestions = await this.suggestSlotsSimple({
+          tenantId,
+          staffId: newStaffId,
+          startFromIso: newStartAt,
+          durationMinutes,
+          stepMinutes: 15,
+          maxSuggestions: 5,
+          searchDays: 7,
+        });
+        return { ok: false, code: 'SLOT_TAKEN', suggestions };
+      }
+
+      await (this.prisma as any).appointments.update({
+        where: { id: String(appointmentId) },
+        data: {
+          serviceId: newServiceId,
+          staffId: newStaffId,
+          date: dateAtUtcMidnight,
+          time: timeHHMM,
+          endTime: endTimeHHMM,
+          updatedAt: new Date(),
+        } as any,
+      });
+
+      return { ok: true, data: { appointmentId: String(appointmentId), startAt: newStartAt } };
+    } catch (e: any) {
+      this.logger.error(`[updateAppointment] failed hard: ${e?.message || e}`);
+      return { ok: false, code: 'ERROR' };
+    }
+  }
+
+  private schemaDateTimeToStartIso(dateUtcMidnight: Date, timeHHMM: string) {
+    const yy = dateUtcMidnight.getUTCFullYear();
+    const mm = dateUtcMidnight.getUTCMonth();
+    const dd = dateUtcMidnight.getUTCDate();
+    const m = String(timeHHMM || '').match(/^(\d{1,2}):(\d{2})$/);
+    const hh = m ? Number(m[1]) : 0;
+    const mi = m ? Number(m[2]) : 0;
+    const dUtc = new Date(Date.UTC(yy, mm, dd, hh - 3, mi, 0, 0));
+    return toIstanbulIso(dUtc);
+  }
+
+  private async safeListUpcomingAppointmentsByPhone(tenantId: string, phone: string, limit: number): Promise<UpcomingAppt[]> {
+    try {
+      const customer = await (this.prisma as any).customers.findUnique({
+        where: { tenantId_phoneNumber: { tenantId, phoneNumber: phone } },
+        select: { id: true },
+      }).catch(() => null);
+
+      if (!customer?.id) return [];
+
+      // TR "today" + now HH:MM
+      const nowTr = new Date(Date.now() + IST_OFFSET_MS);
+      const y = nowTr.getUTCFullYear();
+      const m = nowTr.getUTCMonth();
+      const d = nowTr.getUTCDate();
+      const todayUtcMidnight = new Date(Date.UTC(y, m, d, 0, 0, 0, 0));
+      const nowHHMM = `${String(nowTr.getUTCHours()).padStart(2, '0')}:${String(nowTr.getUTCMinutes()).padStart(2, '0')}`;
+
+      const appts = await (this.prisma as any).appointments.findMany({
+        where: {
+          tenantId,
+          customerId: String(customer.id),
+          OR: [
+            { date: { gt: todayUtcMidnight } },
+            { date: todayUtcMidnight, time: { gte: nowHHMM } },
+          ],
+        },
+        orderBy: [{ date: 'asc' }, { time: 'asc' }],
+        take: Math.max(1, Math.min(20, limit || 6)),
+        select: { id: true, serviceId: true, staffId: true, date: true, time: true },
+      }).catch(() => []);
+
+      if (!appts?.length) return [];
+
+      // isimleri çek
+      const svcIds = [...new Set(appts.map((a: any) => String(a.serviceId || '')).filter(Boolean))];
+      const stfIds = [...new Set(appts.map((a: any) => String(a.staffId || '')).filter(Boolean))];
+
+      const [svcs, stfs] = await Promise.all([
+        (this.prisma as any).services.findMany({
+          where: { tenantId, id: { in: svcIds } },
+          select: { id: true, name: true },
+          take: 100,
+        }).catch(() => []),
+        (this.prisma as any).staff.findMany({
+          where: { tenantId, id: { in: stfIds } },
+          select: { id: true, name: true },
+          take: 100,
+        }).catch(() => []),
+      ]);
+
+      const svcMap = new Map<string, string>();
+      for (const s of svcs || []) svcMap.set(String(s.id), String(s.name || ''));
+
+      const stfMap = new Map<string, string>();
+      for (const p of stfs || []) stfMap.set(String(p.id), String(p.name || ''));
+
+      return (appts || []).map((a: any) => {
+        const startAtIso = this.schemaDateTimeToStartIso(a.date, String(a.time || '00:00'));
+        return {
+          id: String(a.id),
+          serviceId: String(a.serviceId),
+          staffId: String(a.staffId),
+          date: a.date,
+          time: String(a.time || ''),
+          startAtIso,
+          serviceName: svcMap.get(String(a.serviceId)) || undefined,
+          staffName: stfMap.get(String(a.staffId)) || undefined,
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  // =========================
+  // suggestions
+  // =========================
+  private async suggestSlotsSimple(opts: {
+    tenantId: string;
+    staffId: string;
+    startFromIso: string;
+    durationMinutes: number;
+    stepMinutes: number;
+    maxSuggestions: number;
+    searchDays: number;
+  }) {
+    const { tenantId, staffId, startFromIso, durationMinutes, stepMinutes, maxSuggestions, searchDays } = opts;
+
+    const startUtc = new Date(startFromIso);
+    const suggestions: Array<{ startAt: string; endAt: string }> = [];
+
+    let cursor = startUtc;
+    for (let day = 0; day < searchDays && suggestions.length < maxSuggestions; day++) {
+      const dayTr = new Date(cursor.getTime() + IST_OFFSET_MS);
+      const y = dayTr.getUTCFullYear();
+      const m = dayTr.getUTCMonth();
+      const d = dayTr.getUTCDate();
+
+      const dateAtUtcMidnight = new Date(Date.UTC(y, m, d, 0, 0, 0, 0));
+
+      const existing = await (this.prisma as any).appointments
+        .findMany({
+          where: { tenantId, staffId, date: dateAtUtcMidnight },
+          select: { time: true, endTime: true },
+          take: 200,
+        })
+        .catch(() => []);
+
+      const taken = (existing || [])
+        .map((x: any) => ({ s: String(x?.time || ''), e: String(x?.endTime || '') }))
+        .filter((x: any) => x.s && x.e);
+
+      for (let hh = WORK_START_HH; hh < WORK_END_HH && suggestions.length < maxSuggestions; hh++) {
+        for (let mm = 0; mm < 60 && suggestions.length < maxSuggestions; mm += stepMinutes) {
+          const candUtc = new Date(Date.UTC(y, m, d, hh - 3, mm, 0, 0));
+          const candIso = toIstanbulIso(candUtc);
+
+          if (!isWithinWorkingHoursIso(candIso)) continue;
+
+          const { timeHHMM, endTimeHHMM } = toSchemaDateTime(candIso, durationMinutes);
+
+          const endIso = toIstanbulIso(new Date(candUtc.getTime() + durationMinutes * 60000));
+          if (!isEndWithinWorkingHoursIso(endIso)) continue;
+
+          const clash = taken.some((t: any) => this.overlaps(timeHHMM, endTimeHHMM || timeHHMM, t.s, t.e));
+          if (!clash) suggestions.push({ startAt: candIso, endAt: candIso });
+        }
+      }
+
+      cursor = addDaysMs(cursor, 1);
+    }
+
+    return suggestions;
+  }
+
+  // =========================
+  // LLM
+  // =========================
+  private async answerWithLLM(opts: {
+    raw: string;
+    business: any;
+    services: any[];
+    staff: any[];
+    history: HistoryTurn[];
+    mode: 'general' | 'procedure';
+    focusService: null | { name: string; duration?: any; price?: any };
+    avoidRepeat?: boolean;
+    learnedCustomerSummary?: string;
+  }): Promise<string> {
+    if (!this.openai) return '';
+
+    const { raw, business, services, staff, history, mode, focusService, avoidRepeat, learnedCustomerSummary } = opts;
+
+    const servicesText = servicesToTextShort(services);
+    const staffText = staffToTextShort(staff);
+
+    const historyText =
+      history && history.length
+        ? history
+            .slice(-8)
+            .map((h) => `${h.role === 'user' ? 'Müşteri' : 'Asistan'}: ${h.text}`)
+            .join('\n')
+        : 'YOK';
+
+    let system = `
+Sen bir güzellik merkezi WhatsApp asistanısın. Türkçe konuş.
+Kurallar:
+- Cevaplar KISA olsun (maks 2-4 cümle).
+- Durduk yere fiyat listesi / randevu yönlendirmesi yapma.
+- Fiyat sadece müşteri sorarsa ver; mümkünse ilgili hizmete özel ver.
+- Müşteri randevu/rezervasyon demeden randevu akışına sokma.
+- Prosedür sorularında genel bilgi ver ama kesin tıbbi iddia yapma.
+- Aynı mesajı tekrarlama. Gerekirse tek kısa soru sor.
+- İnternete erişimin yok; "internetten baktım" gibi şeyler söyleme.
+- Resmi dil yok; WhatsApp dili, doğal ve samimi yaz.
+- “reis”, “kral”, “askerlik arkadaşı” gibi samimi ama uygunsuz hitaplar kullanma.
+- “Biraz sabret” gibi emir/veriştiren dil kullanma. Nazik ve kısa ol.
+`.trim();
+
+    if (mode === 'procedure') system += `\n- Prosedür modunda yumuşak ve samimi bir dille yanıt ver; sonunda zorla randevu isteme.`;
+    if (avoidRepeat) system += `\n- Aynı cümleleri tekrar etme; cevabı farklı yaz.`;
+
+    const user = `
+Mod: ${mode}
+Müşteri mesajı: ${raw}
+
+Müşteri geçmiş özet (varsa):
+${learnedCustomerSummary || 'YOK'}
+
+Odak hizmet (varsa): ${focusService ? JSON.stringify(focusService) : 'YOK'}
+İşletme verisi: ${business ? JSON.stringify(business) : 'YOK'}
+
+Hizmetler (kısa):
+${servicesText || 'YOK'}
+
+Personeller (kısa):
+${staffText || 'YOK'}
+
+Son konuşma geçmişi:
+${historyText}
+`.trim();
+
+    try {
+      const resp = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: avoidRepeat ? 0.7 : 0.6,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+      });
+
+      const out = (resp.choices?.[0]?.message?.content || '').trim();
+      return out && out.length >= 2 ? out : '';
+    } catch (e: any) {
+      this.logger.warn(`[LLM] ${e?.message || e}`);
+      return '';
+    }
+  }
+
+  private procedureTemplateForService(serviceName: string, duration?: any, price?: any) {
+    const parts: string[] = [];
+    parts.push(`${serviceName} için genel olarak süreç kişiye göre değişebilir.`);
+    if (duration != null) parts.push(`Seans süresi genelde ${duration} dk civarıdır.`);
+    parts.push('Kaç seans gerektiği; bölge, kıl tipi ve cilt yapısına göre değişir.');
+    const base = parts.join(' ');
+    const priceLine = price != null ? `\nFiyat: ${price}₺` : '';
+    return base + priceLine;
+  }
+
+  // =========================
+  // DB lists
+  // =========================
+  private async safeListServices(tenantId: string) {
+    return await (this.prisma as any).services
+      .findMany({
+        where: { tenantId, isActive: true },
+        select: { id: true, name: true, price: true, duration: true },
+        take: 50,
+      })
+      .catch(() => []);
+  }
+
+  private async safeListStaff(tenantId: string) {
+    return await (this.prisma as any).staff
+      ?.findMany({
+        where: { tenantId, isActive: true },
+        select: { id: true, name: true },
+        take: 50,
+      })
+      .catch(() => []);
+  }
+
+  // =========================
+  // Session helpers
+  // =========================
+  private getOrInitSession(key: string, tenantId: string, phone: string): SessionState {
+    const existing = this.sessions.get(key);
+    if (existing) {
+      if (Date.now() - existing.updatedAt > 2 * 60 * 60 * 1000) {
+        const fresh = this.makeFreshSession(tenantId, phone);
+        this.sessions.set(key, fresh);
+        return fresh;
+      }
+      existing.updatedAt = Date.now();
+      return existing;
+    }
+    const s = this.makeFreshSession(tenantId, phone);
+    this.sessions.set(key, s);
+    return s;
+  }
+
+  private makeFreshSession(tenantId: string, phone: string): SessionState {
+    return {
+      state: WaState.IDLE,
+      draft: { tenantId, customerPhone: phone },
+      updatedAt: Date.now(),
+      history: [],
+      repeatCount: 0,
+    };
+  }
+
+  private saveSession(key: string, s: SessionState) {
+    s.updatedAt = Date.now();
+    this.sessions.set(key, s);
+  }
+
+  private softResetSession(s: SessionState, tenantId: string, phone: string, opts?: { keepIdempotency?: boolean }) {
+    const keep = Boolean(opts?.keepIdempotency);
+
+    const lastCreatedBookingKey = s.lastCreatedBookingKey;
+    const lastCreatedAppointmentId = s.lastCreatedAppointmentId;
+    const lastCreatedAt = s.lastCreatedAt;
+
+    s.state = WaState.IDLE;
+    s.draft = { tenantId, customerPhone: phone };
+
+    s.pendingStartAt = undefined;
+    s.pendingDateOnly = undefined;
+    s.pendingSummary = undefined;
+
+    s.lastTopic = undefined;
+    s.lastServiceId = undefined;
+    s.lastSuggestions = undefined;
+    s.suggestedServiceId = undefined;
+    s.suggestedServiceName = undefined;
+
+    // ✅ edit reset
+    s.editMode = undefined;
+    s.targetAppointmentId = undefined;
+    s.targetApptSnapshot = undefined;
+
+    if (keep) {
+      s.lastCreatedBookingKey = lastCreatedBookingKey;
+      s.lastCreatedAppointmentId = lastCreatedAppointmentId;
+      s.lastCreatedAt = lastCreatedAt;
+    } else {
+      s.lastCreatedBookingKey = undefined;
+      s.lastCreatedAppointmentId = undefined;
+      s.lastCreatedAt = undefined;
+    }
+  }
+
+  // =========================
+  // Memory helpers
+  // =========================
+  private recordHistory(session: SessionState, role: 'user' | 'assistant', text: string) {
+    const clean = (text || '').trim();
+    if (!clean) return;
+    session.history = session.history || [];
+    session.history.push({ role, text: clean, ts: Date.now() });
+    if (session.history.length > 20) session.history = session.history.slice(-20);
+  }
+
+  private getRecentHistory(session: SessionState, maxTurns: number): HistoryTurn[] {
+    if (!session.history?.length) return [];
+    return session.history.slice(-Math.max(1, maxTurns));
+  }
+
+  private isLikelyDuplicateInbound(session: SessionState, raw: string) {
+    const t = normalizeTr(raw);
+    if (!t) return false;
+    const now = Date.now();
+
+    if (session.lastUserTextNorm && session.lastUserAt) {
+      if (session.lastUserTextNorm === t && now - session.lastUserAt < 15000) return true;
+    }
+    session.lastUserTextNorm = t;
+    session.lastUserAt = now;
+    return false;
+  }
+
+  private makeBookingKey(tenantId: string, phone: string, draft: BookingDraft) {
+    if (!draft?.serviceId || !draft?.startAt) return '';
+    const staff = draft.staffId ? String(draft.staffId) : '-';
+    return `${tenantId}|${phone}|${String(draft.serviceId)}|${staff}|${String(draft.startAt)}`;
+  }
+
+  private safeReply(session: SessionState, reply: string) {
+    let out = (reply || '').trim();
+    if (!out) out = 'Tamam 👍';
+
+    const prev = session.lastAssistantReply || session.lastAssistantText || '';
+    const same = prev && normalizeTr(prev) === normalizeTr(out);
+
+    if (same) {
+      session.repeatCount = (session.repeatCount || 0) + 1;
+
+      if (session.repeatCount === 1) out = out + ' 🙂';
+      else {
+        if (session.state !== WaState.IDLE) {
+          if (session.state === WaState.WAIT_SERVICE) out = this.humanizeAsk('service');
+          else if (session.state === WaState.WAIT_STAFF) out = this.humanizeAsk('staff');
+          else if (session.state === WaState.WAIT_NAME) out = this.humanizeAsk('name');
+          else if (session.state === WaState.WAIT_DATETIME) out = this.humanizeAsk('datetime');
+          else out = 'Devam edelim 🙂';
+        } else {
+          out = 'Anladım 🙂 Nasıl yardımcı olayım?';
+        }
+        session.repeatCount = 0;
+      }
+    } else {
+      session.repeatCount = 0;
+    }
+
+    session.lastAssistantReply = out;
+    session.lastAssistantText = out;
+    this.recordHistory(session, 'assistant', out);
+    return out;
+  }
+
+  private shouldNudgeBooking(session: SessionState) {
+    const recent = this.getRecentHistory(session, 6).map((h) => normalizeTr(h.text)).join(' ');
+    return (
+      recent.includes('randevu') ||
+      recent.includes('rezervasyon') ||
+      recent.includes('uygun') ||
+      recent.includes('yarin') ||
+      recent.includes('bugun')
+    );
+  }
+
+  // =========================
+  // Matching
+  // =========================
+  private tryAutofillService(draft: BookingDraft, services: any[], msg: string) {
+    if (draft.serviceId) return;
+    const hit = this.detectServiceFromMessage(msg, services);
+    if (hit?.id) draft.serviceId = String(hit.id);
+  }
+
+  private tryAutofillStaff(draft: BookingDraft, staff: any[], msg: string) {
+    if (draft.staffId) return;
+    const t = normalizePersonName(msg);
+    const words = normalizePersonName(msg).split(/\s+/).filter(Boolean);
+
+    const hit =
+      staff.find((p: any) => normalizePersonName(String(p?.name || '')) === t) ||
+      staff.find((p: any) => {
+        const name = normalizePersonName(String(p?.name || ''));
+        return words.some((w) => w.length >= 3 && name.includes(w));
+      });
+
+    if (hit?.id) draft.staffId = String(hit.id);
+  }
+
+  private detectServiceFromMessage(raw: string, services: any[]) {
+    if (!services || services.length === 0) return null;
+    const t = normalizeTr(raw);
+    const words = t.split(/\s+/).filter(Boolean);
+
+    const direct = services.find((s: any) => normalizeTr(String(s?.name || '')).includes(t));
+    if (direct) return direct;
+
+    const best = services.find((s: any) => {
+      const name = normalizeTr(String(s?.name || ''));
+      return words.some((w) => w.length >= 3 && name.includes(w));
+    });
+
+    return best || null;
+  }
+
+  // =========================
+  // Learning profile (best effort)
+  // =========================
+  private async saveLearningProfile(tenantId: string, phone: string, patch: Partial<LearningProfile>) {
+    const data: LearningProfile = { ...(patch as any), updatedAt: Date.now() };
+    try {
+      if ((this.prisma as any).customerProfile?.upsert) {
+        await (this.prisma as any).customerProfile.upsert({
+          where: { tenantId_phoneNumber: { tenantId, phoneNumber: phone } },
+          update: { data } as any,
+          create: { tenantId, phoneNumber: phone, data } as any,
+        });
+        return;
+      }
+    } catch {}
+
+    try {
+      const c = await (this.prisma as any).customers?.findUnique?.({
+        where: { tenantId_phoneNumber: { tenantId, phoneNumber: phone } },
+        select: { meta: true, profile: true, profileJson: true } as any,
+      });
+
+      const base = (c as any)?.meta ?? (c as any)?.profile ?? (c as any)?.profileJson ?? {};
+      const merged = { ...(base && typeof base === 'object' ? base : {}), ...data };
+
+      try {
+        await (this.prisma as any).customers.update({
+          where: { tenantId_phoneNumber: { tenantId, phoneNumber: phone } },
+          data: { meta: merged } as any,
+        });
+        return;
+      } catch {}
+
+      try {
+        await (this.prisma as any).customers.update({
+          where: { tenantId_phoneNumber: { tenantId, phoneNumber: phone } },
+          data: { profileJson: JSON.stringify(merged) } as any,
+        });
+        return;
+      } catch {}
+    } catch {}
+  }
+
+  private async learnFromSuccessfulBooking(tenantId: string, phone: string, draft: BookingDraft) {
+    const patch: Partial<LearningProfile> = {
+      lastServiceId: draft.serviceId ? String(draft.serviceId) : null,
+      lastStaffId: draft.staffId ? String(draft.staffId) : null,
+      lastStartAt: draft.startAt ? String(draft.startAt) : null,
+    };
+
+    if (draft.startAt) {
+      const parts = getTrPartsFromIso(String(draft.startAt));
+      if (parts) patch.preferredTimeHint = `${String(parts.hh).padStart(2, '0')}:${String(parts.mm).padStart(2, '0')}`;
+    }
+
+    await this.saveLearningProfile(tenantId, phone, patch);
+  }
+}
+
+// =========================
+// Helpers
+// =========================
+function normalizeTr(s: string) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/[’'`"]/g, '')
+    .replace(/ç/g, 'c')
+    .replace(/ğ/g, 'g')
+    .replace(/ı/g, 'i')
+    .replace(/ö/g, 'o')
+    .replace(/ş/g, 's')
+    .replace(/ü/g, 'u')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizePersonName(s: string) {
+  let t = normalizeTr(s);
+  t = t
+    .replace(/\b(uzman|uzmani|uzmanı|usta|dr|doktor|mr|ms)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return t;
+}
+
+function isNoPreferenceStaff(raw: string) {
+  const t = normalizeTr(raw);
+  return (
+    t.includes('fark etmez') ||
+    t.includes('farketmez') ||
+    t.includes('siz secin') ||
+    t.includes('siz seçin') ||
+    t.includes('siz belirleyin') ||
+    t.includes('herhangi') ||
+    t.includes('kim olursa') ||
+    t.includes('kiminle olursa') ||
+    t === 'farketmez' ||
+    t === 'fark etmez'
+  );
+}
+
+
+function looksLikeUpcomingQuery(raw: string) {
+  const t = normalizeTr(raw);
+
+  // “randevum ne zaman”, “rezervasyonlarımı listele”, “randevumu göster”, vb.
+  return (
+    t.includes('randevu') &&
+    (t.includes('ne zaman') ||
+      t.includes('ne zamana') ||
+      t.includes('ne zamandi') ||
+      t.includes('ne zamandı') ||
+      t.includes('tarihi') ||
+      t.includes('tarihimi') ||
+      t.includes('saat kac') ||
+      t.includes('saat kaç') ||
+      t.includes('goster') ||
+      t.includes('göster') ||
+      t.includes('listele') ||
+      t.includes('listeler misin') ||
+      t.includes('rezervasyonlarimi') ||
+      t.includes('rezervasyonlarımı'))
+  );
+}
+
+
+function looksLikeBookingIntent(raw: string) {
+  const t = normalizeTr(raw);
+  if (t === 'randevu' || t === 'rezervasyon') return true;
+  const hasRandevu = t.includes('randevu') || t.includes('rezervasyon');
+  if (!hasRandevu) return false;
+  const verbs = ['olustur', 'oluştur', 'ayarla', 'yap', 'yapal', 'al', 'alin', 'almak', 'istiyorum', 'isterim', 'rezervasyon yap', 'randevu yap', 'randevu al'];
+  if (verbs.some((v) => t.includes(normalizeTr(v)))) return true;
+  if (t.includes('yarin') || t.includes('bugun') || /\b\d{1,2}:\d{2}\b/.test(t)) return true;
+  return false;
+}
+
+function looksLikeCancelIntent(raw: string) {
+  const t = normalizeTr(raw);
+  return t === 'iptal' || t.includes('iptal et') || t.includes('randevu iptal') || t.includes('randevumu iptal') || t.includes('vazgectim') || t.includes('vazgec');
+}
+
+function looksLikeRescheduleIntent(raw: string) {
+  const t = normalizeTr(raw);
+  return (
+    t.includes('randevu degis') ||
+    t.includes('randevu değiş') ||
+    t.includes('randevumu degis') ||
+    t.includes('randevumu değiş') ||
+    t.includes('tarih degis') ||
+    t.includes('saat degis') ||
+    t.includes('ertele') ||
+    t.includes('ileri al') ||
+    t.includes('geri al') ||
+    t.includes('baska saate') ||
+    t.includes('baska tarihe')
+  );
+}
+
+function looksLikeGenericEditIntent(raw: string) {
+  const t = normalizeTr(raw);
+
+  return (
+    // klasik değiştir
+    (t.includes('randevu') &&
+      (t.includes('degis') ||
+        t.includes('değiş') ||
+        t.includes('guncelle') ||
+        t.includes('güncelle') ||
+        t.includes('duzenle') ||
+        t.includes('düzenle'))) ||
+
+    // iptal / ertele
+    (t.includes('randevu') &&
+      (t.includes('iptal') || t.includes('ertele'))) ||
+
+    // 👇 YENİ EKLENENLER
+    (t.includes('randevu') &&
+      (t.includes('ne zaman') ||
+        t.includes('ne zamana') ||
+        t.includes('hangi gun') ||
+        t.includes('hangi gün') ||
+        t.includes('tarihi') ||
+        t.includes('saat kac') ||
+        t.includes('saat kaç') ||
+        t.includes('ne zamandi') ||
+        t.includes('ne zamandı')))
+  );
+}
+function looksLikeServiceListRequest(msg: string) {
+  const t = normalizeTr(msg);
+  return t.includes('hizmetler') || t.includes('hizmet list') || t.includes('listeyi at') || t.includes('neler var') || t.includes('servisler');
+}
+
+function looksLikePriceQuestion(msg: string) {
+  const t = normalizeTr(msg);
+  return t.includes('fiyat') || t.includes('ucret') || t.includes('kac tl') || t.includes('kaç tl');
+}
+
+function looksLikeAddressOrHours(msg: string) {
+  const t = normalizeTr(msg);
+  return t.includes('adres') || t.includes('konum') || t.includes('nerde') || t.includes('nerede') || t.includes('calisma saati') || t.includes('çalışma saati') || t.includes('kacda') || t.includes('kaçta');
+}
+
+function shouldExitBookingFlow(msgNorm: string, raw: string) {
+  if (isYes(msgNorm) || isNo(msgNorm)) return false;
+  const t = normalizeTr(raw);
+  if (!t) return false;
+  if (looksLikeBookingIntent(raw)) return false;
+  return (
+    t.includes('selam') ||
+    t.includes('merhaba') ||
+    t.includes('tesekkur') ||
+    t.includes('teşekkür') ||
+    t.includes('bilgi') ||
+    t.includes('soru') ||
+    t.includes('istemiyorum') ||
+    t.includes('vazgec') ||
+    t.includes('vazgeç') ||
+    t === 'hayir' ||
+    t === 'hayır'
+  );
+}
+
+function looksLikeProcedureQuestion(msg: string) {
+  const t = normalizeTr(msg);
+  return (
+    t.includes('nasil') ||
+    t.includes('surec') ||
+    t.includes('kac seans') ||
+    t.includes('seans') ||
+    t.includes('acitir') ||
+    t.includes('can yakar') ||
+    t.includes('zararli') ||
+    t.includes('yan etk') ||
+    t.includes('risk') ||
+    t.includes('sonrasi') ||
+    t.includes('bakim') ||
+    t.includes('kimlere uygun degil') ||
+    t.includes('kimler icin uygun degil')
+  );
+}
+
+function isCancel(msg: string) {
+  const t = normalizeTr(msg);
+  return t === 'iptal' || t.includes('iptal et') || t.includes('vazgectim') || t.includes('vazgec');
+}
+
+function isRestart(msg: string) {
+  const t = normalizeTr(msg);
+  return t === 'bastan' || t.includes('yeniden') || t.includes('sifirla') || t.includes('sıfırla');
+}
+
+function isYes(msg: string) {
+  const t = normalizeTr(msg);
+  return t === 'e' || t === 'evet' || t.includes('onay') || t === 'tamam' || t.includes('tamam');
+}
+
+function isNo(msg: string) {
+  const t = normalizeTr(msg);
+  return t === 'h' || t === 'hayir' || t.includes('istemiyorum') || t.includes('iptal') || t.includes('degil') || t.includes('değil');
+}
+
+function servicesToTextShort(services: any[]) {
+  if (!services || services.length === 0) return '';
+  return services
+    .slice(0, 6)
+    .map((s: any) => {
+      const name = String(s?.name || 'Hizmet');
+      const price = s?.price != null ? `${s.price}₺` : '-';
+      const dur = s?.duration != null ? `${s.duration} dk` : '-';
+      return `• ${name} (${price}, ${dur})`;
+    })
+    .join('\n');
+}
+
+function staffToTextShort(staff: any[]) {
+  if (!staff || staff.length === 0) return '';
+  return staff.slice(0, 6).map((p: any) => `• ${String(p?.name || 'Personel')}`).join('\n');
+}
+
+function extractName(raw: string) {
+  const s = (raw || '').trim();
+  if (!s) return null;
+  if (s.length < 2) return null;
+  if (/^\+?\d[\d\s-]+$/.test(s)) return null;
+
+  const t = normalizeTr(s);
+  const banned = ['fark etmez', 'farketmez', 'siz secin', 'siz seçin', 'herhangi', 'kim olursa', 'istemiyorum', 'vazgectim', 'vazgec', 'iptal', 'tamam', 'evet', 'hayir', 'hayır'];
+  if (banned.some((b) => t === normalizeTr(b) || t.includes(normalizeTr(b)))) return null;
+
+  const m = s.match(/^(ben\s+)?([a-zA-ZÇĞİÖŞÜçğıöşü\s]{2,})$/);
+  if (!m) return null;
+  const name = m[2].trim();
+  if (name.length < 2) return null;
+  return name;
+}
+
+// ===== TZ + Working hours helpers =====
+const IST_OFFSET_MIN = 180;
+const IST_OFFSET_MS = IST_OFFSET_MIN * 60 * 1000;
+
+const WORK_START_HH = 8;
+const WORK_END_HH = 22;
+
+function addDaysMs(d: Date, n: number) {
+  return new Date(d.getTime() + n * 24 * 60 * 60 * 1000);
+}
+
+function toIstanbulIso(dUtc: Date) {
+  const x = new Date(dUtc.getTime() + IST_OFFSET_MS);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const year = x.getUTCFullYear();
+  const month = pad(x.getUTCMonth() + 1);
+  const day = pad(x.getUTCDate());
+  const hh = pad(x.getUTCHours());
+  const mm = pad(x.getUTCMinutes());
+  const ss = pad(x.getUTCSeconds());
+  return `${year}-${month}-${day}T${hh}:${mm}:${ss}+03:00`;
+}
+
+function prettyIstanbul(iso: string) {
+  const dUtc = new Date(iso);
+  if (isNaN(dUtc.getTime())) return iso;
+
+  const x = new Date(dUtc.getTime() + IST_OFFSET_MS);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(x.getUTCDate())}.${pad(x.getUTCMonth() + 1)}.${x.getUTCFullYear()} ${pad(x.getUTCHours())}:${pad(x.getUTCMinutes())}`;
+}
+
+function getTrPartsFromIso(iso: string) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  const tr = new Date(d.getTime() + IST_OFFSET_MS);
+  return { y: tr.getUTCFullYear(), m: tr.getUTCMonth() + 1, d: tr.getUTCDate(), hh: tr.getUTCHours(), mm: tr.getUTCMinutes() };
+}
+
+function isWithinWorkingHoursIso(iso: string) {
+  const p = getTrPartsFromIso(iso);
+  if (!p) return false;
+  if (p.hh < WORK_START_HH) return false;
+  if (p.hh >= WORK_END_HH) return false;
+  return true;
+}
+
+function isEndWithinWorkingHoursIso(iso: string) {
+  const p = getTrPartsFromIso(iso);
+  if (!p) return false;
+  if (p.hh < WORK_START_HH) return false;
+  if (p.hh > WORK_END_HH) return false;
+  if (p.hh === WORK_END_HH && p.mm > 0) return false;
+  return true;
+}
+
+function suggestWorkingHourAlternatives(requestedIso: string, count: number) {
+  const p = getTrPartsFromIso(requestedIso);
+
+  if (!p) {
+    const nowUtc = new Date();
+    const tomorrowTr = new Date(nowUtc.getTime() + IST_OFFSET_MS);
+    tomorrowTr.setUTCDate(tomorrowTr.getUTCDate() + 1);
+    const dUtc = new Date(Date.UTC(tomorrowTr.getUTCFullYear(), tomorrowTr.getUTCMonth(), tomorrowTr.getUTCDate(), WORK_START_HH - 3, 0, 0, 0));
+    return [toIstanbulIso(dUtc)];
+  }
+
+  const suggestions: string[] = [];
+  const startDayOffset = p.hh >= WORK_END_HH ? 1 : 0;
+
+  let dayOffset = startDayOffset;
+  while (suggestions.length < count && dayOffset < 14) {
+    for (let hh = WORK_START_HH; hh < WORK_END_HH && suggestions.length < count; hh += 2) {
+      const dUtc = new Date(Date.UTC(p.y, p.m - 1, p.d + dayOffset, hh - 3, 0, 0, 0));
+      suggestions.push(toIstanbulIso(dUtc));
+    }
+    dayOffset += 1;
+  }
+
+  return suggestions.slice(0, count);
+}
+
+type ParsedTRDateTime = {
+  dateUtc: Date;
+  hasTime: boolean;
+  hasDate: boolean;
+  dateOnly?: string;
+};
+
+function extractWeekdayIndex(tNorm: string): number | null {
+  const words = (tNorm || '').split(/\s+/).filter(Boolean);
+  for (const w0 of words) {
+    const w = w0.trim();
+    if (!w) continue;
+    if (w.startsWith('pazartesi') || w === 'pzt') return 1;
+    if (w.startsWith('sali') || w === 'sal') return 2;
+    if (w.startsWith('carsamba') || w === 'crs' || w === 'car') return 3;
+    if (w.startsWith('persembe') || w === 'prs' || w === 'per') return 4;
+    if (w.startsWith('cuma')) return 5;
+    if (w.startsWith('cumartesi') || w === 'cmt') return 6;
+    if (w.startsWith('pazar')) return 0;
+  }
+  if (tNorm.includes('pazartesi') || tNorm.includes('pzt')) return 1;
+  if (tNorm.includes('sali')) return 2;
+  if (tNorm.includes('carsamba') || tNorm.includes('crs')) return 3;
+  if (tNorm.includes('persembe') || tNorm.includes('prs')) return 4;
+  if (tNorm.includes('cuma')) return 5;
+  if (tNorm.includes('cumartesi') || tNorm.includes('cmt')) return 6;
+  if (tNorm.includes('pazar')) return 0;
+  return null;
+}
+
+function nextOccurrenceOfWeekday(nowTr: Date, targetDow: number): { year: number; month: number; day: number } {
+  const todayDow = nowTr.getUTCDay();
+  let delta = (targetDow - todayDow + 7) % 7;
+  if (delta === 0) delta = 7;
+  const target = addDaysMs(nowTr, delta);
+  return { year: target.getUTCFullYear(), month: target.getUTCMonth(), day: target.getUTCDate() };
+}
+
+function parseDateTimeTR(raw: string): ParsedTRDateTime | null {
+  const s = (raw || '').trim();
+  if (!s) return null;
+
+  const t = normalizeTr(s);
+  const nowTr = new Date(Date.now() + IST_OFFSET_MS);
+
+  const hasTomorrow = t.includes('yarin');
+  const hasToday = t.includes('bugun');
+
+  const weekdayIdx = extractWeekdayIndex(t);
+
+  const mNumeric = t.match(/\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b/);
+  const mMonth = t.match(/\b(\d{1,2})\s+(ocak|subat|mart|nisan|mayis|haziran|temmuz|agustos|eylul|ekim|kasim|aralik)\b/);
+
+  const timeOnly = parseTimeBest(t);
+  const hasTime = Boolean(timeOnly);
+
+  let baseTr = new Date(nowTr.getTime());
+  if (hasTomorrow) baseTr = addDaysMs(baseTr, 1);
+
+  let year = baseTr.getUTCFullYear();
+  let month = baseTr.getUTCMonth();
+  let day = baseTr.getUTCDate();
+
+  let hasExplicitDate = false;
+
+  if (mNumeric) {
+    hasExplicitDate = true;
+    day = Number(mNumeric[1]);
+    month = Number(mNumeric[2]) - 1;
+    if (mNumeric[3]) {
+      const y = Number(mNumeric[3]);
+      year = y < 100 ? 2000 + y : y;
+    }
+  } else if (mMonth) {
+    hasExplicitDate = true;
+    day = Number(mMonth[1]);
+    month = monthNameToIndex(mMonth[2]);
+  } else if (weekdayIdx != null) {
+    hasExplicitDate = true;
+    const next = nextOccurrenceOfWeekday(nowTr, weekdayIdx);
+    year = next.year;
+    month = next.month;
+    day = next.day;
+  } else if (hasTomorrow || hasToday) {
+    hasExplicitDate = true;
+  } else if (!hasTime) {
+    return null;
+  }
+
+  if (!hasTime) {
+    const dateOnly = `${String(year)}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const dummyUtc = new Date(Date.UTC(year, month, day, 0, 0, 0, 0));
+    return { dateUtc: dummyUtc, hasTime: false, hasDate: true, dateOnly };
+  }
+
+  const hh = timeOnly!.hh;
+  const mm = timeOnly!.mm;
+
+  const dUtc = new Date(Date.UTC(year, month, day, hh - 3, mm, 0, 0));
+  if (isNaN(dUtc.getTime())) return null;
+
+  if (!hasExplicitDate && hasTime) {
+    const nowUtc = new Date();
+    if (dUtc.getTime() <= nowUtc.getTime()) {
+      const moved = addDaysMs(dUtc, 1);
+      return { dateUtc: moved, hasTime: true, hasDate: true };
+    }
+  }
+
+  return { dateUtc: dUtc, hasTime: true, hasDate: true };
+}
+
+function parseTimeBest(t: string): { hh: number; mm: number } | null {
+  const matches: Array<{ hh: number; mm: number; idx: number }> = [];
+  const reStrong = /(\d{1,2})\s*[:.]\s*(\d{2})/g;
+  let m: RegExpExecArray | null;
+  while ((m = reStrong.exec(t))) {
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) matches.push({ hh, mm, idx: m.index });
+  }
+
+  if (matches.length === 0 && t.includes('saat')) {
+    const reWeak = /saat\s*(\d{1,2})(?:\s*[:.]\s*(\d{2}))?/g;
+    while ((m = reWeak.exec(t))) {
+      const hh = Number(m[1]);
+      const mm = m[2] ? Number(m[2]) : 0;
+      if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) matches.push({ hh, mm, idx: m.index });
+    }
+  }
+
+  if (matches.length === 0) return null;
+  const last = matches[matches.length - 1];
+  return { hh: last.hh, mm: last.mm };
+}
+
+function monthNameToIndex(m: string) {
+  switch (m) {
+    case 'ocak': return 0;
+    case 'subat': return 1;
+    case 'mart': return 2;
+    case 'nisan': return 3;
+    case 'mayis': return 4;
+    case 'haziran': return 5;
+    case 'temmuz': return 6;
+    case 'agustos': return 7;
+    case 'eylul': return 8;
+    case 'ekim': return 9;
+    case 'kasim': return 10;
+    case 'aralik': return 11;
+    default: return 0;
+  }
+}
+
+function clampToFuture(d: Date) {
+  const now = new Date();
+  if (d.getTime() > now.getTime()) return d;
+  let x = new Date(d.getTime());
+  for (let i = 0; i < 366; i++) {
+    x = addDaysMs(x, 1);
+    if (x.getTime() > now.getTime()) return x;
+  }
+  return addDaysMs(now, 1);
+}
+
+function toSchemaDateTime(startAtIso: string, durationMinutes?: number) {
+  const parts = getTrPartsFromIso(startAtIso);
+  if (!parts) {
+    return {
+      dateAtUtcMidnight: new Date(Date.UTC(1970, 0, 1, 0, 0, 0, 0)),
+      timeHHMM: '00:00',
+      endTimeHHMM: durationMinutes ? '00:00' : undefined,
+    };
+  }
+
+  const dateAtUtcMidnight = new Date(Date.UTC(parts.y, parts.m - 1, parts.d, 0, 0, 0, 0));
+  const timeHHMM = `${String(parts.hh).padStart(2, '0')}:${String(parts.mm).padStart(2, '0')}`;
+
+  let endTimeHHMM: string | undefined = undefined;
+  if (typeof durationMinutes === 'number' && durationMinutes > 0) {
+    const startUtc = new Date(startAtIso);
+    const endIso = toIstanbulIso(new Date(startUtc.getTime() + durationMinutes * 60000));
+    const ep = getTrPartsFromIso(endIso);
+    if (ep) endTimeHHMM = `${String(ep.hh).padStart(2, '0')}:${String(ep.mm).padStart(2, '0')}`;
+  }
+
+  return { dateAtUtcMidnight, timeHHMM, endTimeHHMM };
+}

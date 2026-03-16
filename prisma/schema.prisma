@@ -7,307 +7,257 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-/**
- * Existing core tables (from db pull):
- * Tenant, Service, Staff, Customer, Appointment, CallSession
- * We keep them and ADD new MVP bot tables additively.
- */
+model appointments {
+  id String @id @default(cuid())
+  tenantId         String
+  customerId       String
+  serviceId        String
+  staffId          String
+  date             DateTime
+  time             String
+  endTime          String?
+  status           AppointmentStatus @default(PENDING)
+  notes            String?
+  channel          SessionChannel?
+  messageSessionId String?
+  callSessionId    String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime
+  call_sessions    call_sessions?    @relation(fields: [callSessionId], references: [id])
+  customers        customers         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  message_sessions message_sessions? @relation(fields: [messageSessionId], references: [id])
+  services         services          @relation(fields: [serviceId], references: [id])
+  staff            staff             @relation(fields: [staffId], references: [id])
+  tenants          tenants           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reminder2hSentAt DateTime?
+startAtUtc DateTime? @db.Timestamptz(6)
+endAtUtc   DateTime? @db.Timestamptz(6)
 
-enum AppointmentStatus {
-  scheduled
-  cancelled
-  done
+@@index([tenantId, startAtUtc])
+  @@unique([tenantId, staffId, date, time])
+  @@index([tenantId, customerId])
+  @@index([tenantId, date, status])
 }
 
-enum Channel {
-  VOICE
-  WHATSAPP
-  SMS
-  WEB
-}
-
-enum MessageDirection {
-  INBOUND
-  OUTBOUND
-}
-
-
-
-enum MessageRole {
-  USER
-  BOT
-  SYSTEM
-}
-
-model Tenant {
-  id           String        @id @default(cuid())
-  name         String
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  appointments Appointment[]
-  customers    Customer[]
-  services     Service[]
-  staff        Staff[]
-
-  // ✅ new (no DB column here; relation only)
-  business      Business?
-  conversations BotConversation[]
-  staffServices StaffService[]
-}
-
-model Service {
-  id           String        @id @default(cuid())
+model call_sessions {
+  id           String         @id
   tenantId     String
-  name         String
-  price        Int
-  duration     Int
-  isActive     Boolean       @default(true)
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  appointments Appointment[]
-  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  // ✅ new
-  staffLinks StaffService[]
-
-  @@unique([tenantId, name])
-  @@index([tenantId])
-}
-model WhatsAppMessage {
-  id           String           @id @default(cuid())
-  tenantId     String
-  direction    MessageDirection
-  from         String?
+  customerId   String?
+  callSid      String         @unique
+  from         String
   to           String?
-  body         String?
-  provider     String           @default("twilio")
-  providerSid  String?
-  createdAt    DateTime         @default(now())
+  status       String?
+  duration     Int?
+  transcript   String?
+  context      Json?
+  createdAt    DateTime       @default(now())
+updatedAt    DateTime @updatedAt
+  appointments appointments[]
+  customers    customers?     @relation(fields: [customerId], references: [id])
+  tenants      tenants        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, callSid])
+}
+
+model customers {
+  id               String             @id
+  tenantId         String
+  phoneNumber      String
+  name             String?
+  email            String?
+  notes            String?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime
+  appointments     appointments[]
+  call_sessions    call_sessions[]
+  tenants          tenants            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  message_sessions message_sessions[]
+
+  @@unique([tenantId, phoneNumber])
+  @@index([tenantId, phoneNumber])
+}
+
+model message_sessions {
+  id              String         @id
+  tenantId        String
+  customerId      String
+  channel         SessionChannel @default(WHATSAPP)
+  conversationId  String         @unique
+  context         Json?
+  lastSuggestions Json?
+  lastMessageAt   DateTime?
+  isActive        Boolean        @default(true)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime
+  appointments    appointments[]
+  customers       customers      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  tenants         tenants        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+  @@index([tenantId, conversationId])
+}
+
+model notifications {
+  id        String           @id
+  tenantId  String
+  type      NotificationType
+  recipient String
+  subject   String?
+  body      String
+  sentAt    DateTime?
+  status    String           @default("pending")
+  metadata  Json?
+  createdAt DateTime         @default(now())
+  tenants   tenants          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, status])
+}
+
+model services {
+  id           String         @id
+  tenantId     String
+  name         String
+  description  String?
+  duration     Int
+  price        Float
+  isActive     Boolean        @default(true)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime
+  appointments appointments[]
+  tenants      tenants        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, isActive])
+}
+
+model staff {
+  id           String         @id
+  tenantId     String
+  name         String
+  phone        String?
+  email        String?
+  isActive     Boolean        @default(true)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime
+  appointments appointments[]
+  tenants      tenants        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, isActive])
+}
+
+model subscription_plans {
+  id                String               @id
+  tenantId          String
+  planType          SubscriptionPlanType
+  status            SubscriptionStatus   @default(TRIAL)
+  startDate         DateTime
+  endDate           DateTime?
+  monthlyPrice      Float
+  voiceMinutesQuota Int?
+  messageQuota      Int?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime
+  tenants           tenants              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, status])
+}
+
+model system_logs {
+  id        String   @id
+  tenantId  String?
+  level     String
+  message   String
+  context   Json?
+  createdAt DateTime @default(now())
 
   @@index([tenantId, createdAt])
-  @@index([tenantId, direction, createdAt])
 }
 
-
-model Staff {
-  id           String        @id @default(cuid())
-  tenantId     String
-  fullName     String
-  phone        String?
-  isActive     Boolean       @default(true)
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  appointments Appointment[]
-  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  // ✅ new
-  services     StaffService[]
-  workingHours WorkingHours[]
-  timeOffs     TimeOff[]
-
-  @@unique([tenantId, fullName])
-  @@index([tenantId])
+model tenant_settings {
+  id                    String   @id
+  tenantId              String   @unique
+  botEnabled            Boolean  @default(true)
+  voiceEnabled          Boolean  @default(true)
+  whatsappEnabled       Boolean  @default(true)
+  workingHoursStart     String   @default("09:00")
+  workingHoursEnd       String   @default("18:00")
+  workingDays           String   @default("1,2,3,4,5")
+  slotDurationMinutes   Int      @default(30)
+  bufferMinutes         Int      @default(0)
+  maxAdvanceBookingDays Int      @default(30)
+  timezone              String   @default("Europe/Istanbul")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime
+  tenants               tenants  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 }
 
-model Customer {
-  id           String        @id @default(cuid())
-  tenantId     String
-  fullName     String
-  phone        String
-  note         String?
-  isActive     Boolean       @default(true)
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  appointments Appointment[]
-  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  // ✅ new (WhatsApp id/phone ayrı tutulabilir)
-  whatsappPhone String?
-  conversations BotConversation[]
-
-  @@unique([tenantId, phone])
-  @@index([tenantId])
-  @@index([tenantId, whatsappPhone])
+model tenants {
+  id                 String               @id
+  name               String
+  domain             String?              @unique
+  isActive           Boolean              @default(true)
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime
+  appointments       appointments[]
+  call_sessions      call_sessions[]
+  customers          customers[]
+  message_sessions   message_sessions[]
+  notifications      notifications[]
+  services           services[]
+  staff              staff[]
+  subscription_plans subscription_plans[]
+  tenant_settings    tenant_settings?
+  users              users[]
 }
 
-model Appointment {
-  id         String            @id @default(cuid())
-  tenantId   String
-  customerId String
-  serviceId  String
-  startAt    DateTime
-  endAt      DateTime
-  status     AppointmentStatus @default(scheduled)
-
-  // ✅ new: which channel created it
-  channel Channel @default(WHATSAPP)
-
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
-  staffId        String?
-  reminderSentAt DateTime?
-  customer       Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
-  service        Service   @relation(fields: [serviceId], references: [id], onDelete: Cascade)
-  staff          Staff?    @relation(fields: [staffId], references: [id])
-  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  // (Optional) aynı staff+startAt duplicate’ini engeller (Postgres NULL staffId'e izin verir)
-  @@unique([tenantId, staffId, startAt])
-  @@index([customerId])
-  @@index([serviceId])
-  @@index([staffId])
-  @@index([tenantId])
-}
-
-model CallSession {
+model users {
   id        String   @id
   tenantId  String
-  phone     String
-  callSid   String
-  step      String   @default("SERVICE")
-  data      Json     @default("{}")
+  email     String
+  password  String
+  fullName  String
+  role      UserRole @default(OWNER)
+  isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime
+  tenants   tenants  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  @@unique([tenantId, callSid])
-  @@index([tenantId, phone])
+  @@unique([tenantId, email])
 }
 
-/**
- * =========================
- * ✅ NEW MVP BOT TABLES
- * =========================
- */
-
-model Business {
-  id       String @id @default(cuid())
-  tenantId String @unique
-
-  name     String
-  phone    String?
-  address  String?
-  city     String?
-  timezone String  @default("Europe/Istanbul")
-
-  ownerName     String?
-  ownerPhone    String? // SMS fallback
-  ownerWhatsapp String? // WhatsApp primary
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  @@index([tenantId])
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
 }
 
-model StaffService {
-  id        String  @id @default(cuid())
-  tenantId  String
-  staffId   String
-  serviceId String
-  isActive  Boolean @default(true)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  staff   Staff   @relation(fields: [staffId], references: [id], onDelete: Cascade)
-  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
-
-  @@unique([tenantId, staffId, serviceId])
-  @@index([tenantId])
-  @@index([tenantId, staffId])
-  @@index([tenantId, serviceId])
+enum NotificationType {
+  WHATSAPP
+  SMS
+  EMAIL
 }
 
-model WorkingHours {
-  id       String @id @default(cuid())
-  tenantId String
-  staffId  String
-
-  // ISO: 1=Mon ... 7=Sun
-  dayOfWeek Int
-
-  // minutes from 00:00 local time
-  startMin Int
-  endMin   Int
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  staff Staff @relation(fields: [staffId], references: [id], onDelete: Cascade)
-
-  @@unique([tenantId, staffId, dayOfWeek, startMin, endMin])
-  @@index([tenantId, staffId])
+enum SessionChannel {
+  WHATSAPP
+  VOICE
 }
 
-model TimeOff {
-  id       String @id @default(cuid())
-  tenantId String
-  staffId  String
-
-  startAt DateTime
-  endAt   DateTime
-  reason  String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  staff Staff @relation(fields: [staffId], references: [id], onDelete: Cascade)
-
-  @@index([tenantId, staffId, startAt])
+enum SubscriptionPlanType {
+  CHATBOT_ONLY
+  CHATBOT_VOICE
+  ENTERPRISE
 }
 
-model BotConversation {
-  id       String  @id @default(cuid())
-  tenantId String
-  channel  Channel
-
-  customerId     String?
-  externalUserId String? // WhatsApp "From" veya CallSid/phone
-  isOpen         Boolean @default(true)
-
-  state       String?
-  contextJson Json?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
-
-  messages BotMessage[]
-
-  @@index([tenantId, channel, isOpen])
-  @@index([tenantId, externalUserId])
+enum SubscriptionStatus {
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+  TRIAL
 }
 
-model BotMessage {
-  id             String @id @default(cuid())
-  tenantId       String
-  conversationId String
-
-  role    MessageRole
-  text    String
-  rawJson Json?
-
-  createdAt DateTime @default(now())
-
-  conversation BotConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-
-  @@index([tenantId, conversationId, createdAt])
+enum UserRole {
+  SUPER_ADMIN
+  OWNER
+  STAFF
 }
-model NotificationLog {
-  id            String   @id @default(cuid())
-  tenantId      String
-  appointmentId String
-  type          String   // e.g. "REMINDER_2H"
-  to            String
-  payload       Json?
-  createdAt     DateTime @default(now())
-
-  @@unique([appointmentId, type])
-  @@index([tenantId, createdAt])
-}
-

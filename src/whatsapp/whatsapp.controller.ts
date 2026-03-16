@@ -1,23 +1,7 @@
-import { Controller, Post, Req, Res, Logger } from '@nestjs/common';
+import { Controller, Post, Get, Req, Res, Logger } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
-import { AgentService } from '../agent/agent.service';
-
-function escapeXml(s: string) {
-  return (s || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
-function toTwimlMessage(text: string) {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Message>${escapeXml(text)}</Message>
-</Response>`;
-}
+import { WhatsappService } from './whatsapp.service';
 
 function normalizeWa(v: any): string {
   const s = String(v || '').trim();
@@ -30,198 +14,189 @@ export class WhatsappController {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly agent: AgentService,
+    private readonly wa: WhatsappService,
   ) {}
 
-  /**
-   * tenantId resolve:
-   * 1) query.tenantId
-   * 2) To numarasından tenantId_phone benzeri map tablosu
-   */
-  private async resolveTenantId(req: Request, to: string): Promise<string | null> {
+  private async resolveTenantId(req: Request): Promise<string | null> {
     const fromQuery = String((req.query as any)?.tenantId || '').trim();
     if (fromQuery) return fromQuery;
 
-    if (!to) return null;
+    const fromEnv = String(process.env.DEFAULT_TENANT_ID || '').trim();
+    if (fromEnv) return fromEnv;
 
-    // senin loglarda "tenantId_phone" mapping vardı.
-    // Prisma model ismi tam ne bilmiyoruz -> candidates ile deniyoruz.
-    const p: any = this.prisma as any;
-
-    const candidates = [
-      'tenantId_phone',
-      'tenantIdPhone',
-      'tenantPhone',
-      'tenant_phone',
-      'tenantPhoneMap',
-      'tenantId_phoneMap',
-    ];
-
-    for (const name of candidates) {
-      const model = p?.[name];
-      if (!model?.findFirst) continue;
-
-      try {
-        const row = await model.findFirst({
-          where: { phone: to },
-          select: { tenantId: true },
-        });
-
-        if (row?.tenantId) return String(row.tenantId);
-      } catch {
-        // ignore
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * WhatsApp message log (opsiyonel):
-   * Prisma'da WhatsAppMessage modeli yoksa PATLAMASIN diye try/catch.
-   */
-  private async logWhatsAppMessage(params: {
-    tenantId: string;
-    direction: 'INBOUND' | 'OUTBOUND';
-    from?: string | null;
-    to?: string | null;
-    body?: string | null;
-    providerSid?: string | null;
-  }) {
     try {
-      const p: any = this.prisma as any;
-      const model = p?.whatsAppMessage || p?.whatsappMessage || p?.whatSAppMessage;
-      if (!model?.create) return;
-
-      await model.create({
-        data: {
-          tenantId: params.tenantId,
-          direction: params.direction,
-          from: params.from ?? null,
-          to: params.to ?? null,
-          body: params.body ?? null,
-          provider: 'twilio',
-          providerSid: params.providerSid ?? null,
-        },
-      });
+      const count = await this.prisma.tenants.count();
+      if (count === 1) {
+        const t = await this.prisma.tenants.findFirst({ select: { id: true } });
+        return t?.id ? String(t.id) : null;
+      }
     } catch {
       // ignore
     }
+    return null;
   }
 
-  // Twilio WhatsApp webhook: POST /whatsapp/webhook
+  @Get('webhook')
+  async verify(@Req() req: Request, @Res() res: Response) {
+    const mode = String((req.query as any)?.['hub.mode'] || '');
+    const token = String((req.query as any)?.['hub.verify_token'] || '');
+    const challenge = String((req.query as any)?.['hub.challenge'] || '');
+    const expected = String(process.env.WHATSAPP_VERIFY_TOKEN || '').trim();
+
+    if (mode === 'subscribe' && expected && token === expected) {
+      return res.status(200).send(challenge);
+    }
+
+    this.logger.warn(`WA webhook verify failed. mode=${mode} token=${token}`);
+    return res.sendStatus(403);
+  }
+
+  private isMetaPayload(body: any): boolean {
+    return !!body && (body.object === 'whatsapp_business_account' || Array.isArray(body.entry));
+  }
+
+  private async sendMetaText(toWaIdOrMsisdn: string, text: string, phoneNumberId?: string) {
+    const token = String(process.env.META_WA_TOKEN || '').trim();
+    const version = String(process.env.META_WA_VERSION || 'v25.0').trim();
+    const pni = String(phoneNumberId || process.env.META_WA_PHONE_NUMBER_ID || '').trim();
+
+    if (!token || !pni) {
+      this.logger.error(
+        `META send failed: missing META_WA_TOKEN or META_WA_PHONE_NUMBER_ID. pni=${pni} tokenLen=${token?.length || 0}`,
+      );
+      return;
+    }
+
+    const url = `https://graph.facebook.com/${version}/${pni}/messages`;
+
+    // Node 20'de fetch var
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: String(toWaIdOrMsisdn),
+        type: 'text',
+        text: { body: String(text || '').slice(0, 4000) },
+      }),
+    });
+
+    const raw = await resp.text();
+    if (!resp.ok) {
+      this.logger.error(`META send failed status=${resp.status} body=${raw}`);
+    } else {
+      this.logger.log(`✅ META sent to=${toWaIdOrMsisdn} status=${resp.status}`);
+    }
+  }
+
   @Post('webhook')
   async webhook(@Req() req: Request, @Res() res: Response) {
+    const body: any = req.body;
+
+    // META webhook: sadece 200 dön, işi içeride hallet
+    if (this.isMetaPayload(body)) {
+      try {
+        const tenantId = await this.resolveTenantId(req);
+        if (!tenantId) {
+          this.logger.warn(`META webhook: tenantId bulunamadı`);
+          return res.sendStatus(200);
+        }
+
+        const entries = Array.isArray(body.entry) ? body.entry : [];
+        for (const entry of entries) {
+          const changes = entry?.changes || [];
+          for (const ch of changes) {
+            const value = ch?.value || {};
+            const messages = value?.messages || [];
+            const contacts = value?.contacts || [];
+            const metadata = value?.metadata || {};
+            const phoneNumberId = metadata?.phone_number_id;
+
+            for (const msg of messages) {
+              const fromWaId = String(msg?.from || '').trim(); // wa_id (digits)
+              const msgType = String(msg?.type || '').trim();
+
+              let text = '';
+              if (msgType === 'text') text = String(msg?.text?.body || '').trim();
+              else if (msgType === 'button') text = String(msg?.button?.text || '').trim();
+              else if (msgType === 'interactive') {
+                // list / reply
+                text =
+                  String(msg?.interactive?.button_reply?.title || '').trim() ||
+                  String(msg?.interactive?.list_reply?.title || '').trim();
+              }
+
+              const contactName =
+                String(contacts?.[0]?.profile?.name || '').trim() ||
+                String(value?.contacts?.[0]?.profile?.name || '').trim();
+
+              if (!fromWaId) continue;
+
+              this.logger.log(`📩 META inbound tenantId=${tenantId} from=${fromWaId} type=${msgType} text="${text}"`);
+
+              // boş mesaj gelirse bile handle edelim (AI belki "?" döner)
+              const replyText = await this.wa.handleIncoming({
+                tenantId,
+                from: `whatsapp:+${fromWaId}`,
+                to: `whatsapp:${process.env.META_WA_PHONE_NUMBER_ID || phoneNumberId || ''}`,
+                text: text || '',
+                contentType: String(req.headers['content-type'] || ''),
+                raw: {
+                  provider: 'meta',
+                  msg,
+                  valueMeta: { phoneNumberId, contactName },
+                },
+              });
+
+              const safeReply = String(replyText || '').trim() || 'Size nasıl yardımcı olabilirim?';
+              await this.sendMetaText(fromWaId, safeReply, phoneNumberId);
+            }
+          }
+        }
+
+        return res.sendStatus(200);
+      } catch (e: any) {
+        this.logger.error(`META webhook error: ${e?.message || e}`);
+        return res.sendStatus(200);
+      }
+    }
+
+    // --- Twilio webhook (eski) hala dursun ---
     try {
-      // Twilio form fields
       const from = normalizeWa((req.body as any)?.From);
       const to = normalizeWa((req.body as any)?.To);
       const bodyText = String((req.body as any)?.Body || '').trim();
-      const messageSid = String((req.body as any)?.MessageSid || '').trim() || null;
+      const contentType = String(req.headers['content-type'] || '');
 
-      // Twilio'ya asla 400 dönmeyelim -> hep 200 + TwiML
       if (!from || !bodyText) {
-        return res.status(200).type('text/xml').send(toTwimlMessage('Mesajı göremedim. Tekrar yazar mısınız?'));
+        return res.status(200).send('OK');
       }
 
-      const tenantId = await this.resolveTenantId(req, to);
-
+      const tenantId = await this.resolveTenantId(req);
       if (!tenantId) {
-        this.logger.warn(`tenantId bulunamadı. to=${to} from=${from}`);
-        return res
-          .status(200)
-          .type('text/xml')
-          .send(toTwimlMessage('Bu numara için işletme tanımı bulunamadı. Lütfen işletme sahibine ulaşın.'));
+        this.logger.warn(`Twilio WA: tenantId bulunamadı. to=${to} from=${from}`);
+        return res.status(200).send('OK');
       }
 
-      this.logger.log(`📩 WhatsApp tenantId=${tenantId} from=${from} to=${to}: ${bodyText}`);
+      this.logger.log(`📩 Twilio inbound tenantId=${tenantId} from=${from} to=${to}: ${bodyText}`);
 
-      // ✅ INBOUND log (model varsa)
-      await this.logWhatsAppMessage({
+      const replyText = await this.wa.handleIncoming({
         tenantId,
-        direction: 'INBOUND',
-        from,
-        to,
-        body: bodyText,
-        providerSid: messageSid,
-      });
-
-      // 1) Conversation bul/oluştur
-      const conversation =
-        (await this.prisma.botConversation.findFirst({
-          where: {
-            tenantId,
-            channel: 'WHATSAPP',
-            externalUserId: from,
-            isOpen: true,
-          },
-          select: { id: true },
-        })) ||
-        (await this.prisma.botConversation.create({
-          data: {
-            tenantId,
-            channel: 'WHATSAPP',
-            externalUserId: from,
-            isOpen: true,
-            state: null,
-            contextJson: {},
-          },
-          select: { id: true },
-        }));
-
-      const conversationId = conversation.id;
-
-      // 2) USER mesajını DB’ye yaz
-      await this.prisma.botMessage.create({
-        data: {
-          tenantId,
-          conversationId,
-          role: 'USER',
-          text: bodyText,
-          rawJson: {
-            provider: 'twilio',
-            from,
-            to,
-            body: req.body,
-          } as any,
-        },
-      });
-
-      // 3) Agent cevabı
-      const reply = await this.agent.replyText({
-        tenantId,
-        from,
+        from: `whatsapp:${from}`,
+        to: `whatsapp:${to}`,
         text: bodyText,
+        contentType,
+        raw: { provider: 'twilio', body: req.body },
       });
 
-      const replyText = String(reply || '').trim() || 'Size nasıl yardımcı olabilirim?';
-
-      // 4) BOT mesajını DB’ye yaz
-      await this.prisma.botMessage.create({
-        data: {
-          tenantId,
-          conversationId,
-          role: 'BOT',
-          text: replyText,
-          rawJson: { provider: 'agent' } as any,
-        },
-      });
-
-      // ✅ OUTBOUND log (model varsa)
-      await this.logWhatsAppMessage({
-        tenantId,
-        direction: 'OUTBOUND',
-        from: to, // işletme numarası gibi düşünebilirsin
-        to: from, // müşteri
-        body: replyText,
-        providerSid: null,
-      });
-
-      // 5) TwiML dön
-      return res.status(200).type('text/xml').send(toTwimlMessage(replyText));
+      // Twilio burada TwiML beklerdi, ama artık Meta’ya geçiyoruz; Twilio kullanmıyorsan önemli değil
+      return res.status(200).send(String(replyText || 'OK'));
     } catch (e: any) {
-      this.logger.error(`webhook error: ${e?.message || e}`);
-      return res.status(200).type('text/xml').send(toTwimlMessage('Bir hata oldu. Tekrar dener misiniz?'));
+      this.logger.error(`Twilio webhook error: ${e?.message || e}`);
+      return res.status(200).send('OK');
     }
   }
 }

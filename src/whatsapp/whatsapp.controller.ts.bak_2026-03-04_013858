@@ -1,0 +1,119 @@
+import { Controller, Post, Req, Res, Logger } from '@nestjs/common';
+import type { Request, Response } from 'express';
+import { PrismaService } from '../prisma/prisma.service';
+import { WhatsappService } from './whatsapp.service';
+
+function escapeXml(s: string) {
+  return (s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function toTwimlMessage(text: string) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>${escapeXml(text)}</Message>
+</Response>`;
+}
+
+function normalizeWa(v: any): string {
+  const s = String(v || '').trim();
+  return s.replace(/^whatsapp:/i, '').trim();
+}
+
+@Controller('whatsapp')
+export class WhatsappController {
+  private readonly logger = new Logger(WhatsappController.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly wa: WhatsappService,
+  ) {}
+
+  /**
+   * tenantId resolve:
+   * 1) query.tenantId
+   * 2) DEFAULT_TENANT_ID env
+   * 3) DB'de tek tenant varsa onu seç (quick-fallback)
+   */
+  private async resolveTenantId(req: Request): Promise<string | null> {
+    const fromQuery = String((req.query as any)?.tenantId || '').trim();
+    if (fromQuery) return fromQuery;
+
+    const fromEnv = String(process.env.DEFAULT_TENANT_ID || '').trim();
+    if (fromEnv) return fromEnv;
+
+    // fallback: tek tenant varsa
+    try {
+      const count = await this.prisma.tenants.count();
+      if (count === 1) {
+        const t = await this.prisma.tenants.findFirst({ select: { id: true } });
+        return t?.id ? String(t.id) : null;
+      }
+    } catch {
+      // ignore
+    }
+
+    return null;
+  }
+
+  @Post('webhook')
+  async webhook(@Req() req: Request, @Res() res: Response) {
+    try {
+      const from = normalizeWa((req.body as any)?.From);
+      const to = normalizeWa((req.body as any)?.To);
+      const bodyText = String((req.body as any)?.Body || '').trim();
+      const contentType = String(req.headers['content-type'] || '');
+
+      // Twilio'ya asla 4xx dönme -> hep 200 + TwiML
+      if (!from || !bodyText) {
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(toTwimlMessage('Mesajı göremedim. Tekrar yazar mısın?'));
+      }
+
+      const tenantId = await this.resolveTenantId(req);
+
+      if (!tenantId) {
+        this.logger.warn(`tenantId bulunamadı. to=${to} from=${from}`);
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(
+            toTwimlMessage(
+              'Bu numara için işletme tanımı bulunamadı. (Webhook URL’ine ?tenantId= ekleyelim)',
+            ),
+          );
+      }
+
+      this.logger.log(`📩 WhatsApp tenantId=${tenantId} from=${from} to=${to}: ${bodyText}`);
+
+      const replyText = await this.wa.handleIncoming({
+        tenantId,
+        from: `whatsapp:${from}`,
+        to: `whatsapp:${to}`,
+        text: bodyText,
+        contentType,
+        raw: {
+          From: (req.body as any)?.From,
+          To: (req.body as any)?.To,
+          Body: (req.body as any)?.Body,
+          MessageSid: (req.body as any)?.MessageSid,
+        },
+      });
+
+      const safeReply = String(replyText || '').trim() || 'Size nasıl yardımcı olabilirim?';
+      return res.status(200).type('text/xml').send(toTwimlMessage(safeReply));
+    } catch (e: any) {
+      this.logger.error(`webhook error: ${e?.message || e}`);
+      return res
+        .status(200)
+        .type('text/xml')
+        .send(toTwimlMessage('Bir hata oldu. Tekrar dener misin?'));
+    }
+  }
+}

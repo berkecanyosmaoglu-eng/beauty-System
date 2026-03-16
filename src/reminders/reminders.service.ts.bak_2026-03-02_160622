@@ -1,0 +1,224 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
+import { PrismaService } from '../prisma/prisma.service';
+
+@Injectable()
+export class RemindersService {
+  private readonly logger = new Logger(RemindersService.name);
+
+  // notifications.type enum: NotificationType
+  // Enum içinde yoksa build hata verir. O yüzden mevcut enum'dan bir değeri kullanmak daha garanti:
+  // Şimdilik type'ı "REMINDER" gibi bir enum yoksa patlar.
+  // Bu yüzden: schema.prisma'daki NotificationType değerlerinden birini kullanacağız.
+  // Eğer bilmiyorsak, safest: (this.prisma as any).notifications ile "type" yazarken string yerine enum kullanmak.
+  // Burada string veriyoruz ama TS patlarsa aşağıdaki NOT'u uygula.
+  private readonly TYPE_ANY: any = 'REMINDER_2H';
+
+  constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Her dakika çalışır:
+   * - şimdi + 2 saat (±1 dk) pencere
+   * - appointments(date+time) -> startAt hesapla
+   * - notifications tablosunda aynı appointment için daha önce "sent" var mı? varsa skip
+   * - Twilio WhatsApp ile gönder
+   * - notifications.status="sent", sentAt=now
+   */
+  @Cron('*/1 * * * *')
+  async run2hReminders() {
+    try {
+      const now = new Date();
+
+      const windowStart = new Date(now.getTime() + 119 * 60 * 1000);
+      const windowEnd = new Date(now.getTime() + 121 * 60 * 1000);
+
+      const day0 = new Date(now);
+      day0.setHours(0, 0, 0, 0);
+      const day2 = new Date(day0.getTime() + 2 * 24 * 60 * 60 * 1000);
+
+      // Twilio env kontrol
+      const client = this.getTwilioClientSafe();
+      const from = this.getTwilioWhatsappFromSafe();
+      if (!client || !from) {
+        this.logger.warn(
+          `[2hReminder] Missing env. Need TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN + TWILIO_WHATSAPP_FROM (whatsapp:+...)`,
+        );
+        return;
+      }
+
+      // randevuları çek
+      const appts = await this.prisma.appointments.findMany({
+        where: {
+          date: { gte: day0, lt: day2 },
+          // iptal alanın varsa filtremize ekleriz:
+          // status: { not: 'CANCELED' } as any,
+        } as any,
+        include: {
+          customer: true,
+          service: true,
+          staff: true,
+        } as any,
+        take: 600,
+      });
+
+      if (!appts?.length) return;
+
+      let sent = 0;
+
+      for (const a of appts as any[]) {
+        const startAt = this.combineDateAndTime(a.date, a.time);
+        if (!startAt) continue;
+
+        if (startAt < windowStart || startAt > windowEnd) continue;
+
+        const customerPhone = String(a?.customer?.phoneNumber || '').trim();
+        if (!customerPhone) continue;
+
+        // idempotency: bu appointment için "sent" var mı?
+        const already = await this.prisma.notifications.findFirst({
+          where: {
+            tenantId: a.tenantId,
+            // metadata içinde appointmentId tutacağız
+            status: 'sent',
+            metadata: {
+              path: ['appointmentId'],
+              equals: a.id,
+            },
+          } as any,
+          select: { id: true },
+        });
+
+        if (already) continue;
+
+        const serviceName = String(a?.service?.name || 'randevun');
+        const staffName = a?.staff?.name ? ` (${String(a.staff.name)})` : '';
+        const startText = this.prettyTr(startAt);
+
+        const body =
+          `Selam 👋 Randevuna 2 saat kaldı.\n` +
+          `📅 ${startText}\n` +
+          `💅 ${serviceName}${staffName}\n\n` +
+          `Gelebilecek misin? (E/H)\n` +
+          `İptal/erteleme istersen buraya yazman yeter.`;
+
+        // önce notification kaydı aç (pending)
+        const notif = await this.prisma.notifications.create({
+          data: {
+            tenantId: a.tenantId,
+            type: this.TYPE_ANY, // NOT: TS patlarsa aşağıda anlattım
+            recipient: customerPhone,
+            subject: '2 Saat Kala Hatırlatma',
+            body,
+            status: 'pending',
+            metadata: {
+              appointmentId: a.id,
+              serviceId: a.serviceId,
+              staffId: a.staffId,
+              targetStartAt: startAt.toISOString(),
+              channel: 'whatsapp',
+            },
+          } as any,
+          select: { id: true },
+        });
+
+        try {
+          const to = this.normalizeToWhatsapp(customerPhone);
+
+          const res = await client.messages.create({
+            from,
+            to,
+            body,
+          });
+
+          await this.prisma.notifications.update({
+            where: { id: notif.id },
+            data: {
+              status: 'sent',
+              sentAt: new Date(),
+              metadata: {
+                ...(typeof (notif as any).metadata === 'object' ? (notif as any).metadata : {}),
+                appointmentId: a.id,
+                provider: 'twilio',
+                providerMessageId: String(res?.sid || ''),
+              },
+            } as any,
+          });
+
+          sent++;
+        } catch (e: any) {
+          this.logger.error(
+            `[2hReminder] send failed apptId=${a?.id} to=${customerPhone} err=${e?.message || e}`,
+          );
+          // failed
+          await this.prisma.notifications.update({
+            where: { id: notif.id },
+            data: {
+              status: 'failed',
+              metadata: {
+                appointmentId: a.id,
+                error: String(e?.message || e),
+              },
+            } as any,
+          });
+        }
+      }
+
+      if (sent > 0) this.logger.log(`[2hReminder] sent=${sent}`);
+    } catch (e: any) {
+      this.logger.error(`[run2hReminders] ${e?.message || e}`);
+    }
+  }
+
+  private getTwilioClientSafe(): any | null {
+    const sid = process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID;
+    const token = process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
+    if (!sid || !token) return null;
+    try {
+      const twilio = require('twilio');
+      return twilio(sid, token);
+    } catch (e) {
+      this.logger.error(`[2hReminder] twilio require failed: ${(e as any)?.message || e}`);
+      return null;
+    }
+  }
+
+  private getTwilioWhatsappFromSafe(): string | null {
+    const from =
+      process.env.TWILIO_WHATSAPP_FROM ||
+      process.env.WHATSAPP_FROM ||
+      process.env.TWILIO_FROM_WHATSAPP ||
+      '';
+    if (!from) return null;
+    return this.normalizeToWhatsapp(from);
+  }
+
+  private normalizeToWhatsapp(raw: string): string {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+    if (/^whatsapp:/i.test(s)) return s;
+    if (s.startsWith('+')) return `whatsapp:${s}`;
+    if (s.startsWith('90')) return `whatsapp:+${s}`;
+    if (s.startsWith('0')) return `whatsapp:+9${s}`;
+    return `whatsapp:+90${s}`;
+  }
+
+  private combineDateAndTime(date: Date, timeStr: string): Date | null {
+    const t = String(timeStr || '').trim();
+    const m = t.match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (Number.isNaN(hh) || Number.isNaN(mm)) return null;
+    const d = new Date(date);
+    d.setHours(hh, mm, 0, 0);
+    return d;
+  }
+
+  private prettyTr(d: Date) {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const x = new Date(d);
+    return `${pad(x.getDate())}.${pad(x.getMonth() + 1)}.${x.getFullYear()} ${pad(
+      x.getHours(),
+    )}:${pad(x.getMinutes())}`;
+  }
+}

@@ -1,0 +1,511 @@
+import { Injectable, Logger } from '@nestjs/common';
+import WebSocket from 'ws';
+
+/**
+ * Twilio message payload type. Media events carry base64 encoded μ-law audio
+ * while start/stop notify the stream SID.
+ */
+type TwilioMsg =
+  | { event: 'connected' }
+  | {
+      event: 'start';
+      start: {
+        streamSid: string;
+        callSid?: string;
+        customParameters?: Record<string, string>;
+      };
+    }
+  | { event: 'media'; streamSid: string; media: { payload: string } }
+  | { event: 'stop'; streamSid: string };
+
+type SessionState = {
+  key: string; // internal map key
+  tenantId: string;
+  closed: boolean;
+
+  // Twilio WS
+  twilio?: WebSocket;
+  streamSid?: string;
+  twilioFrames: number;
+
+  // OpenAI WS
+  openai?: WebSocket;
+  openaiReady: boolean;
+
+  openaiAppends: number;
+  openaiDeltas: number;
+  openaiLastError?: string;
+
+  // audio tracking
+  appendedMsSinceCommit: number;
+
+  // speaking / barge-in
+  aiSpeaking: boolean; // true when we are currently streaming audio deltas to Twilio
+  responseInProgress: boolean; // true after response.create until response.done
+  aiHasActiveResponse: boolean; // true when response is active (created or delta started)
+
+  // Debounce
+  lastResponseCreateAt: number;
+
+  // greet once
+  greeted: boolean;
+};
+
+@Injectable()
+export class RealtimeBridgeService {
+  private readonly logger = new Logger(RealtimeBridgeService.name);
+  private readonly sessions = new Map<string, SessionState>();
+
+  // OpenAI realtime endpoint + model query param
+  private readonly openaiUrl =
+    process.env.OPENAI_REALTIME_URL ||
+    'wss://api.openai.com/v1/realtime?model=gpt-realtime-mini';
+
+  private readonly apiKey = process.env.OPENAI_API_KEY || '';
+
+  /**
+   * main.ts içindeki raw WS upgrade handler burayı çağırıyor.
+   * - ws: Twilio Media Stream WebSocket
+   * - requestUrl: örn "/bot/stream?tenantId=xxx"
+   */
+  handleTwilioWebSocket(ws: WebSocket, requestUrl: string) {
+    const tenantIdFromQuery = this.getQueryParam(requestUrl, 'tenantId') || '';
+    const tenantId = tenantIdFromQuery || 'default';
+
+    // IMPORTANT: do NOT key sessions only by tenantId (parallel calls collide)
+    const tempKey = `tmp:${tenantId}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+
+    const state: SessionState = {
+      key: tempKey,
+      tenantId,
+      closed: false,
+
+      twilio: ws,
+      streamSid: undefined,
+      twilioFrames: 0,
+
+      openai: undefined,
+      openaiReady: false,
+      openaiAppends: 0,
+      openaiDeltas: 0,
+      openaiLastError: undefined,
+
+      appendedMsSinceCommit: 0,
+
+      aiSpeaking: false,
+      responseInProgress: false,
+      aiHasActiveResponse: false,
+
+      lastResponseCreateAt: 0,
+      greeted: false,
+    };
+
+    this.sessions.set(tempKey, state);
+    this.logger.log(`WS CONNECT url=${requestUrl} tenantId(query)=${tenantIdFromQuery || '-'}`);
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(String(raw)) as TwilioMsg;
+
+        if (msg.event === 'start') {
+          const streamSid = msg.start?.streamSid;
+          const tenantIdFromStart = msg.start?.customParameters?.tenantId || '';
+          const finalTenantId = tenantIdFromStart || tenantId;
+
+          state.tenantId = finalTenantId;
+          state.streamSid = streamSid;
+
+          // Move session key to stable streamSid-based key
+          const newKey = `sid:${finalTenantId}:${streamSid}`;
+          this.sessions.delete(state.key);
+          state.key = newKey;
+          this.sessions.set(newKey, state);
+
+          this.logger.log(
+            `Twilio start tenantId=${state.tenantId} streamSid=${streamSid} customTenant=${tenantIdFromStart || '-'}`
+          );
+
+          this.ensureOpenAI(state.key);
+          return;
+        }
+
+        if (msg.event === 'media') {
+          state.twilioFrames++;
+
+          // Calculate ms from base64 μ-law at 8kHz (1 byte/sample).
+          try {
+            const payload = msg.media?.payload || '';
+            const byteLen = Buffer.from(payload, 'base64').length;
+            const ms = Math.round((byteLen / 8000) * 1000);
+            state.appendedMsSinceCommit += ms;
+          } catch {
+            // ignore
+          }
+
+          // append audio to OpenAI input buffer
+          if (state.openai && state.openaiReady) {
+            state.openai.send(
+              JSON.stringify({
+                type: 'input_audio_buffer.append',
+                audio: msg.media.payload, // base64 g711_ulaw
+              })
+            );
+            state.openaiAppends++;
+          }
+
+          if (state.twilioFrames === 1 || state.twilioFrames % 200 === 0) {
+            this.logger.log(
+              `Twilio media tenantId=${state.tenantId} frames=${state.twilioFrames} openaiReady=${state.openaiReady} appends=${state.openaiAppends}`
+            );
+          }
+          return;
+        }
+
+        if (msg.event === 'stop') {
+          this.detach(state.key, 'twilio-stop');
+          return;
+        }
+      } catch (e: any) {
+        this.logger.error(`twilio message parse error: ${e?.message || e}`);
+      }
+    });
+
+    ws.on('close', () => this.detach(state.key, 'twilio-close'));
+    ws.on('error', (e) => this.detach(state.key, `twilio-error:${(e as any)?.message || e}`));
+  }
+
+  // --------------------------
+  // OpenAI realtime
+  // --------------------------
+
+  private ensureOpenAI(sessionKey: string) {
+    const state = this.sessions.get(sessionKey);
+    if (!state || state.closed) return;
+
+    if (!this.apiKey) {
+      state.openaiLastError = 'OPENAI_API_KEY missing';
+      this.logger.error(`OpenAI key missing. sessionKey=${sessionKey}`);
+      return;
+    }
+
+    if (
+      state.openai &&
+      (state.openai.readyState === WebSocket.OPEN || state.openai.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+
+    const ws = new WebSocket(this.openaiUrl, {
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        'OpenAI-Beta': 'realtime=v1',
+      },
+    });
+
+    state.openai = ws;
+    state.openaiReady = false;
+
+    ws.on('open', () => {
+      state.openaiReady = true;
+      this.logger.log(`OpenAI WS connected tenantId=${state.tenantId} sessionKey=${sessionKey}`);
+
+      // ===============================
+      // 🔥 PREMIUM VOICE + PERSONA
+      // ===============================
+      // Not all voices are valid across models; keep configurable & safe fallback.
+      const VOICE = (process.env.OPENAI_REALTIME_VOICE || 'alloy').trim();
+
+      const premiumInstructions =
+        [
+          'Sen bir güzellik merkezi için "premium" resepsiyonist asistanısın.',
+          'Türkçe konuş.',
+          'Doğal, sıcak, akıcı konuş; robot gibi maddeler sayma.',
+          'Cevapları kısa tut ama tek cümleye sıkıştırma: 1-3 kısa cümle ideal.',
+          'Gereksiz açıklama yapma. Kullanıcının söylediğini kısaca teyit et ve net ilerle.',
+          'Randevu alırken sadece gerekli bilgiyi sor (hizmet, tercih edilen gün/saat, gerekirse isim).',
+          'Kullanıcı randevudan farklı bir şey sorarsa: kısa bilgi ver, sonra tekrar nazikçe randevuya dön.',
+          'Asla "appointment id" gibi teknik şeylerden bahsetme.',
+          'Sakin tempo: doğal duraklama hissi ver, aşırı hızlı konuşma.',
+        ].join(' ');
+
+      const sessionUpdate = {
+        type: 'session.update',
+        session: {
+          model: 'gpt-realtime-mini',
+          modalities: ['audio', 'text'],
+          input_audio_format: 'g711_ulaw',
+          output_audio_format: 'g711_ulaw',
+          voice: VOICE,
+
+          // VAD + barge-in
+          turn_detection: {
+            type: 'server_vad',
+            prefix_padding_ms: 250,
+            silence_duration_ms: 450,
+            create_response: false, // we trigger manually on speech_stopped
+            interrupt_response: true,
+          },
+
+          instructions: premiumInstructions,
+        },
+      };
+
+      this.logger.log(`[RealtimeBridgeService] session.update tenantId=${state.tenantId} voice=${VOICE}`);
+      ws.send(JSON.stringify(sessionUpdate));
+
+      // ✅ Greeting: create item + response (no need to commit empty audio)
+      if (!state.greeted) {
+        state.greeted = true;
+
+        ws.send(
+          JSON.stringify({
+            type: 'conversation.item.create',
+            item: {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_text', text: 'Merhaba.' }],
+            },
+          })
+        );
+
+        // Mark active response right away (premium barge-in works even before first delta)
+        state.responseInProgress = true;
+        state.aiHasActiveResponse = true;
+        state.lastResponseCreateAt = Date.now();
+
+        ws.send(
+          JSON.stringify({
+            type: 'response.create',
+            response: {
+              modalities: ['audio', 'text'],
+              instructions:
+                'Görüşmeyi sen başlat. Sıcak ve premium ton. 1-2 kısa cümle: "Merhaba, hoş geldiniz. Size nasıl yardımcı olabilirim?"',
+            },
+          })
+        );
+
+        this.logger.log(`response.create (greeting) tenantId=${state.tenantId}`);
+      }
+    });
+
+    ws.on('message', (raw) => {
+      let msg: any;
+      try {
+        msg = JSON.parse(String(raw));
+      } catch {
+        return;
+      }
+
+      const t = msg?.type;
+      const s = this.sessions.get(sessionKey);
+      if (!s || s.closed) return;
+
+      // Log key events (keep noise low)
+      if (
+        t === 'error' ||
+        t === 'session.created' ||
+        t === 'session.updated' ||
+        t === 'response.created' ||
+        t === 'response.done' ||
+        t === 'input_audio_buffer.speech_started' ||
+        t === 'input_audio_buffer.speech_stopped'
+      ) {
+        this.logger.log(`OpenAI event tenantId=${s.tenantId} type=${t}`);
+      }
+
+      if (t === 'error') {
+        const em = msg?.error?.message || JSON.stringify(msg);
+        this.logger.error(`OpenAI error tenantId=${s.tenantId}: ${em}`);
+
+        s.openaiLastError = em;
+
+        // Defensive reset to recover quickly
+        try {
+          s.openai?.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
+        } catch {}
+
+        s.appendedMsSinceCommit = 0;
+        s.responseInProgress = false;
+        s.aiSpeaking = false;
+        s.aiHasActiveResponse = false;
+        return;
+      }
+
+      // Response created -> mark active immediately (barge-in should work even before audio deltas)
+      if (t === 'response.created') {
+        s.responseInProgress = true;
+        s.aiHasActiveResponse = true;
+        return;
+      }
+
+      // --------------------------
+      // 🔥 BARGE-IN
+      // --------------------------
+      if (t === 'input_audio_buffer.speech_started') {
+        // user starts speaking: stop AI if speaking / active response
+        this.logger.log(
+          `[BARGE-IN] speech_started tenantId=${s.tenantId} aiSpeaking=${s.aiSpeaking} active=${s.aiHasActiveResponse}`
+        );
+
+        if (s.aiHasActiveResponse) {
+          try {
+            s.openai?.send(JSON.stringify({ type: 'response.cancel' }));
+          } catch {}
+        }
+
+        // Clear buffers both sides
+        try {
+          s.openai?.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
+        } catch {}
+
+        if (s.twilio && s.streamSid) {
+          try {
+            s.twilio.send(JSON.stringify({ event: 'clear', streamSid: s.streamSid }));
+          } catch {}
+        }
+
+        // reset local flags
+        s.appendedMsSinceCommit = 0;
+        s.aiSpeaking = false;
+        s.responseInProgress = false;
+        s.aiHasActiveResponse = false;
+        return;
+      }
+
+      // user stopped speaking -> commit + response.create (only if enough audio)
+      if (t === 'input_audio_buffer.speech_stopped') {
+        if (!s.openai || !s.openaiReady) return;
+
+        // avoid overlapping responses
+        if (s.responseInProgress) {
+          this.logger.log(`response.create skipped (already in progress) tenantId=${s.tenantId}`);
+          return;
+        }
+
+        const now = Date.now();
+        if (now - s.lastResponseCreateAt < 900) return;
+
+        const ok = this.hasEnoughAudio(s, 'speech_stopped');
+        if (!ok) return;
+
+        // ✅ commit then create response
+        try {
+          s.openai.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+        } catch {}
+
+        s.appendedMsSinceCommit = 0;
+        s.responseInProgress = true;
+        s.aiHasActiveResponse = true;
+        s.lastResponseCreateAt = now;
+
+        try {
+          s.openai.send(JSON.stringify({ type: 'response.create' }));
+        } catch {}
+
+        this.logger.log(`response.create tenantId=${s.tenantId}`);
+        return;
+      }
+
+      // Response done -> reset flags
+      if (
+        t === 'response.done' ||
+        t === 'response.audio.done' ||
+        t === 'response.output_audio.done' ||
+        t === 'response.end'
+      ) {
+        s.aiSpeaking = false;
+        s.responseInProgress = false;
+        s.aiHasActiveResponse = false;
+        return;
+      }
+
+      // OpenAI audio delta -> forward to Twilio
+      if (t === 'response.audio.delta' || t === 'response.output_audio.delta') {
+        const delta = msg?.delta;
+
+        // mark as speaking
+        s.aiHasActiveResponse = true;
+        s.aiSpeaking = true;
+
+        if (typeof delta === 'string' && s.twilio && s.streamSid) {
+          s.openaiDeltas++;
+          try {
+            s.twilio.send(
+              JSON.stringify({
+                event: 'media',
+                streamSid: s.streamSid,
+                media: { payload: delta },
+              })
+            );
+          } catch {}
+
+          if (s.openaiDeltas === 1 || s.openaiDeltas % 50 === 0) {
+            this.logger.log(
+              `OpenAI audio.delta tenantId=${s.tenantId} deltas=${s.openaiDeltas} twilioFrames=${s.twilioFrames}`
+            );
+          }
+        }
+        return;
+      }
+    });
+
+    ws.on('close', () => this.detach(sessionKey, 'openai-close'));
+    ws.on('error', (e) => this.detach(sessionKey, `openai-error:${(e as any)?.message || e}`));
+  }
+
+  // --------------------------
+  // Helpers / cleanup
+  // --------------------------
+
+  private detach(sessionKey: string, reason: string) {
+    const state = this.sessions.get(sessionKey);
+    if (!state || state.closed) return;
+
+    state.closed = true;
+
+    this.logger.warn(
+      `Bridge close tenantId=${state.tenantId} sessionKey=${sessionKey} reason=${reason} twilioFrames=${state.twilioFrames} openaiAppends=${state.openaiAppends} openaiDeltas=${state.openaiDeltas} openaiErr=${state.openaiLastError || '-'}`
+    );
+
+    try {
+      state.openai?.close();
+    } catch {}
+    try {
+      state.twilio?.close();
+    } catch {}
+
+    this.sessions.delete(sessionKey);
+  }
+
+  private getQueryParam(url: string, key: string): string | null {
+    const idx = url.indexOf('?');
+    if (idx === -1) return null;
+    const qs = url.slice(idx + 1);
+    for (const part of qs.split('&')) {
+      const [k, v] = part.split('=');
+      if (k === key) return decodeURIComponent(v || '');
+    }
+    return null;
+  }
+
+  private hasEnoughAudio(session: SessionState, reason: string): boolean {
+    const ms = session.appendedMsSinceCommit || 0;
+
+    // OpenAI commit requires ~100ms+; keep slightly higher to avoid edge errors
+    if (ms < 140) {
+      this.logger.warn(
+        `[RealtimeBridgeService] skip response.create (audio too short) why=${reason} ms=${ms} tenantId=${session.tenantId}`
+      );
+      try {
+        session.openai?.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
+      } catch {}
+      session.appendedMsSinceCommit = 0;
+      return false;
+    }
+
+    this.logger.log(
+      `[RealtimeBridgeService] ok for commit+response.create why=${reason} ms=${ms} tenantId=${session.tenantId}`
+    );
+    return true;
+  }
+}
