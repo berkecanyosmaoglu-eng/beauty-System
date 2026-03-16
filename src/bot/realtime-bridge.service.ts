@@ -101,7 +101,10 @@ class VoiceBridgeSession {
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
+  private lastTranscriptNorm = '';
   private lastBotReplyText = '';
+  private lastBargeInAt = 0;
+  private lastSpeechStoppedAt = 0;
 
   private autoFilledName = false;
 
@@ -232,9 +235,9 @@ class VoiceBridgeSession {
           type: 'server_vad',
           create_response: false,
           interrupt_response: false,
-          threshold: 0.68,
-          prefix_padding_ms: 180,
-          silence_duration_ms: 260,
+          threshold: 0.62,
+          prefix_padding_ms: 140,
+          silence_duration_ms: 180,
         },
       },
     });
@@ -358,11 +361,20 @@ class VoiceBridgeSession {
           this.lastBotReplyText,
         );
 
+        const norm = normalizeTurkishForTime(transcript);
+        if (!norm || norm === this.lastTranscriptNorm) {
+          this.parentLogger.warn(
+            `[voice] duplicate transcript callId=${this.meta.callId} text="${transcript}"`,
+          );
+          return;
+        }
+
         this.lastTranscriptAt = Date.now();
         this.lastTranscriptText = transcript;
+        this.lastTranscriptNorm = norm;
 
         this.parentLogger.log(
-          `[voice] transcript callId=${this.meta.callId} raw="${rawTranscript}" normalized="${transcript}"`,
+          `[voice] transcript normalized callId=${this.meta.callId} raw="${rawTranscript}" normalized="${transcript}"`,
         );
 
         const reply = await this.callAgentBrain(transcript);
@@ -384,11 +396,13 @@ class VoiceBridgeSession {
         this.parentLogger.log(
           `[voice] speech_started callId=${this.meta.callId}`,
         );
+        this.lastBargeInAt = Date.now();
         // Aggressive barge-in: stop any queued playback immediately.
-        this.cancelAssistantAudio();
+        this.cancelAssistantAudio('speech_started');
         return;
 
       case 'input_audio_buffer.speech_stopped':
+        this.lastSpeechStoppedAt = Date.now();
         this.parentLogger.log(
           `[voice] speech_stopped callId=${this.meta.callId}`,
         );
@@ -419,14 +433,19 @@ class VoiceBridgeSession {
 
     const now = Date.now();
     const msSinceAssistantAudio = now - this.lastAssistantAudioAt;
+    const msSinceBargeIn = now - this.lastBargeInAt;
+    const msSinceSpeechStopped = now - this.lastSpeechStoppedAt;
 
-    if (msSinceAssistantAudio < 450 && normalized.length < 12) {
+    if (msSinceBargeIn < 180 && normalized.length < 18) return true;
+    if (msSinceSpeechStopped > 0 && msSinceSpeechStopped < 120 && normalized.length < 3) return true;
+
+    if (msSinceAssistantAudio < 280 && normalized.length < 16) {
       return true;
     }
 
     if (
       normalized.toLowerCase() === this.lastTranscriptText.toLowerCase() &&
-      now - this.lastTranscriptAt < 900
+      now - this.lastTranscriptAt < 1400
     ) {
       return true;
     }
@@ -456,9 +475,10 @@ class VoiceBridgeSession {
 
     if (this.speechEnergyFrames >= this.speechFramesForBargeIn) {
       this.parentLogger.warn(
-        `[voice] barge-in detected callId=${this.meta.callId}`,
+        `[voice] barge-in detected callId=${this.meta.callId} rms=${rms.toFixed(0)}`,
       );
-      this.cancelAssistantAudio();
+      this.lastBargeInAt = Date.now();
+      this.cancelAssistantAudio('barge_in');
       this.speechEnergyFrames = 0;
     }
   }
@@ -468,7 +488,9 @@ class VoiceBridgeSession {
     return rms >= this.speechEnergyThreshold;
   }
 
-  private cancelAssistantAudio() {
+  private cancelAssistantAudio(
+    reason: 'barge_in' | 'speech_started' | 'new_reply' | 'close' = 'new_reply',
+  ) {
     this.playbackToken += 1;
 
     if (this.playbackTimer) {
@@ -487,7 +509,14 @@ class VoiceBridgeSession {
 
     if (this.activeResponse) {
       this.sendOpenAi({ type: 'response.cancel' });
+      this.parentLogger.warn(
+        `[voice] response cancelled callId=${this.meta.callId} reason=${reason}`,
+      );
     }
+
+    this.parentLogger.log(
+      `[voice] assistant output cleared callId=${this.meta.callId} reason=${reason}`,
+    );
 
     this.assistantSpeaking = false;
     this.activeResponse = false;
@@ -574,12 +603,14 @@ class VoiceBridgeSession {
   }
 
   private async speakReply(replyText: string) {
-    const spoken = rewriteAgentReplyForVoice(replyText);
+    const spoken = shortenReplyForPhone(rewriteAgentReplyForVoice(replyText));
     const clean = sanitizeReplyForVoice(spoken);
     if (!clean || !this.sessionReady) return;
 
     // Interrupt any previous playback before starting the next answer.
-    this.cancelAssistantAudio();
+    if (this.assistantSpeaking || this.activeResponse) {
+      this.cancelAssistantAudio('new_reply');
+    }
 
     this.lastBotReplyText = clean;
     this.assistantSpeaking = true;
@@ -595,18 +626,20 @@ class VoiceBridgeSession {
 
       if (audioBuffer && token === this.playbackToken) {
         this.parentLogger.log(
-          `[voice] ElevenLabs audio ok callId=${this.meta.callId} bytes=${audioBuffer.length}`,
+          `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${audioBuffer.length}`,
         );
         this.streamUlawBuffer(audioBuffer, token);
         return;
       }
     } catch (err) {
-      this.parentLogger.error(`[voice] ElevenLabs TTS error: ${err}`);
+      this.parentLogger.error(
+        `[voice] ElevenLabs failure callId=${this.meta.callId}: ${err}`,
+      );
     }
 
     // Fallback to OpenAI realtime TTS only if ElevenLabs fails.
     this.parentLogger.warn(
-      `[voice] ElevenLabs unavailable, falling back to OpenAI TTS callId=${this.meta.callId}`,
+      `[voice] fallback to OpenAI TTS callId=${this.meta.callId}`,
     );
 
     this.sendOpenAi({
@@ -745,7 +778,7 @@ class VoiceBridgeSession {
     if (this.closed) return;
     this.closed = true;
 
-    this.cancelAssistantAudio();
+    this.cancelAssistantAudio('close');
 
     try {
       if (this.openaiWs && this.openaiWs.readyState === WebSocket.OPEN) {
@@ -1065,6 +1098,27 @@ function rewriteAgentReplyForVoice(replyText: string) {
     .trim();
 
   return text;
+}
+
+function shortenReplyForPhone(text: string) {
+  let out = String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!out) return out;
+
+  out = out.replace(/nas[ıi]l yard[ıi]mc[ıi] olabilirim\??/gi, '').trim();
+
+  const numberedItems = [...out.matchAll(/\b\d\)\s*[^\n]+/g)];
+  if (numberedItems.length > 2) {
+    return `Toplam ${numberedItems.length} seçenek var. İstersen ilk iki uygun olanı söyleyebilirim.`;
+  }
+
+  if (out.length > 220) {
+    const short = out.split(/(?<=[.!?])\s+/).slice(0, 2).join(' ').trim();
+    out = short || out.slice(0, 220);
+  }
+
+  return out.replace(/\s{2,}/g, ' ').trim();
 }
 
 function naturalTimeSpeech(hhmm: string) {

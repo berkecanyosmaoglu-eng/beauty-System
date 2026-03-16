@@ -2866,12 +2866,38 @@ ${historyText}
     }
 
     const parsed = parseDateTimeTR(raw);
+    const tNorm = normalizeTr(raw);
     if (parsed?.hasTime) {
-      draft.startAt = toIstanbulIso(clampToFuture(parsed.dateUtc));
+      let nextIso = toIstanbulIso(clampToFuture(parsed.dateUtc));
+      // Keep existing date when caller only updates the time ("iki", "saat iki", "iki buçuk").
+      if (!hasExplicitDateMarker(tNorm)) {
+        const baseIso = draft.startAt || session.pendingStartAt;
+        const parts = getTrPartsFromIso(nextIso);
+        if (baseIso && parts) {
+          const merged = buildIsoWithSameDate(baseIso, parts.hh, parts.mm);
+          if (merged) nextIso = merged;
+        }
+      }
+      draft.startAt = nextIso;
       session.pendingStartAt = draft.startAt;
       session.pendingDateOnly = undefined;
     } else if (parsed?.dateOnly) {
-      session.pendingDateOnly = parsed.dateOnly;
+      // Keep existing time when caller only updates date ("yarın", "perşembe").
+      let mergedWithExistingTime = false;
+      if (draft.startAt) {
+        const [yy, mm, dd] = parsed.dateOnly.split('-').map(Number);
+        const prev = getTrPartsFromIso(draft.startAt);
+        if (prev) {
+          const mergedUtc = new Date(Date.UTC(yy, mm - 1, dd, prev.hh - 3, prev.mm, 0, 0));
+          draft.startAt = toIstanbulIso(clampToFuture(mergedUtc));
+          session.pendingStartAt = draft.startAt;
+          session.pendingDateOnly = undefined;
+          mergedWithExistingTime = true;
+        }
+      }
+      if (!mergedWithExistingTime) {
+        session.pendingDateOnly = parsed.dateOnly;
+      }
     }
 
     const maybeName = extractName(raw);
@@ -3194,12 +3220,18 @@ function isRestart(msg: string) {
 
 function isYes(msg: string) {
   const t = normalizeTr(msg);
-  return t === 'e' || t === 'evet' || t.includes('onay') || t === 'tamam' || t.includes('tamam');
+  if (!t) return false;
+  if (/^(e|evet|olur|tamam|tabi|tabii|aynen|dogru|do[ğg]ru)$/.test(t)) return true;
+  if (/(onayl[iı]yorum|onay|kesinlikle|evet olsun|aynen oyle|aynen öyle)/.test(t)) return true;
+  return false;
 }
 
 function isNo(msg: string) {
   const t = normalizeTr(msg);
-  return t === 'h' || t === 'hayir' || t.includes('istemiyorum') || t.includes('iptal') || t.includes('degil') || t.includes('değil');
+  if (!t) return false;
+  if (/^(h|hayir|hayır|yok|olmaz|yanlis|yanlış)$/.test(t)) return true;
+  if (/(istemiyorum|olmasin|olmasın|iptal|degil|değil|oyle degil|öyle değil)/.test(t)) return true;
+  return false;
 }
 
 function servicesToTextShort(services: any[]) {
@@ -3470,6 +3502,9 @@ function parseDateTimeTR(raw: string): ParsedTRDateTime | null {
 }
 
 function parseTimeBest(t: string): { hh: number; mm: number } | null {
+  const spoken = parseSpokenTurkishTime(t);
+  if (spoken) return spoken;
+
   const matches: Array<{ hh: number; mm: number; idx: number }> = [];
   const reStrong = /(\d{1,2})\s*[:.]\s*(\d{2})/g;
   let m: RegExpExecArray | null;
@@ -3499,6 +3534,64 @@ function parseTimeBest(t: string): { hh: number; mm: number } | null {
   if (matches.length === 0) return null;
   const last = matches[matches.length - 1];
   return { hh: last.hh, mm: last.mm };
+}
+
+function parseSpokenTurkishTime(t: string): { hh: number; mm: number } | null {
+  const wordHour: Record<string, number> = {
+    bir: 1,
+    iki: 2,
+    uc: 3,
+    dort: 4,
+    bes: 5,
+    alti: 6,
+    yedi: 7,
+    sekiz: 8,
+    dokuz: 9,
+    on: 10,
+    'on bir': 11,
+    onbir: 11,
+    'on iki': 12,
+    oniki: 12,
+  };
+
+  const pickHour = (s: string): number | null => {
+    const direct = s.match(/\b(1[0-2]|[1-9])\b/);
+    if (direct) return Number(direct[1]);
+    for (const [k, v] of Object.entries(wordHour)) {
+      if (new RegExp(`\\b${k}\\b`).test(s)) return v;
+    }
+    return null;
+  };
+
+  const quarterPast = t.match(/\bceyrek\s+gece\s+([a-z0-9\s]+)$/);
+  if (quarterPast) {
+    const hh = pickHour(quarterPast[1]);
+    if (hh != null) return applyDayPeriod(t, hh, 15);
+  }
+
+  const quarterTo = t.match(/\b([a-z0-9\s]+)e\s+ceyrek\s+var\b/);
+  if (quarterTo) {
+    const nextHour = pickHour(quarterTo[1]);
+    if (nextHour != null) {
+      const hh = nextHour === 1 ? 12 : nextHour - 1;
+      return applyDayPeriod(t, hh, 45);
+    }
+  }
+
+  if (/\bbucuk\b/.test(t)) {
+    const hh = pickHour(t);
+    if (hh != null) return applyDayPeriod(t, hh, 30);
+  }
+
+  return null;
+}
+
+function applyDayPeriod(t: string, hour12: number, minute: number): { hh: number; mm: number } {
+  let hh = hour12;
+  if (/\b(aksam|gece)\b/.test(t) && hh <= 11) hh += 12;
+  else if (/\b(ogle|oglen)\b/.test(t) && hh <= 5) hh += 12;
+  else if (!/\b(sabah|ogle|oglen|aksam|gece)\b/.test(t) && hh >= 1 && hh <= 7) hh += 12;
+  return { hh, mm: minute };
 }
 
 /**
@@ -3713,4 +3806,3 @@ function toSchemaDateTime(startAtIso: string, durationMinutes?: number) {
 // - “işlem iptal”
 // - “randevu değiştir 2. randevu 18:00”
 // - “pazartesi 12:00 uygun mu?”
-
