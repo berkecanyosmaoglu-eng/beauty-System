@@ -470,6 +470,10 @@ private humanizeConfirmNeedEH(seed?: string) {
       const services = await this.safeListServices(tenantId);
       const staff = await this.safeListStaff(tenantId);
 
+      if (isSimpleGreetingOnly(raw)) {
+        return this.safeReply(session, 'Merhaba, hoş geldiniz. Nasıl yardımcı olayım?');
+      }
+
       this.extractSlotsFromMessage({ session, raw, services, staff });
 
       const learned = await this.safeGetLearnedCustomerContext(tenantId, from, services);
@@ -731,6 +735,18 @@ if (mPick && (parsedInline?.hasTime || onlyTimeInline)) {
         const svc = this.detectServiceFromMessage(raw, services);
         if (svc?.id) session.draft.serviceId = String(svc.id);
 
+        if (!svc?.id && this.hasExplicitUnknownServiceRequest(raw, services)) {
+          this.logAction('unknown_service_detected', {
+            tenantId,
+            phone: from,
+            raw,
+          });
+          return this.safeReply(
+            session,
+            'Bu isimde bir hizmetimizi bulamadım. İsterseniz mevcut işlemlerimizden birini söyleyebilirsiniz.',
+          );
+        }
+
         const parsed = parseDateTimeTR(raw);
         if (parsed?.hasTime) {
           session.pendingStartAt = toIstanbulIso(clampToFuture(parsed.dateUtc));
@@ -741,23 +757,6 @@ if (mPick && (parsedInline?.hasTime || onlyTimeInline)) {
         }
 
         if (!isNoPreferenceStaff(raw)) this.tryAutofillStaff(session.draft, staff, raw);
-
-        // Eğer hizmet yoksa, öğrenilmiş “en sık” hizmete E/H öner
-        if (!session.draft.serviceId && learned?.topServiceId && learned?.topServiceName) {
-          session.state = WaState.WAIT_SERVICE;
-          session.suggestedServiceId = learned.topServiceId;
-          session.suggestedServiceName = learned.topServiceName;
-          this.saveSession(key, session);
-
-          const q = this.pickOne(
-            [
-              `Geçen sefer ${learned.topServiceName} almıştınız. Yine aynı işlem için randevu olsun mu? (E/H)`,
-              `En son ${learned.topServiceName} yaptırmıştınız 🙂 Yine onun için randevu ayarlayayım mı? (E/H)`,
-            ],
-            from + learned.topServiceId,
-          );
-          return this.safeReply(session, q);
-        }
 
         if (!session.draft.serviceId) {
           session.state = WaState.WAIT_SERVICE;
@@ -1275,6 +1274,21 @@ if (wantsTimeInline || parsed2?.hasTime) {
     }
 
     this.extractSlotsFromMessage({ session, raw, services, staff });
+    this.logAction('extracted_slots', {
+      tenantId,
+      phone: from,
+      serviceId: session.draft.serviceId || null,
+      staffId: session.draft.staffId || null,
+      startAt: session.draft.startAt || null,
+      customerName: session.draft.customerName || null,
+      pendingDateOnly: session.pendingDateOnly || null,
+    });
+    this.logAction('next_missing_slot_selection', {
+      tenantId,
+      phone: from,
+      nextSlot: this.getNextMissingSlot(session),
+      state: session.state,
+    });
 
     const picked = this.pickFromSuggestions(session, raw);
     if (picked?.type === 'staff' && picked.staffId) session.draft.staffId = picked.staffId;
@@ -1288,17 +1302,9 @@ if (wantsTimeInline || parsed2?.hasTime) {
     if (!session.draft.staffId && staff.length === 1 && staff[0]?.id) session.draft.staffId = String(staff[0].id);
 
     if (session.state === WaState.WAIT_SERVICE) {
-      if (!session.draft.serviceId && session.suggestedServiceId) {
-        if (isYes(msg)) {
-          session.draft.serviceId = session.suggestedServiceId;
-          session.suggestedServiceId = undefined;
-          session.suggestedServiceName = undefined;
-        } else if (isNo(msg)) {
-          session.suggestedServiceId = undefined;
-          session.suggestedServiceName = undefined;
-          return await this.naturalAsk(session, 'service', { services, staff, business: null });
-        }
-      }
+      // Voice flow must not ask/confirm previously suggested services.
+      session.suggestedServiceId = undefined;
+      session.suggestedServiceName = undefined;
 
       if (session.editMode) {
         if (!session.draft.serviceId) return await this.naturalAsk(session, 'service', { services, staff, business: null });
@@ -1317,6 +1323,16 @@ if (wantsTimeInline || parsed2?.hasTime) {
         session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
         session.state = WaState.WAIT_CONFIRM;
         return `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+      }
+
+      if (!session.draft.serviceId && this.hasExplicitUnknownServiceRequest(raw, services)) {
+        this.logAction('unknown_service_detected', {
+          tenantId,
+          phone: from,
+          raw,
+          state: session.state,
+        });
+        return 'Bu isimde bir hizmetimizi bulamadım. İsterseniz mevcut işlemlerimizden birini söyleyebilirsiniz.';
       }
 
       if (!session.draft.serviceId) return await this.naturalAsk(session, 'service', { services, staff, business: null });
@@ -2936,6 +2952,27 @@ ${historyText}
     return best || null;
   }
 
+  private hasExplicitUnknownServiceRequest(raw: string, services: any[]) {
+    const t = normalizeTr(raw);
+    if (!t || !hasStrongServiceRequestCue(t)) return false;
+    if (this.detectServiceFromMessage(raw, services)) return false;
+
+    // If caller is only giving date/time/staff/name info, do not label as unknown service.
+    if (parseDateTimeTR(raw)?.hasDate || parseTimeBest(t) || isNoPreferenceStaff(raw) || Boolean(extractName(raw))) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private getNextMissingSlot(session: SessionState): 'service' | 'staff' | 'name' | 'datetime' | 'confirm' {
+    if (!session.draft.serviceId) return 'service';
+    if (!session.draft.staffId) return 'staff';
+    if (!session.draft.customerName) return 'name';
+    if (!session.draft.startAt) return 'datetime';
+    return 'confirm';
+  }
+
   // =========================
   // Learning profile (best effort)
   // =========================
@@ -3072,6 +3109,27 @@ function looksLikeUpcomingQuery(raw: string) {
   const shortQuestion = t.includes('?') && (t.includes('randevu') || t.includes('rezervasyon'));
 
   return wantsInfo || shortQuestion;
+}
+
+function isSimpleGreetingOnly(raw: string) {
+  const t = normalizeTr(raw);
+  if (!t) return false;
+  return t === 'merhaba' || t === 'selam' || t === 'selamlar' || t === 'iyi gunler' || t === 'iyi aksamlar';
+}
+
+function hasStrongServiceRequestCue(raw: string) {
+  const t = normalizeTr(raw);
+  return (
+    t.includes('rezervasyon') ||
+    t.includes('randevu') ||
+    t.includes('hizmet') ||
+    t.includes('islem') ||
+    t.includes('işlem') ||
+    t.includes('bakim') ||
+    t.includes('bakım') ||
+    t.includes('icin') ||
+    t.includes('için')
+  );
 }
 
 
@@ -3504,6 +3562,17 @@ function parseDateTimeTR(raw: string): ParsedTRDateTime | null {
 function parseTimeBest(t: string): { hh: number; mm: number } | null {
   const spoken = parseSpokenTurkishTime(t);
   if (spoken) return spoken;
+
+  // Turkish phone speech variants: "9'a", "3'e", "2'ye", "sabah 9'a", "yarın 3'e"
+  const mSuffix = t.match(/\b(\d{1,2})\s*['’]?(?:a|e|ya|ye)\b/);
+  if (mSuffix) {
+    let hh = Number(mSuffix[1]);
+    const hasDayPeriod = /\b(sabah|ogle|oglen|aksam|gece)\b/.test(t);
+    if (/\b(aksam|gece)\b/.test(t) && hh <= 11) hh += 12;
+    else if (/\b(ogle|oglen)\b/.test(t) && hh <= 5) hh += 12;
+    else if (!hasDayPeriod && hh >= 1 && hh <= 7) hh += 12;
+    if (hh >= 0 && hh <= 23) return { hh, mm: 0 };
+  }
 
   const matches: Array<{ hh: number; mm: number; idx: number }> = [];
   const reStrong = /(\d{1,2})\s*[:.]\s*(\d{2})/g;
