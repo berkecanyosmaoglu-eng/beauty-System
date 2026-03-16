@@ -516,6 +516,14 @@ class VoiceBridgeSession {
   }
 
   private async callAgentBrain(userText: string): Promise<string> {
+    const greeting = this.buildDeterministicGreetingReply(userText);
+    if (greeting) {
+      this.parentLogger.log(
+        `[voice] deterministic_greeting callId=${this.meta.callId} text="${greeting}"`,
+      );
+      return greeting;
+    }
+
     const customerPhone = normalizePhone(
       this.meta.from ||
         this.meta.streamSid ||
@@ -527,7 +535,7 @@ class VoiceBridgeSession {
       tenantId: this.meta.tenantId,
       customerPhone,
       text: userText,
-      channel: 'whatsapp',
+      channel: 'voice',
       from: this.meta.from,
       to: this.meta.to,
       callId: this.meta.callId,
@@ -575,7 +583,11 @@ class VoiceBridgeSession {
   }
 
   private async speakReply(replyText: string) {
-    const spoken = shortenReplyForPhone(rewriteAgentReplyForVoice(replyText));
+    const openingGreeting =
+      'Merhaba, ben işletmenin sesli asistanıyım. Size nasıl yardımcı olabilirim?';
+    const rewritten = rewriteAgentReplyForVoice(replyText);
+    const spoken =
+      rewritten === openingGreeting ? openingGreeting : shortenReplyForPhone(rewritten);
     const clean = sanitizeReplyForVoice(spoken);
     if (!clean || !this.sessionReady) return;
 
@@ -589,7 +601,7 @@ class VoiceBridgeSession {
     this.assistantStartedAt = Date.now();
 
     this.parentLogger.log(
-      `[voice] speakReply callId=${this.meta.callId} text="${clean}"`,
+      `[voice] final_outgoing_text_before_elevenlabs callId=${this.meta.callId} text="${clean}"`,
     );
 
     try {
@@ -609,33 +621,11 @@ class VoiceBridgeSession {
       );
     }
 
-    // Fallback to OpenAI realtime TTS only if ElevenLabs fails.
+    this.assistantSpeaking = false;
+    this.activeResponse = false;
     this.parentLogger.warn(
-      `[voice] fallback to OpenAI TTS callId=${this.meta.callId}`,
+      `[voice] elevenlabs_unavailable_skip_tts callId=${this.meta.callId}`,
     );
-
-    this.sendOpenAi({
-      type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'user',
-        content: [
-          {
-            type: 'input_text',
-            text:
-              'Aşağıdaki metni aynen seslendir. Ekstra kelime ekleme. Tek bir ses ve tek bir persona kullan. Türkçe, sakin, net ve doğal konuş. Saati doğal telaffuz et; 14:00 için saat iki, 16:30 için dört buçuk de. Parantez, emoji, madde imi ve sembolleri okuma:\n' +
-              clean,
-          },
-        ],
-      },
-    });
-
-    this.sendOpenAi({
-      type: 'response.create',
-      response: {
-        modalities: ['audio', 'text'],
-      },
-    });
   }
 
   private async generateElevenLabsAudio(
@@ -692,7 +682,7 @@ class VoiceBridgeSession {
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         this.parentLogger.warn(
-          `[voice] ElevenLabs synthesis aborted callId=${this.meta.callId}`,
+          `[voice] ElevenLabs synthesis aborted callId=${this.meta.callId} reason=barge_in_or_cancel`,
         );
         return null;
       }
@@ -703,6 +693,15 @@ class VoiceBridgeSession {
         this.currentTtsAbort = null;
       }
     }
+  }
+
+  private buildDeterministicGreetingReply(userText: string): string | null {
+    const t = normalizeTurkishForTime(userText);
+    if (!t) return null;
+    if (/^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin|alo)[.!? ]*$/.test(t)) {
+      return 'Merhaba, nasıl yardımcı olabilirim?';
+    }
+    return null;
   }
 
   private streamUlawBuffer(buf: Buffer, token: number) {
