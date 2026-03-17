@@ -55,7 +55,7 @@ export class WhatsappController {
     return !!body && (body.object === 'whatsapp_business_account' || Array.isArray(body.entry));
   }
 
-  private async sendMetaText(toWaIdOrMsisdn: string, text: string, phoneNumberId?: string) {
+  private async sendMetaText(toWaIdOrMsisdn: string, text: string, phoneNumberId?: string): Promise<boolean> {
     const token = String(process.env.META_WA_TOKEN || '').trim();
     const version = String(process.env.META_WA_VERSION || 'v25.0').trim();
     const pni = String(phoneNumberId || process.env.META_WA_PHONE_NUMBER_ID || '').trim();
@@ -64,33 +64,51 @@ export class WhatsappController {
       this.logger.error(
         `META send failed: missing META_WA_TOKEN or META_WA_PHONE_NUMBER_ID. pni=${pni} tokenLen=${token?.length || 0}`,
       );
-      return;
+      return false;
     }
 
     const url = `https://graph.facebook.com/${version}/${pni}/messages`;
+    const payload = {
+      messaging_product: 'whatsapp',
+      to: String(toWaIdOrMsisdn),
+      type: 'text',
+      text: { body: String(text || '').slice(0, 4000) },
+    };
 
-    // Node 20'de fetch var
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: String(toWaIdOrMsisdn),
-        type: 'text',
-        text: { body: String(text || '').slice(0, 4000) },
-      }),
-    });
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try {
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
 
-    const raw = await resp.text();
-    if (!resp.ok) {
-      this.logger.error(`META send failed status=${resp.status} body=${raw}`);
-    } else {
-      this.logger.log(`✅ META sent to=${toWaIdOrMsisdn} status=${resp.status}`);
+        const raw = await resp.text();
+        if (resp.ok) {
+          this.logger.log(`META send ok to=${toWaIdOrMsisdn} status=${resp.status} attempt=${attempt}`);
+          return true;
+        }
+
+        this.logger.error(`META send http_error to=${toWaIdOrMsisdn} status=${resp.status} attempt=${attempt} body=${raw}`);
+        if (resp.status >= 400 && resp.status < 500) return false;
+      } catch (e: any) {
+        const kind = e?.name === 'AbortError' ? 'timeout' : 'fetch_exception';
+        this.logger.error(`META send ${kind} to=${toWaIdOrMsisdn} attempt=${attempt} error=${e?.message || e}`);
+      } finally {
+        clearTimeout(timeout);
+      }
+      await new Promise((r) => setTimeout(r, attempt * 250));
     }
+
+    return false;
   }
+
 
   @Post('webhook')
   async webhook(@Req() req: Request, @Res() res: Response) {
@@ -123,10 +141,12 @@ export class WhatsappController {
               if (msgType === 'text') text = String(msg?.text?.body || '').trim();
               else if (msgType === 'button') text = String(msg?.button?.text || '').trim();
               else if (msgType === 'interactive') {
-                // list / reply
                 text =
                   String(msg?.interactive?.button_reply?.title || '').trim() ||
                   String(msg?.interactive?.list_reply?.title || '').trim();
+              } else if (msgType === 'reaction') {
+                this.logger.log(`META inbound ignored reaction tenantId=${tenantId} from=${fromWaId}`);
+                continue;
               }
 
               const contactName =
@@ -151,7 +171,8 @@ export class WhatsappController {
                 },
               });
 
-              const safeReply = String(replyText || '').trim() || 'Size nasıl yardımcı olabilirim?';
+              const safeReply = String(replyText || '').trim();
+              if (!safeReply) continue;
               await this.sendMetaText(fromWaId, safeReply, phoneNumberId);
             }
           }
