@@ -168,6 +168,15 @@ type UpcomingAppt = {
   staffName?: string;
 };
 
+type GlobalIntent =
+  | 'NEW_BOOKING'
+  | 'LIST_APPOINTMENTS'
+  | 'MY_APPOINTMENT_TIME'
+  | 'RESCHEDULE_BOOKING'
+  | 'CANCEL_BOOKING'
+  | 'FAQ_GENERAL'
+  | 'UNKNOWN';
+
 @Injectable()
 export class AgentService {
   private readonly logger = new Logger(AgentService.name);
@@ -475,7 +484,17 @@ private humanizeConfirmNeedEH(seed?: string) {
         return this.safeReply(session, 'Merhaba, hoş geldiniz. Nasıl yardımcı olayım?');
       }
 
-      this.extractSlotsFromMessage({ session, raw, services, staff, isVoice });
+      const globalIntent = this.detectGlobalIntent(raw);
+      const shouldExtractSlots =
+        session.state !== WaState.IDLE ||
+        globalIntent === 'NEW_BOOKING' ||
+        globalIntent === 'RESCHEDULE_BOOKING' ||
+        globalIntent === 'CANCEL_BOOKING';
+
+      if (shouldExtractSlots) {
+        this.extractSlotsFromMessage({ session, raw, services, staff, isVoice });
+      }
+
 
       const learned = isVoice
         ? { name: null, summary: '' }
@@ -490,6 +509,31 @@ private humanizeConfirmNeedEH(seed?: string) {
 
       if (learned?.name && !session.draft.customerName) {
         session.draft.customerName = String(learned.name);
+      }
+
+      // Global override router: user can jump domains at any moment.
+      if (session.state !== WaState.IDLE) {
+        if (globalIntent === 'LIST_APPOINTMENTS' || globalIntent === 'MY_APPOINTMENT_TIME') {
+          this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+          this.saveSession(key, session);
+        }
+
+        if (
+          (globalIntent === 'RESCHEDULE_BOOKING' || globalIntent === 'CANCEL_BOOKING') &&
+          [WaState.WAIT_SERVICE, WaState.WAIT_STAFF, WaState.WAIT_NAME, WaState.WAIT_DATETIME].includes(session.state)
+        ) {
+          this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+          this.saveSession(key, session);
+        }
+
+        if (
+          globalIntent === 'NEW_BOOKING' &&
+          [WaState.WAIT_APPT_PICK, WaState.WAIT_EDIT_ACTION, WaState.WAIT_CONFIRM].includes(session.state) &&
+          session.editMode
+        ) {
+          this.softResetSession(session, tenantId, from, { keepIdempotency: true });
+          this.saveSession(key, session);
+        }
       }
 
       // ✅ Eğer bir flow içindeysek (booking/edit) state machine’e gir
@@ -509,10 +553,14 @@ private humanizeConfirmNeedEH(seed?: string) {
         return this.safeReply(session, reply);
       }
 
+      if ((isYes(msg) || isNo(msg)) && session.state === WaState.IDLE) {
+        return this.safeReply(session, 'Bu mesajı ne için yazdığını anlayamadım 🙂 Randevu, listeleme, değişiklik veya iptal yazabilirsin.');
+      }
+
       // =========================
       // ✅ Upcoming appointment inquiry (IDLE iken)
       // =========================
-      if (looksLikeUpcomingQuery(raw)) {
+      if (looksLikeUpcomingQuery(raw) || globalIntent === 'LIST_APPOINTMENTS' || globalIntent === 'MY_APPOINTMENT_TIME') {
         const list = await this.safeListUpcomingAppointmentsByPhone(tenantId, from, 6);
 
         if (!list?.length) {
@@ -552,7 +600,12 @@ private humanizeConfirmNeedEH(seed?: string) {
       // Kullanıcı açıkça iptal/değiştir niyeti belirtmediği sürece edit akışına girmeyiz.
       // Yeni randevu isteği (booking intent) her zaman önceliklidir.
       // =========================
-      const explicitEditIntent = looksLikeCancelIntent(raw) || looksLikeRescheduleIntent(raw) || looksLikeGenericEditIntent(raw);
+      const explicitEditIntent =
+        globalIntent === 'CANCEL_BOOKING' ||
+        globalIntent === 'RESCHEDULE_BOOKING' ||
+        looksLikeCancelIntent(raw) ||
+        looksLikeRescheduleIntent(raw) ||
+        looksLikeGenericEditIntent(raw);
       const explicitNewBookingIntent = looksLikeBookingIntent(raw) && !explicitEditIntent;
       if (explicitEditIntent && !explicitNewBookingIntent) {
         const list = await this.safeListUpcomingAppointmentsByPhone(tenantId, from, 6);
@@ -742,7 +795,7 @@ if (mPick && (parsedInline?.hasTime || onlyTimeInline)) {
       // =========================
       // Booking intent
       // =========================
-      if (looksLikeBookingIntent(raw)) {
+      if (globalIntent === 'NEW_BOOKING' || looksLikeBookingIntent(raw)) {
         const svc = this.detectServiceFromMessage(raw, services);
         if (svc?.id) session.draft.serviceId = String(svc.id);
 
@@ -2863,6 +2916,23 @@ ${historyText}
     return recent.includes('randevu') || recent.includes('rezervasyon') || recent.includes('uygun') || recent.includes('yarin') || recent.includes('bugun');
   }
 
+
+
+  private detectGlobalIntent(raw: string): GlobalIntent {
+    const t = normalizeTr(raw);
+    if (!t) return 'UNKNOWN';
+
+    if (looksLikeCancelIntent(raw)) return 'CANCEL_BOOKING';
+    if (looksLikeRescheduleIntent(raw) || looksLikeGenericEditIntent(raw)) return 'RESCHEDULE_BOOKING';
+    if (looksLikeUpcomingQuery(raw)) return 'LIST_APPOINTMENTS';
+    if (looksLikeBookingIntent(raw)) return 'NEW_BOOKING';
+
+    if (looksLikeProcedureQuestion(raw) || looksLikePriceQuestion(raw) || looksLikeServiceListRequest(raw) || looksLikeAddressOrHours(raw)) {
+      return 'FAQ_GENERAL';
+    }
+
+    return 'UNKNOWN';
+  }
   // =========================
   // Matching
   // =========================
@@ -2977,7 +3047,10 @@ ${historyText}
 
     const maybeName = extractName(raw);
     const looksLikeStaffName = staff?.some((p: any) => normalizePersonName(String(p?.name || '')) === normalizePersonName(raw));
-    if (!looksLikeStaffName && maybeName) draft.customerName = maybeName;
+    const canCaptureName = session.state === WaState.WAIT_NAME || looksLikeExplicitNameStatement(raw);
+    if (!draft.customerName && canCaptureName && !looksLikeStaffName && maybeName) {
+      draft.customerName = maybeName;
+    }
   }
 
   private tryAutofillStaff(draft: BookingDraft, staff: any[], msg: string) {
@@ -3257,15 +3330,28 @@ function looksLikeRescheduleIntent(raw: string) {
     t.includes('baska tarihe')
   ) return true;
 
-  // ✅ randevu kelimesi olmadan da yakala:
-  // “saatini 13:00 yap”, “13:00’a al”, “13:00 ile değiştir”
-  const hasTime = /\b\d{1,2}:\d{2}\b/.test(t);
+  // randevu kelimesi olmadan da yakala: “saatini 10 yap”, “10'a al”
+  const hasTime = /\b\d{1,2}:\d{2}\b/.test(t) || /\b(saat\s*)?\d{1,2}(\.?\d{2})?\s*(a|e)?\b/.test(t);
   const hasChangeVerb =
-    t.includes('degis') || t.includes('değiş') || t.includes('guncelle') || t.includes('güncelle') ||
-    t.includes('al') || t.includes('cek') || t.includes('çek') || t.includes('tas') || t.includes('taş');
+    t.includes('degis') ||
+    t.includes('değiş') ||
+    t.includes('guncelle') ||
+    t.includes('güncelle') ||
+    t.includes('al') ||
+    t.includes('cek') ||
+    t.includes('çek') ||
+    t.includes('tas') ||
+    t.includes('taş') ||
+    t.includes('yap');
 
   if (hasTime && hasChangeVerb) return true;
   if (t.includes('saatini') && hasChangeVerb) return true;
+
+  // “randevuyu 10'a aldın mı” gibi teyit cümlelerini de reschedule domain'e al
+  if (
+    (t.includes('randevu') || t.includes('saatini')) &&
+    (t.includes('aldin mi') || t.includes('aldın mı') || t.includes('yaptin mi') || t.includes('yaptın mı'))
+  ) return true;
 
   return false;
 }
@@ -3386,6 +3472,12 @@ function staffToTextShort(staff: any[]) {
   return staff.slice(0, 6).map((p: any) => `• ${String(p?.name || 'Personel')}`).join('\n');
 }
 
+function looksLikeExplicitNameStatement(raw: string) {
+  const t = normalizeTr(raw);
+  if (!t) return false;
+  return t.startsWith('ben ') || t.startsWith('adim ') || t.startsWith('adım ') || t.startsWith('isim ') || t.startsWith('ismim ');
+}
+
 function extractName(raw: string) {
   const s = (raw || '').trim();
   if (!s) return null;
@@ -3407,6 +3499,8 @@ function extractName(raw: string) {
  'nasilsin', 'naber',  
   'iptal',
     'tamam',
+    'onayla',
+    'onayliyorum',
     'evet',
     'hayir',
     'hayır',

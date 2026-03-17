@@ -75,6 +75,16 @@ export class WhatsappService {
     return String(replyText || '').trim() || 'Tamamdır.';
   }
 
+  private shouldIgnoreInbound(raw: any, text: string): boolean {
+    const msgType = String(raw?.msg?.type || '').trim().toLowerCase();
+    if (msgType === 'reaction') return true;
+    if (!text) return true;
+    const clean = String(text || '').trim();
+    if (!clean) return true;
+    if (/^[\?!.\-_,\s]+$/.test(clean)) return true;
+    return false;
+  }
+
   // -------------------------
   // META CLOUD API
   // -------------------------
@@ -313,7 +323,11 @@ export class WhatsappService {
     const text = String(input.text || '').trim();
 
     if (!tenantId) return this.replyTextOnly('Merhaba! (tenant bulunamadı) webhook’a tenantId ekleyelim.');
-    if (!from || !text) return this.replyTextOnly('Mesajını göremedim. Tekrar yazar mısın?');
+    if (!from) return '';
+    if (this.shouldIgnoreInbound(input.raw, text)) {
+      this.logger.log(`WA inbound ignored tenantId=${tenantId} from=${from} type=${String(input.raw?.msg?.type || 'unknown')}`);
+      return '';
+    }
 
     this.logger.log(`📩 WA inbound tenantId=${tenantId} from=${from} to=${to} text="${text.slice(0, 200)}"`);
 
