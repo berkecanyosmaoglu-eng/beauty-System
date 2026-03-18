@@ -229,7 +229,7 @@ describe('BookingCoreService voice booking guards', () => {
     const session = (service as any).sessions.get(`${tenantId}:${from}`);
     expect(session.draft.serviceId).toBe('svc-5');
     expect(session.pendingDateOnly).toBe('2026-03-19');
-    expect(session.state).toBe('WAIT_STAFF');
+    expect(session.state).toBe('WAIT_NAME');
   });
 
   it('resolves ellipsis like "bunu alayım" using recent service continuity', async () => {
@@ -252,7 +252,7 @@ describe('BookingCoreService voice booking guards', () => {
     expect(reply).not.toMatch(/hangi hizmet/i);
     const session = (service as any).sessions.get(`${tenantId}:${from}`);
     expect(session.draft.serviceId).toBe('svc-5');
-    expect(session.state).toBe('WAIT_STAFF');
+    expect(session.state).toBe('WAIT_NAME');
   });
 
   it('reuses recent staff context on "Esra Hanım olsun"', async () => {
@@ -310,32 +310,33 @@ describe('BookingCoreService voice booking guards', () => {
     expect(session.draft.serviceId).toBe('svc-5');
   });
 
-  it('keeps waiting for staff instead of silently defaulting on weak input', async () => {
+  it('asks for customer name next when service is known without exposing staff selection', async () => {
     const service = new BookingCoreService(createPrismaMock());
     const key = `${tenantId}:${from}`;
 
     (service as any).sessions.set(key, {
-      state: 'WAIT_STAFF',
+      state: 'WAIT_SERVICE',
       draft: {
         tenantId,
         customerPhone: from,
-        serviceId: 'svc-1',
       },
       updatedAt: Date.now(),
       history: [],
+      lastServiceId: 'svc-1',
+      lastServiceName: 'Lazer Epilasyon',
     });
 
     const reply = await service.replyText({
       tenantId,
       from,
-      text: 'şey yani',
+      text: 'lazer epilasyon',
       channel: 'voice',
     });
 
     const session = (service as any).sessions.get(key);
-    expect(session.state).toBe('WAIT_STAFF');
-    expect(session.draft.staffId).toBeUndefined();
-    expect(reply).toMatch(/personel|fark etmez/i);
+    expect(session.state).toBe('WAIT_NAME');
+    expect(reply).toMatch(/isim|ad soyad/i);
+    expect(reply).not.toMatch(/personel|fark etmez/i);
   });
 
   it('accepts a single spoken first name in WAIT_NAME', async () => {
@@ -503,42 +504,12 @@ describe('BookingCoreService voice booking guards', () => {
     expect(session.draft.customerName).toBe('Berkecan');
   });
 
-  it('resolves plain single-token staff reply in WAIT_STAFF without re-asking staff', async () => {
+  it('does not save customer name from "Elif olsun" while waiting for name', async () => {
     const service = new BookingCoreService(createPrismaMock());
     const key = `${tenantId}:${from}`;
 
     (service as any).sessions.set(key, {
-      state: 'WAIT_STAFF',
-      draft: {
-        tenantId,
-        customerPhone: from,
-        serviceId: 'svc-5',
-      },
-      updatedAt: Date.now(),
-      history: [],
-    });
-
-    const reply = await service.replyText({
-      tenantId,
-      from,
-      text: 'Elif',
-      channel: 'voice',
-    });
-
-    const session = (service as any).sessions.get(key);
-    expect(session.draft.staffId).toBe('stf-4');
-    expect(session.draft.customerName).toBeUndefined();
-    expect(session.state).toBe('WAIT_NAME');
-    expect(reply).toMatch(/isim|ad soyad/i);
-    expect(reply).not.toMatch(/personel/i);
-  });
-
-  it('does not save customer name from "Elif olsun" in WAIT_STAFF', async () => {
-    const service = new BookingCoreService(createPrismaMock());
-    const key = `${tenantId}:${from}`;
-
-    (service as any).sessions.set(key, {
-      state: 'WAIT_STAFF',
+      state: 'WAIT_NAME',
       draft: {
         tenantId,
         customerPhone: from,
@@ -560,14 +531,15 @@ describe('BookingCoreService voice booking guards', () => {
     expect(session.draft.customerName).toBeUndefined();
     expect(session.state).toBe('WAIT_NAME');
     expect(reply).toMatch(/isim|ad soyad/i);
+    expect(reply).not.toMatch(/personel|fark etmez/i);
   });
 
-  it('does not save customer name from "Esra Hanım olsun" in WAIT_STAFF', async () => {
+  it('does not save customer name from "Esra Hanım olsun" while waiting for name', async () => {
     const service = new BookingCoreService(createPrismaMock());
     const key = `${tenantId}:${from}`;
 
     (service as any).sessions.set(key, {
-      state: 'WAIT_STAFF',
+      state: 'WAIT_NAME',
       draft: {
         tenantId,
         customerPhone: from,

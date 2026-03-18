@@ -1,7 +1,7 @@
 import {
   mergeVoiceFragments,
   shouldBufferShortVoiceTranscript,
-} from './realtime-bridge.service';
+} from './realtime-bridge.service.ts';
 
 describe('RealtimeBridgeService voice transcript helpers', () => {
   it('buffers short split name fragments in WAIT_NAME', () => {
@@ -20,10 +20,10 @@ describe('RealtimeBridgeService voice transcript helpers', () => {
     );
   });
 
-  it('buffers short split staff fragments in WAIT_STAFF', () => {
-    expect(shouldBufferShortVoiceTranscript('WAIT_STAFF', 'Mehmet')).toBe(true);
-    expect(mergeVoiceFragments('Mehmet', 'Bey', 'WAIT_STAFF')).toBe(
-      'Mehmet Bey',
+  it('does not buffer staff-like fragments when staff selection no longer exists', () => {
+    expect(shouldBufferShortVoiceTranscript('WAIT_STAFF', 'Mehmet')).toBe(
+      false,
     );
+    expect(mergeVoiceFragments('Mehmet', 'Bey', 'WAIT_STAFF')).toBe('Bey');
   });
 });

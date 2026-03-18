@@ -42,7 +42,6 @@ enum WaState {
 
   // booking
   WAIT_SERVICE = 'WAIT_SERVICE',
-  WAIT_STAFF = 'WAIT_STAFF',
   WAIT_NAME = 'WAIT_NAME',
   WAIT_DATETIME = 'WAIT_DATETIME',
   WAIT_CONFIRM = 'WAIT_CONFIRM',
@@ -210,24 +209,19 @@ export class BookingCoreService {
 
   constructor(private readonly prisma: PrismaService) {}
 
+  async prewarmVoiceContext(tenantId: string): Promise<void> {
+    try {
+      const businessPromise = this.safeGetBusinessProfile(tenantId);
+      const servicesPromise = this.safeListServices(tenantId);
+      const staffPromise = this.safeListStaff(tenantId);
 
-
-async prewarmVoiceContext(tenantId: string): Promise<void> {
-  try {
-    const businessPromise = this.safeGetBusinessProfile(tenantId);
-    const servicesPromise = this.safeListServices(tenantId);
-    const staffPromise = this.safeListStaff(tenantId);
-
-    await Promise.all([businessPromise, servicesPromise, staffPromise]);
-  } catch (err) {
-    this.logger?.warn?.(
-      `[voice] prewarmVoiceContext failed tenantId=${tenantId} err=${err instanceof Error ? err.message : String(err)}`,
-    );
+      await Promise.all([businessPromise, servicesPromise, staffPromise]);
+    } catch (err) {
+      this.logger?.warn?.(
+        `[voice] prewarmVoiceContext failed tenantId=${tenantId} err=${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
-}
-
-
-
 
   /**
    * Structured logging helper. Emits JSON logs for key actions with context.
@@ -285,10 +279,7 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
     );
   }
 
-  private humanizeAsk(
-    kind: 'service' | 'staff' | 'name' | 'datetime',
-    seed?: string,
-  ) {
+  private humanizeAsk(kind: 'service' | 'name' | 'datetime', seed?: string) {
     // Voice‑friendly prompts. Remove emojis and keep questions short and clear.
     if (kind === 'service') {
       return this.pickOne(
@@ -296,15 +287,6 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
           'Hangi hizmet için randevu oluşturalım?',
           'Hangi hizmeti istersiniz?',
           'Hangi işlem için yardımcı olayım?',
-        ],
-        seed,
-      );
-    }
-    if (kind === 'staff') {
-      return this.pickOne(
-        [
-          "Hangi personeli tercih edersiniz? 'Fark etmez' diyebilirsiniz.",
-          "Kiminle olsun istersiniz? 'Fark etmez' diyebilirsiniz.",
         ],
         seed,
       );
@@ -738,7 +720,6 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
             globalIntent === 'CANCEL_BOOKING') &&
           [
             WaState.WAIT_SERVICE,
-            WaState.WAIT_STAFF,
             WaState.WAIT_NAME,
             WaState.WAIT_DATETIME,
           ].includes(session.state)
@@ -1146,12 +1127,6 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
               business,
             }),
           );
-        }
-
-        if (staff && staff.length > 0 && !session.draft.staffId) {
-          session.state = WaState.WAIT_STAFF;
-          this.saveSession(key, session);
-          return this.safeReply(session, this.askStaffMenu(session, staff));
         }
 
         session.state = WaState.WAIT_NAME;
@@ -1711,7 +1686,6 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
         t.includes('islem') ||
         t.includes('işlem');
       const wantsStaff =
-        act === 'STAFF' ||
         t.includes('usta') ||
         t.includes('personel') ||
         t.includes('calisan') ||
@@ -1752,8 +1726,11 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
 
       if (wantsStaff) {
         session.editMode = 'RESCHEDULE';
-        session.state = WaState.WAIT_STAFF;
-        return this.askStaffMenu(session, staff);
+        session.state = WaState.WAIT_DATETIME;
+        session.draft.startAt = undefined;
+        session.pendingDateOnly = undefined;
+        session.pendingStartAt = undefined;
+        return 'Personel tercihi almıyoruz. Uygun bir randevu için gün ve saat söyleyebilirsiniz.';
       }
 
       if (wantsTime) {
@@ -1829,8 +1806,6 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
     });
 
     const picked = this.pickFromSuggestions(session, raw);
-    if (picked?.type === 'staff' && picked.staffId)
-      session.draft.staffId = picked.staffId;
     if (picked?.type === 'slot' && picked.startAt) {
       session.draft.startAt = picked.startAt;
       session.pendingStartAt = picked.startAt;
@@ -1895,88 +1870,7 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
           staff,
           business: null,
         });
-      session.state = WaState.WAIT_STAFF;
-    }
-
-    if (session.state === WaState.WAIT_STAFF) {
-      if (!staff || staff.length === 0) {
-        return 'Şu an personel listem görünmüyor 😕 Birazdan tekrar dener misin?';
-      }
-
-      const previousStaffId = session.draft.staffId;
-
-      if (isNoPreferenceStaff(raw)) {
-        session.draft.staffId = String(staff[0].id);
-        session.state = session.editMode
-          ? WaState.WAIT_CONFIRM
-          : WaState.WAIT_NAME;
-      } else if (!session.draft.staffId) {
-        const maybeSpoken = extractLikelyStaffName(raw);
-        if (
-          maybeSpoken &&
-          this.shouldCaptureRequestedStaffName(raw, maybeSpoken, isVoice)
-        ) {
-          session.draft.requestedStaffName = maybeSpoken;
-          return this.askStaffMenu(session, staff);
-        }
-        return this.askStaffMenu(session, staff);
-      } else {
-        session.state = session.editMode
-          ? WaState.WAIT_CONFIRM
-          : WaState.WAIT_NAME;
-      }
-
-      if (
-        session.draft.staffId &&
-        (session.draft.staffId !== previousStaffId || isNoPreferenceStaff(raw))
-      ) {
-        const pickedStaff = staff.find(
-          (item: any) => String(item?.id) === String(session.draft.staffId),
-        );
-        this.logAction('staff_selection_consumed_utterance', {
-          tenantId,
-          phone: from,
-          raw,
-          staffId: String(session.draft.staffId),
-          staffName: String(
-            pickedStaff?.name ||
-              pickedStaff?.fullName ||
-              session.recentStaffName ||
-              '',
-          ),
-          state: session.state,
-        });
-      }
-
-      if (session.editMode) {
-        const pre = await this.precheckAndPrepareConfirm({
-          tenantId,
-          draft: session.draft,
-          ignoreAppointmentId: session.targetAppointmentId || undefined,
-        });
-        if (!pre.ok) {
-          session.draft.staffId = undefined;
-          if (pre.code === 'SLOT_TAKEN')
-            return 'O personelin o saati dolu 😕 Başka bir personel seçelim mi?';
-          return 'Bu personelle şu anki randevu çakışıyor gibi 😕 Başka bir personel seçebilir misin?';
-        }
-        session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
-        session.state = WaState.WAIT_CONFIRM;
-        return isVoice
-          ? this.buildNaturalConfirmationPrompt(session, services, staff, {
-              editMode: true,
-              seed: from + (session.draft.startAt || ''),
-            })
-          : `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
-      }
-
-      if (session.state === WaState.WAIT_NAME && !session.draft.customerName) {
-        return await this.naturalAsk(session, 'name', {
-          services,
-          staff,
-          business: null,
-        });
-      }
+      session.state = WaState.WAIT_NAME;
     }
 
     if (session.state === WaState.WAIT_NAME) {
@@ -2215,7 +2109,7 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
         if (!upd.ok) {
           session.state = WaState.WAIT_EDIT_ACTION;
           session.pendingSummary = undefined;
-          return 'Bir şey takıldı 😕 Ne yapalım: saat mi değişsin, hizmet mi, personel mi, iptal mi?';
+          return 'Bir şey takıldı 😕 Ne yapalım: saat mi değişsin, hizmet mi, iptal mi?';
         }
 
         const newIso = upd.data.startAt;
@@ -2356,22 +2250,6 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
   // =========================
   // Menus
   // =========================
-  private askStaffMenu(session: SessionState, staff: any[]) {
-    // Prepare suggestions for UI/WhatsApp clients but avoid reading out long lists on the phone.
-    const items = (staff || [])
-      .filter(Boolean)
-      .slice(0, 9)
-      .map((p: any) => ({
-        id: String(p.id),
-        label: String(p.name || 'Personel'),
-        value: String(p.id),
-      }));
-
-    session.lastSuggestions = { type: 'staff', items, ts: Date.now() };
-    // For voice calls, ask succinctly without enumerating every option.
-    return 'Hangi personeli tercih edersiniz? İsim söyleyebilirsiniz ya da fark etmez diyebilirsiniz.';
-  }
-
   private askSlotMenu(
     session: SessionState,
     isoList: string[],
@@ -2439,7 +2317,6 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
     const items: SuggestionItem[] = [
       { label: 'Tarih/Saat değiştir', value: 'TIME' },
       { label: 'Hizmet değiştir', value: 'SERVICE' },
-      { label: 'Personel/Usta değiştir', value: 'STAFF' },
       { label: 'Randevuyu iptal et', value: 'CANCEL' },
       { label: 'Vazgeç', value: 'ABORT' },
     ];
@@ -2448,7 +2325,7 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
 
     const lines = items.map((it, i) => `${i + 1}) ${it.label}`).join('\n');
     const tail =
-      'İstersen 1-5 söyle, istersen direkt “saat değiştir / hizmet değiştir / personel değiştir / iptal” diyebilirsin 🙂';
+      'İstersen 1-4 söyle, istersen direkt “saat değiştir / hizmet değiştir / iptal” diyebilirsin 🙂';
     return `${headerParts.join('\n')}\n\nNe yapmak istersin?\n${lines}\n\n${tail}`;
   }
 
@@ -2456,12 +2333,11 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
     session: SessionState,
     raw: string,
   ):
-    | { type: 'staff'; staffId: string }
     | { type: 'slot'; startAt: string }
     | { type: 'appt'; apptId: string }
     | {
         type: 'editAction';
-        action: 'TIME' | 'SERVICE' | 'STAFF' | 'CANCEL' | 'ABORT';
+        action: 'TIME' | 'SERVICE' | 'CANCEL' | 'ABORT';
       }
     | null {
     const s = session.lastSuggestions;
@@ -2477,19 +2353,11 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
       const idx = Number(mNum[1]) - 1;
       const it = s.items[idx];
       if (!it) return null;
-      if (s.type === 'staff')
-        return { type: 'staff', staffId: String(it.value) };
       if (s.type === 'slot') return { type: 'slot', startAt: String(it.value) };
       if (s.type === 'appt') return { type: 'appt', apptId: String(it.value) };
       if (s.type === 'editAction')
         return { type: 'editAction', action: String(it.value) as any };
       return null;
-    }
-
-    if (s.type === 'staff') {
-      const tn = normalizePersonName(raw);
-      const hit = s.items.find((it) => normalizePersonName(it.label) === tn);
-      if (hit) return { type: 'staff', staffId: String(hit.value) };
     }
 
     if (s.type === 'slot') {
@@ -2523,11 +2391,6 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
         ['hizmet', 'SERVICE'],
         ['islem', 'SERVICE'],
         ['işlem', 'SERVICE'],
-        ['staff', 'STAFF'],
-        ['personel', 'STAFF'],
-        ['usta', 'STAFF'],
-        ['calisan', 'STAFF'],
-        ['çalışan', 'STAFF'],
         ['cancel', 'CANCEL'],
         ['iptal', 'CANCEL'],
         ['abort', 'ABORT'],
@@ -2550,12 +2413,11 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
   // =========================
   private async naturalAsk(
     session: SessionState,
-    slot: 'service' | 'staff' | 'name' | 'datetime',
+    slot: 'service' | 'name' | 'datetime',
     ctx: { services: any[]; staff: any[]; business: any },
   ): Promise<string> {
     const fallback = () => {
       if (slot === 'service') return this.humanizeAsk('service');
-      if (slot === 'staff') return this.askStaffMenu(session, ctx.staff);
       if (slot === 'name') return this.humanizeAsk('name');
       return this.humanizeAsk('datetime');
     };
@@ -2565,11 +2427,9 @@ async prewarmVoiceContext(tenantId: string): Promise<void> {
     const missingHint =
       slot === 'service'
         ? 'Müşteriden sadece hangi hizmet istediğini sor.'
-        : slot === 'staff'
-          ? 'Müşteriden hangi personeli tercih ettiğini sor. “Fark etmez” diyebileceğini de söyle.'
-          : slot === 'name'
-            ? 'Müşteriden ad soyadını sor. Kısa ve doğal sor.'
-            : 'Müşteriden gün ve saat bilgisini sor. Örnek format ver ama çok uzun yazma. Saat aralığı 08:00-22:00.';
+        : slot === 'name'
+          ? 'Müşteriden ad soyadını sor. Kısa ve doğal sor.'
+          : 'Müşteriden gün ve saat bilgisini sor. Örnek format ver ama çok uzun yazma. Saat aralığı 08:00-22:00.';
 
     const staffNamesShort = staffToTextShort(ctx.staff) || '';
 
@@ -2795,6 +2655,70 @@ ${staffNamesShort || 'YOK'}
     return null;
   }
 
+  private async resolveInternalStaffAssignment(opts: {
+    tenantId: string;
+    draft: BookingDraft;
+    staffFallbackList?: any[];
+    ignoreAppointmentId?: string;
+  }): Promise<{ staffId: string; staffName?: string | null } | null> {
+    const { tenantId, draft, staffFallbackList, ignoreAppointmentId } = opts;
+    const serviceId = draft.serviceId ? String(draft.serviceId) : '';
+    const startAt = draft.startAt ? String(draft.startAt) : '';
+    if (!serviceId || !startAt) return null;
+
+    const service = await (this.prisma as any).services
+      .findFirst({
+        where: { id: serviceId, tenantId },
+        select: { id: true, duration: true },
+      })
+      .catch(() => null);
+    if (!service) return null;
+
+    const staffList = (
+      staffFallbackList?.length
+        ? staffFallbackList
+        : await this.safeListStaff(tenantId)
+    )
+      .filter(Boolean)
+      .sort((a: any, b: any) =>
+        String(a?.id || '').localeCompare(String(b?.id || ''), 'tr'),
+      );
+    if (!staffList.length) return null;
+
+    const durationMinutes = Number(service.duration) || 30;
+    const { dateAtUtcMidnight, timeHHMM, endTimeHHMM } = toSchemaDateTime(
+      startAt,
+      durationMinutes,
+    );
+
+    for (const item of staffList) {
+      const staffId = String(item?.id || '');
+      if (!staffId) continue;
+      const clash = await this.findOverlapSafe({
+        tenantId,
+        staffId,
+        dateAtUtcMidnight,
+        timeHHMM,
+        endTimeHHMM: endTimeHHMM || timeHHMM,
+        ignoreAppointmentId,
+      });
+      if (!clash) {
+        return {
+          staffId,
+          staffName: String(item?.name || item?.fullName || '') || null,
+        };
+      }
+    }
+
+    const fallback = staffList[0];
+    return fallback?.id
+      ? {
+          staffId: String(fallback.id),
+          staffName: String(fallback?.name || fallback?.fullName || '') || null,
+        }
+      : null;
+  }
+
   private async precheckAndPrepareConfirm(opts: {
     tenantId: string;
     draft: BookingDraft;
@@ -2820,11 +2744,16 @@ ${staffNamesShort || 'YOK'}
       .catch(() => null);
     if (!service) return { ok: false };
 
-    if (!draft.staffId) return { ok: false };
+    const resolvedStaff = await this.resolveInternalStaffAssignment({
+      tenantId,
+      draft,
+    });
+    if (!resolvedStaff?.staffId) return { ok: false };
+    draft.staffId = resolvedStaff.staffId;
 
     const staffRec = await (this.prisma as any).staff
       ?.findFirst({
-        where: { id: String(draft.staffId), tenantId },
+        where: { id: String(resolvedStaff.staffId), tenantId },
         select: { id: true, name: true },
       })
       .catch(() => null);
@@ -2853,7 +2782,7 @@ ${staffNamesShort || 'YOK'}
 
     const clash = await this.findOverlapSafe({
       tenantId,
-      staffId: String(draft.staffId),
+      staffId: String(resolvedStaff.staffId),
       dateAtUtcMidnight,
       timeHHMM,
       endTimeHHMM: endTimeHHMM || timeHHMM,
@@ -2863,7 +2792,7 @@ ${staffNamesShort || 'YOK'}
     if (clash) {
       const suggestions = await this.suggestSlotsSimple({
         tenantId,
-        staffId: String(draft.staffId),
+        staffId: String(resolvedStaff.staffId),
         startFromIso: startIso,
         durationMinutes,
         stepMinutes: 15,
@@ -2935,11 +2864,14 @@ ${staffNamesShort || 'YOK'}
       if (!service) return { ok: false };
 
       if (!staffId) {
-        const list = staffFallbackList?.length
-          ? staffFallbackList
-          : await this.safeListStaff(tenantId);
-        if (!list?.length) return { ok: false };
-        staffId = String(list[0].id);
+        const resolvedStaff = await this.resolveInternalStaffAssignment({
+          tenantId,
+          draft,
+          staffFallbackList,
+        });
+        if (!resolvedStaff?.staffId) return { ok: false };
+        staffId = resolvedStaff.staffId;
+        draft.staffId = resolvedStaff.staffId;
       }
 
       const fullName = customerName.trim();
@@ -3832,11 +3764,6 @@ ${historyText}
       : this.detectStaffFromMessage(raw, staff);
     const pickedSuggestion = this.pickFromSuggestions(session, raw);
 
-    if (pickedSuggestion?.type === 'staff' && pickedSuggestion.staffId) {
-      draft.staffId = pickedSuggestion.staffId;
-      draft.requestedStaffName = undefined;
-      resolution.usedAssistantSuggestion = true;
-    }
     if (pickedSuggestion?.type === 'slot' && pickedSuggestion.startAt) {
       draft.startAt = pickedSuggestion.startAt;
       session.pendingStartAt = pickedSuggestion.startAt;
@@ -4028,8 +3955,6 @@ ${historyText}
         if (session.state !== WaState.IDLE) {
           if (session.state === WaState.WAIT_SERVICE)
             out = this.humanizeAsk('service');
-          else if (session.state === WaState.WAIT_STAFF)
-            out = this.humanizeAsk('staff');
           else if (session.state === WaState.WAIT_NAME)
             out = this.humanizeAsk('name');
           else if (session.state === WaState.WAIT_DATETIME)
@@ -4661,9 +4586,8 @@ ${historyText}
 
   private getNextMissingSlot(
     session: SessionState,
-  ): 'service' | 'staff' | 'name' | 'datetime' | 'confirm' {
+  ): 'service' | 'name' | 'datetime' | 'confirm' {
     if (!session.draft.serviceId) return 'service';
-    if (!session.draft.staffId) return 'staff';
     if (!session.draft.customerName) return 'name';
     if (!session.draft.startAt) return 'datetime';
     return 'confirm';
