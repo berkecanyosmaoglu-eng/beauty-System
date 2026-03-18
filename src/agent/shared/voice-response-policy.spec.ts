@@ -6,7 +6,7 @@ describe('shapeVoiceAgentReply', () => {
       'Randevu özeti:\nYarın 17:00 için kayıt hazır.\nTamamsa evet deyin, istemezseniz hayır diyebilirsiniz.',
     );
 
-    expect(reply).toBe('Yarın 17:00 için kayıt hazır. Onaylıyor musunuz?');
+    expect(reply).toBe('Yarın 17:00 için kayıt hazır. Uygunsa onaylayayım mı?');
   });
 
   it('turns slot menus into a single suggestion question', () => {
@@ -23,5 +23,13 @@ describe('shapeVoiceAgentReply', () => {
     );
 
     expect(reply).toBe('Yarın 12:00 için rezervasyonunuzu oluşturdum.');
+  });
+
+  it('suppresses repeated greeting leads after the first turn', () => {
+    const reply = shapeVoiceAgentReply(
+      'Merhaba, lazer epilasyon için yardımcı olayım. Size nasıl yardımcı olabilirim?',
+    );
+
+    expect(reply).toBe('lazer epilasyon için yardımcı olayım.');
   });
 });

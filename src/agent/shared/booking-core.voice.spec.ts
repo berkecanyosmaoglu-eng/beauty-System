@@ -47,7 +47,7 @@ describe('BookingCoreService voice booking guards', () => {
     });
 
     expect(reply).not.toContain('Şu an görünen bir randevun yok');
-    expect(reply).toMatch(/hangi hizmet/i);
+    expect(reply).toMatch(/hangi (hizmet|işlem|islem)/i);
 
     const session = (service as any).sessions.get(`${tenantId}:${from}`);
     expect(session.state).toBe('WAIT_SERVICE');
@@ -129,5 +129,55 @@ describe('BookingCoreService voice booking guards', () => {
     expect(reply).toContain('Pedikür');
     expect(reply).not.toContain('Protez Tırnak');
     expect(reply).toContain('Hangisi için randevu istersiniz?');
+  });
+
+  it('reuses recent service context for a follow-up booking request', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi almak istiyorum',
+      channel: 'voice',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Yarına rezervasyon yaptırabilir miyiz?',
+      channel: 'voice',
+    });
+
+    expect(reply).not.toMatch(/hangi hizmet/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.draft.serviceId).toBe('svc-5');
+  });
+
+  it('keeps waiting for staff instead of silently defaulting on weak input', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_STAFF',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'şey yani',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.state).toBe('WAIT_STAFF');
+    expect(session.draft.staffId).toBeUndefined();
+    expect(reply).toMatch(/personel|fark etmez/i);
   });
 });

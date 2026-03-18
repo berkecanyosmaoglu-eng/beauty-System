@@ -2,6 +2,8 @@ export function shapeVoiceAgentReply(reply: string): string {
   let text = String(reply || '').trim();
   if (!text) return 'Tamam.';
 
+  text = stripGreetingLead(text);
+
   text = text
     .replace(/[🙂😕✅👍✨😊😉🙏]/g, '')
     .replace(/\s+\n/g, '\n')
@@ -89,8 +91,13 @@ function shapeSlotSuggestion(text: string): string | null {
 
 function cleanupLine(line: string): string {
   return String(line || '')
+    .replace(
+      /^(merhaba|selam|iyi gunler|iyi akşamlar|iyi aksamlar)[,!\s:-]+/i,
+      '',
+    )
+    .replace(/^size nasil yardimci olabilirim\??$/i, '')
     .replace(/^(Randevu özeti|Değişiklik özeti):\s*/i, '')
-    .replace(/^(Onaylıyor musunuz|Onaylıyor musun)\??$/i, 'Onaylıyor musunuz?')
+    .replace(/^(Onaylıyor musunuz|Onaylıyor musun)\??$/i, 'Uygunsa onaylayayım mı?')
     .replace(
       /Tamamsa evet deyin, istemezseniz hayır diyebilirsiniz\.?/gi,
       'Onaylıyor musunuz?',
@@ -119,6 +126,7 @@ function isFillerLine(line: string): boolean {
       'rica ederim',
       'her zaman buradayiz',
       'baska bir sey ile yardimci olabilir miyim',
+      'size nasil yardimci olabilirim',
       'gorusmek uzere',
     ].some((item) => normalized === item)
   );
@@ -145,5 +153,19 @@ function normalizeVoiceText(text: string): string {
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9çğıöşü\s]/gi, ' ')
     .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function stripGreetingLead(text: string): string {
+  return String(text || '')
+    .replace(
+      /^(merhaba|selam|iyi gunler|iyi günler|iyi aksamlar|iyi akşamlar|gunaydin|günaydın)[,!\s:-]+/i,
+      '',
+    )
+    .replace(
+      /(?:^|\s+)size nasil yardimci olabilirim\??|(?:^|\s+)size nasıl yardımcı olabilirim\??/i,
+      '',
+    )
+    .replace(/\s{2,}/g, ' ')
     .trim();
 }
