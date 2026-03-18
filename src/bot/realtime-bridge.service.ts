@@ -36,6 +36,14 @@ type OpenAiEvent = {
   [key: string]: any;
 };
 
+type RecentServiceContext = {
+  serviceName: string;
+  serviceId?: string;
+  source: 'user' | 'assistant';
+  turnId: number;
+  timestamp: number;
+};
+
 type VoiceTimingStage =
   | 'websocket_connected'
   | 'openai_connected'
@@ -190,6 +198,7 @@ class VoiceBridgeSession {
   private bridgeReady = false;
   private greetingInFlight = false;
   private turnSequence = 0;
+  private activeTurnId = 0;
 
   private lastAssistantAudioAt = 0;
   private assistantSpeaking = false;
@@ -212,6 +221,13 @@ class VoiceBridgeSession {
   private playbackToken = 0;
   private playbackTimer: NodeJS.Timeout | null = null;
   private currentTtsAbort: AbortController | null = null;
+  private currentPlaybackDurationMs = 0;
+  private currentPlaybackOffsetBytes = 0;
+  private currentReplyTurnId = 0;
+  private recentServiceContext: RecentServiceContext | null = null;
+  private cachedServices: any[] | null = null;
+  private lastGreetingSuppressedAt = 0;
+  private lastOpeningGreetingIgnoreLogAt = 0;
 
   // 20ms @ 8kHz μ-law = 160 bytes
   private readonly ulawFrameBytes = 160;
@@ -478,6 +494,8 @@ class VoiceBridgeSession {
         this.lastTranscriptText = transcript;
         this.lastTranscriptNorm = norm;
         const turnId = ++this.turnSequence;
+        this.activeTurnId = turnId;
+        this.captureRecentServiceContextFromText(transcript, turnId, 'user');
         this.markTiming('transcript_normalized', {
           turnId,
           rawLength: rawTranscript.length,
@@ -485,13 +503,19 @@ class VoiceBridgeSession {
         });
 
         this.parentLogger.log(
-          `[voice] transcript normalized callId=${this.meta.callId} raw="${rawTranscript}" normalized="${transcript}"`,
+          `[voice] transcript normalized callId=${this.meta.callId} turnId=${turnId} raw="${rawTranscript}" normalized="${transcript}"`,
         );
 
         const reply = await this.callAgentBrain(transcript, turnId);
         if (!reply) return;
+        if (!this.isTurnStillActive(turnId)) {
+          this.parentLogger.warn(
+            `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=agent_reply`,
+          );
+          return;
+        }
 
-        await this.speakReply(reply);
+        await this.speakReply(reply, turnId);
         return;
       }
 
@@ -505,13 +529,14 @@ class VoiceBridgeSession {
           this.lastBotReplyText === RealtimeBridgeService.openingGreeting &&
           Date.now() < this.openingGreetingProtectionUntil
         ) {
-          this.parentLogger.log(
-            `[voice] opening_greeting_barge_in_ignored callId=${this.meta.callId} protectionMsRemaining=${this.openingGreetingProtectionUntil - Date.now()}`,
+          this.logOpeningGreetingIgnore(
+            this.openingGreetingProtectionUntil - Date.now(),
           );
           return;
         }
-        // Aggressive barge-in: stop any queued playback immediately.
-        this.cancelAssistantAudio('speech_started');
+        if (this.shouldInterruptAssistantOnSpeechStarted()) {
+          this.cancelAssistantAudio('speech_started');
+        }
         return;
 
       case 'input_audio_buffer.speech_stopped':
@@ -545,20 +570,31 @@ class VoiceBridgeSession {
     if (normalized.length <= 1) return true;
     if (this.ghostRegex.test(normalized)) return true;
 
+    const preservePartialBooking = this.isMeaningfulPartialBookingTranscript(
+      normalized,
+    );
+    if (preservePartialBooking) {
+      this.parentLogger.log(
+        `[voice] partial_booking_transcript_preserved callId=${this.meta.callId} text="${normalized}"`,
+      );
+    }
+
     const now = Date.now();
     const msSinceAssistantAudio = now - this.lastAssistantAudioAt;
     const msSinceBargeIn = now - this.lastBargeInAt;
     const msSinceSpeechStopped = now - this.lastSpeechStoppedAt;
 
-    if (msSinceBargeIn < 180 && normalized.length < 18) return true;
+    if (!preservePartialBooking && msSinceBargeIn < 180 && normalized.length < 18)
+      return true;
     if (
+      !preservePartialBooking &&
       msSinceSpeechStopped > 0 &&
       msSinceSpeechStopped < 120 &&
       normalized.length < 3
     )
       return true;
 
-    if (msSinceAssistantAudio < 280 && normalized.length < 16) {
+    if (!preservePartialBooking && msSinceAssistantAudio < 280 && normalized.length < 16) {
       return true;
     }
 
@@ -594,8 +630,8 @@ class VoiceBridgeSession {
       this.lastBotReplyText === RealtimeBridgeService.openingGreeting &&
       now < this.openingGreetingProtectionUntil
     ) {
-      this.parentLogger.log(
-        `[voice] opening_greeting_barge_in_ignored callId=${this.meta.callId} protectionMsRemaining=${this.openingGreetingProtectionUntil - now}`,
+      this.logOpeningGreetingIgnore(
+        this.openingGreetingProtectionUntil - now,
       );
       this.speechEnergyFrames = 0;
       return;
@@ -624,8 +660,8 @@ class VoiceBridgeSession {
       this.lastBotReplyText === RealtimeBridgeService.openingGreeting &&
       Date.now() < this.openingGreetingProtectionUntil
     ) {
-      this.parentLogger.log(
-        `[voice] opening_greeting_barge_in_ignored callId=${this.meta.callId} protectionMsRemaining=${this.openingGreetingProtectionUntil - Date.now()}` ,
+      this.logOpeningGreetingIgnore(
+        this.openingGreetingProtectionUntil - Date.now(),
       );
       return false;
     }
@@ -674,6 +710,138 @@ class VoiceBridgeSession {
     );
   }
 
+  private isTurnStillActive(turnId?: number) {
+    if (!turnId) return true;
+    return turnId === this.activeTurnId;
+  }
+
+  private shouldInterruptAssistantOnSpeechStarted() {
+    if (!this.assistantSpeaking) return false;
+
+    const elapsed = Date.now() - this.assistantStartedAt;
+    const remaining = Math.max(
+      this.currentPlaybackDurationMs -
+        Math.floor(this.currentPlaybackOffsetBytes / this.ulawFrameBytes) *
+          this.ulawFrameMs,
+      0,
+    );
+    const shortReply = this.lastBotReplyText.length <= 42;
+
+    if (elapsed < 260) return false;
+    if (shortReply && remaining < 700) return false;
+    if (remaining > 0 && remaining < 220) return false;
+    return true;
+  }
+
+  private logOpeningGreetingIgnore(protectionMsRemaining: number) {
+    const now = Date.now();
+    if (now - this.lastOpeningGreetingIgnoreLogAt < 1200) return;
+    this.lastOpeningGreetingIgnoreLogAt = now;
+    this.parentLogger.log(
+      `[voice] opening_greeting_barge_in_ignored callId=${this.meta.callId} protectionMsRemaining=${protectionMsRemaining}`,
+    );
+  }
+
+  private isMeaningfulPartialBookingTranscript(text: string) {
+    const t = normalizeTurkishForTime(text);
+    if (!t) return false;
+    const patterns = [
+      /\byarin\b.*\b(saat|sabah|ogle|ogleden sonra|aksam|gece)\b/,
+      /\bbugun\b.*\b(saat|sabah|ogle|ogleden sonra|aksam|gece)\b/,
+      /\b\d{1,2}([:.]\d{2})?\b\s*(gibi|olur mu|uygun mu)?$/,
+      /\b(uc|dort|bes|alti|yedi|sekiz|dokuz|on|on bir|on iki)\b\s*(gibi|bucuk|ceyrek|olur mu)?$/,
+      /\b(randevu almak|rezervasyon icin|rezervasyon yapmak|gelebilir miyim)\b/,
+      /\b(lazer epilasyon|protez tirnak|cilt bakimi|kas|kirpik|sac)\b.*\bicin\b/,
+      /\b(ogleden sonra|aksam uzeri|sabah)\b/,
+    ];
+    return patterns.some((pattern) => pattern.test(t));
+  }
+
+  private async buildAgentInputWithVoiceContext(userText: string, turnId: number) {
+    const explicitService = await this.detectServiceMention(userText);
+    const hasBookingIntent = this.hasBookingIntentCue(userText);
+    const shouldReuseRecentService =
+      hasBookingIntent && !explicitService && this.isRecentServiceContextStrong(turnId);
+
+    if (!shouldReuseRecentService || !this.recentServiceContext) {
+      return userText;
+    }
+
+    const serviceName = this.recentServiceContext.serviceName;
+    this.parentLogger.log(
+      `[voice] recent_service_context_reused callId=${this.meta.callId} turnId=${turnId} service=${JSON.stringify(serviceName)}`,
+    );
+    return `${userText}
+
+[voice_context: Az önce konuşulan hizmet: ${serviceName}. Kullanıcı yeni hizmet belirtmediyse booking akışını bu hizmetle sürdür.]`;
+  }
+
+  private isRecentServiceContextStrong(turnId: number) {
+    if (!this.recentServiceContext) return false;
+    const withinTurns = turnId - this.recentServiceContext.turnId <= 4;
+    const withinMs = Date.now() - this.recentServiceContext.timestamp <= 180000;
+    return withinTurns && withinMs;
+  }
+
+  private hasBookingIntentCue(text: string) {
+    const t = normalizeTurkishForTime(text);
+    return /(randevu|rezervasyon|gelebilir miyim|uygun musunuz|uygun mu|buna randevu|bunu yaptiralim|bunu yaptiralim|olur mu)/.test(t);
+  }
+
+  private async detectServiceMention(text: string) {
+    const services = await this.getServicesForVoiceContext();
+    if (!services.length) return null;
+    const bookingCore = (this.agentService as any)?.bookingCore as any;
+    const detector = bookingCore?.detectServiceFromMessage;
+    if (typeof detector === 'function') {
+      try {
+        return detector.call(bookingCore, text, services);
+      } catch {}
+    }
+
+    const t = normalizeTurkishForTime(text);
+    return (
+      services.find((service: any) => {
+        const name = normalizeTurkishForTime(String(service?.name || ''));
+        return name && (t.includes(name) || name.includes(t));
+      }) || null
+    );
+  }
+
+  private async getServicesForVoiceContext() {
+    if (this.cachedServices) return this.cachedServices;
+    const bookingCore = (this.agentService as any)?.bookingCore as any;
+    const listServices = bookingCore?.safeListServices;
+    if (typeof listServices !== 'function') return [];
+    try {
+      const services = await listServices.call(bookingCore, this.meta.tenantId);
+      this.cachedServices = Array.isArray(services) ? services : [];
+    } catch {
+      this.cachedServices = [];
+    }
+    return this.cachedServices;
+  }
+
+  private captureRecentServiceContextFromText(
+    text: string,
+    turnId: number,
+    source: 'user' | 'assistant',
+  ) {
+    void this.detectServiceMention(text).then((service) => {
+      if (!service?.name) return;
+      this.recentServiceContext = {
+        serviceName: String(service.name),
+        serviceId: service?.id ? String(service.id) : undefined,
+        source,
+        turnId,
+        timestamp: Date.now(),
+      };
+      this.parentLogger.log(
+        `[voice] recent_service_context_set callId=${this.meta.callId} turnId=${turnId} source=${source} service=${JSON.stringify(this.recentServiceContext.serviceName)}`,
+      );
+    });
+  }
+
   private cancelAssistantAudio(
     reason: 'barge_in' | 'speech_started' | 'new_reply' | 'close' = 'new_reply',
   ) {
@@ -706,19 +874,38 @@ class VoiceBridgeSession {
 
     this.assistantSpeaking = false;
     this.activeResponse = false;
+    this.currentPlaybackDurationMs = 0;
+    this.currentPlaybackOffsetBytes = 0;
   }
 
   private async callAgentBrain(
     userText: string,
     turnId?: number,
   ): Promise<string> {
+    const effectiveTurnId = turnId ?? this.activeTurnId;
+    const effectiveUserText = await this.buildAgentInputWithVoiceContext(
+      userText,
+      effectiveTurnId,
+    );
+
     this.markTiming('agent_processing_start', {
-      turnId,
-      inputLength: userText.length,
+      turnId: effectiveTurnId,
+      inputLength: effectiveUserText.length,
     });
 
     const deterministicReply = this.buildDeterministicShortReply(userText);
     if (deterministicReply) {
+      if (
+        this.greeted &&
+        (deterministicReply.key === 'greeting' ||
+          deterministicReply.key === 'voice_check') &&
+        Date.now() - this.lastGreetingSuppressedAt > 1200
+      ) {
+        this.lastGreetingSuppressedAt = Date.now();
+        this.parentLogger.log(
+          `[voice] greeting_repeat_suppressed callId=${this.meta.callId} key=${deterministicReply.key}`,
+        );
+      }
       this.parentLogger.log(
         `[voice] deterministic_bypass_triggered callId=${this.meta.callId} key=${JSON.stringify(deterministicReply.key)} text="${deterministicReply.reply}"`,
       );
@@ -745,7 +932,7 @@ class VoiceBridgeSession {
     const payload = {
       tenantId: this.meta.tenantId,
       customerPhone,
-      text: userText,
+      text: effectiveUserText,
       channel: 'voice',
       from: this.meta.from,
       to: this.meta.to,
@@ -802,7 +989,7 @@ class VoiceBridgeSession {
     }
   }
 
-  private async speakReply(replyText: string) {
+  private async speakReply(replyText: string, turnId?: number) {
     const openingGreeting = RealtimeBridgeService.openingGreeting;
     const rewritten = rewriteAgentReplyForVoice(replyText);
     const spoken =
@@ -810,14 +997,22 @@ class VoiceBridgeSession {
         ? openingGreeting
         : shortenReplyForPhone(rewritten);
     const clean = sanitizeReplyForVoice(spoken);
+    const effectiveTurnId = turnId ?? this.activeTurnId;
     if (!clean || !this.sessionReady) return;
+    if (!this.isTurnStillActive(effectiveTurnId)) {
+      this.parentLogger.warn(
+        `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=pre_tts`,
+      );
+      return;
+    }
 
-    // Interrupt any previous playback before starting the next answer.
     if (this.assistantSpeaking || this.activeResponse) {
       this.cancelAssistantAudio('new_reply');
     }
 
     this.lastBotReplyText = clean;
+    this.currentReplyTurnId = effectiveTurnId;
+    this.captureRecentServiceContextFromText(clean, effectiveTurnId, 'assistant');
     this.assistantSpeaking = true;
     this.assistantStartedAt = Date.now();
 
@@ -835,11 +1030,18 @@ class VoiceBridgeSession {
       const token = ++this.playbackToken;
       const audioBuffer = await this.getOrCreateTtsAudio(clean);
 
+      if (!this.isTurnStillActive(effectiveTurnId)) {
+        this.parentLogger.warn(
+          `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=tts_ready`,
+        );
+        return;
+      }
+
       if (audioBuffer && token === this.playbackToken) {
         this.parentLogger.log(
           `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${audioBuffer.length}`,
         );
-        this.streamUlawBuffer(audioBuffer, token);
+        this.streamUlawBuffer(audioBuffer, token, effectiveTurnId);
         return;
       }
     } catch (err) {
@@ -1054,20 +1256,33 @@ class VoiceBridgeSession {
     return synthesisPromise;
   }
 
-  private streamUlawBuffer(buf: Buffer, token: number) {
+  private streamUlawBuffer(buf: Buffer, token: number, turnId: number) {
     if (!buf.length || token !== this.playbackToken) return;
+    if (!this.isTurnStillActive(turnId)) {
+      this.parentLogger.warn(
+        `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=audio_playback`,
+      );
+      return;
+    }
 
+    this.currentPlaybackDurationMs =
+      Math.ceil(buf.length / this.ulawFrameBytes) * this.ulawFrameMs;
+    this.currentPlaybackOffsetBytes = 0;
     let offset = 0;
     const tick = () => {
       if (this.closed) return;
       if (token !== this.playbackToken) return;
+      if (!this.isTurnStillActive(turnId)) return;
 
       if (!this.assistantSpeaking) return;
 
+      this.currentPlaybackOffsetBytes = offset;
       const chunk = buf.subarray(offset, offset + this.ulawFrameBytes);
       if (!chunk.length) {
         this.assistantSpeaking = false;
         this.playbackTimer = null;
+        this.currentPlaybackDurationMs = 0;
+        this.currentPlaybackOffsetBytes = 0;
         return;
       }
 
@@ -1374,9 +1589,9 @@ function rewriteAgentReplyForVoice(replyText: string) {
   ) {
     const m = text.match(/\b(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\b/);
     if (m) {
-      return `Randevunuz onaylandı. ${formatDateTimeForSpeech(`${m[1]} ${m[2]}`)}.`;
+      return `Tamamdır, randevunuzu ${formatDateTimeForSpeech(`${m[1]} ${m[2]}`)} için oluşturdum.`;
     }
-    return 'Randevunuz onaylandı.';
+    return 'Tamamdır, randevunuzu oluşturdum.';
   }
 
   if (
@@ -1526,12 +1741,15 @@ function formatTimeForSpeech(timeText: string) {
   else if (hh24 >= 18 && hh24 < 22) prefix = 'akşam';
   else prefix = 'gece';
 
-  if (mm === 0) return `${prefix} ${base}`;
-  if (mm === 15) return `${prefix} ${base} on beş`;
-  if (mm === 30) return `${prefix} ${base} buçuk`;
-  if (mm === 45) return `${prefix} ${base} kırk beş`;
+  const spokenPrefix =
+    prefix === 'öğleden sonra' ? 'saat' : prefix;
 
-  return `${prefix} ${base} ${mm}`;
+  if (mm === 0) return `${spokenPrefix} ${base}`;
+  if (mm === 15) return `${spokenPrefix} ${base} on beş`;
+  if (mm === 30) return `${spokenPrefix} ${base} buçuk`;
+  if (mm === 45) return `${spokenPrefix} ${base} kırk beş`;
+
+  return `${spokenPrefix} ${base} ${mm}`;
 }
 
 function formatDateTimeForSpeech(text: string, now = new Date()) {
@@ -1603,13 +1821,15 @@ function humanizeBookingSummaryForSpeech(text: string) {
     return source;
   }
 
-  const summary = `${summaryParts.join(', ')} uygun görünüyor.`;
+  const summary = staff
+    ? `${service || 'Randevunuzu'} için randevunuzu ${staff}'a ${dateTime ? formatDateTimeForSpeech(`${dateTime[1]} ${dateTime[2]}`) : 'uygun bir saate'} oluşturalım mı?`
+    : `${summaryParts.join(', ')} uygun görünüyor.`;
   const questionMatch = source.match(/[^.?!]*\?/g);
   const question = questionMatch?.length
     ? humanizeConfirmationForSpeech(questionMatch[questionMatch.length - 1] || '')
     : '';
 
-  return `${summary}${question ? ` ${question}` : ''}`.trim();
+  return `${summary}${!summary.endsWith('?') && question ? ` ${question}` : ''}`.trim();
 }
 
 function naturalTimeSpeech(hhmm: string) {
