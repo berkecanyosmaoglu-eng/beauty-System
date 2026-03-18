@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import WebSocket from 'ws';
-import { AgentService } from '../agent/agent.service';
+import { VoiceAgentService } from '../agent/voice-agent.service';
 
 type BridgeMeta = {
   tenantId: string;
@@ -40,7 +40,7 @@ type OpenAiEvent = {
 export class RealtimeBridgeService {
   private readonly logger = new Logger(RealtimeBridgeService.name);
 
-  constructor(private readonly agentService: AgentService) {}
+  constructor(private readonly agentService: VoiceAgentService) {}
 
   handleBridgeSocket(clientWs: WebSocket, meta: BridgeMeta) {
     const session = new VoiceBridgeSession(
@@ -118,15 +118,14 @@ class VoiceBridgeSession {
     /^(ad[ií]os|bye|bye-bye|thank you|thank you very much|all y['’]all|hallo|hello|alo)\.?$/i;
 
   constructor(
-    private readonly agentService: AgentService,
+    private readonly agentService: VoiceAgentService,
     private readonly parentLogger: Logger,
     private readonly clientWs: WebSocket,
     private readonly meta: BridgeMeta,
   ) {
     const model =
       process.env.JARVIS_REALTIME_MODEL || 'gpt-4o-realtime-preview';
-    this.openaiUrl =
-      `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
+    this.openaiUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
   }
 
   start() {
@@ -341,9 +340,7 @@ class VoiceBridgeSession {
       case 'response.done':
         this.assistantSpeaking = false;
         this.activeResponse = false;
-        this.parentLogger.log(
-          `[voice] ${evt.type} callId=${this.meta.callId}`,
-        );
+        this.parentLogger.log(`[voice] ${evt.type} callId=${this.meta.callId}`);
         return;
 
       case 'conversation.item.input_audio_transcription.completed': {
@@ -430,7 +427,12 @@ class VoiceBridgeSession {
     const msSinceSpeechStopped = now - this.lastSpeechStoppedAt;
 
     if (msSinceBargeIn < 180 && normalized.length < 18) return true;
-    if (msSinceSpeechStopped > 0 && msSinceSpeechStopped < 120 && normalized.length < 3) return true;
+    if (
+      msSinceSpeechStopped > 0 &&
+      msSinceSpeechStopped < 120 &&
+      normalized.length < 3
+    )
+      return true;
 
     if (msSinceAssistantAudio < 280 && normalized.length < 16) {
       return true;
@@ -558,7 +560,7 @@ class VoiceBridgeSession {
         result = await svc.replyText(payload);
       } else {
         throw new Error(
-          'AgentService üzerinde kullanılabilir bir public entrypoint bulunamadı',
+          'VoiceAgentService üzerinde kullanılabilir bir public entrypoint bulunamadı',
         );
       }
 
@@ -574,7 +576,7 @@ class VoiceBridgeSession {
       );
     } catch (err: any) {
       this.parentLogger.error(
-        `[voice] AgentService error callId=${this.meta.callId}: ${
+        `[voice] VoiceAgentService error callId=${this.meta.callId}: ${
           err?.stack || err?.message || err
         }`,
       );
@@ -587,7 +589,9 @@ class VoiceBridgeSession {
       'Merhaba, ben işletmenin sesli asistanıyım. Size nasıl yardımcı olabilirim?';
     const rewritten = rewriteAgentReplyForVoice(replyText);
     const spoken =
-      rewritten === openingGreeting ? openingGreeting : shortenReplyForPhone(rewritten);
+      rewritten === openingGreeting
+        ? openingGreeting
+        : shortenReplyForPhone(rewritten);
     const clean = sanitizeReplyForVoice(spoken);
     if (!clean || !this.sessionReady) return;
 
@@ -628,15 +632,11 @@ class VoiceBridgeSession {
     );
   }
 
-  private async generateElevenLabsAudio(
-    text: string,
-  ): Promise<Buffer | null> {
+  private async generateElevenLabsAudio(text: string): Promise<Buffer | null> {
     const apiKey = process.env.ELEVENLABS_API_KEY;
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
     if (!apiKey || !voiceId) {
-      this.parentLogger.error(
-        '[voice] ElevenLabs API key or voice ID missing',
-      );
+      this.parentLogger.error('[voice] ElevenLabs API key or voice ID missing');
       return null;
     }
 
@@ -698,7 +698,9 @@ class VoiceBridgeSession {
   private buildDeterministicGreetingReply(userText: string): string | null {
     const t = normalizeTurkishForTime(userText);
     if (!t) return null;
-    if (/^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin|alo)[.!? ]*$/.test(t)) {
+    if (
+      /^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin|alo)[.!? ]*$/.test(t)
+    ) {
       return 'Merhaba, nasıl yardımcı olabilirim?';
     }
     return null;
@@ -821,10 +823,7 @@ function normalizeTranscriptForAgent(
     return 'evet';
   }
 
-  if (
-    /^hay[ıi]r[.!]*$/i.test(text) ||
-    /^istemiyorum[.!]*$/i.test(text)
-  ) {
+  if (/^hay[ıi]r[.!]*$/i.test(text) || /^istemiyorum[.!]*$/i.test(text)) {
     return 'hayır';
   }
 
@@ -993,10 +992,7 @@ function rewriteAgentReplyForVoice(replyText: string) {
     return 'Randevu bilgileri doğruysa onaylıyor musunuz?';
   }
 
-  if (
-    lower.includes('kiminle olsun') ||
-    lower.includes('hangi personeli')
-  ) {
+  if (lower.includes('kiminle olsun') || lower.includes('hangi personeli')) {
     return 'Hangi personeli tercih edersiniz? İsim söyleyebilirsiniz ya da fark etmez diyebilirsiniz.';
   }
 
@@ -1053,7 +1049,11 @@ function shortenReplyForPhone(text: string) {
   }
 
   if (out.length > 220) {
-    const short = out.split(/(?<=[.!?])\s+/).slice(0, 2).join(' ').trim();
+    const short = out
+      .split(/(?<=[.!?])\s+/)
+      .slice(0, 2)
+      .join(' ')
+      .trim();
     out = short || out.slice(0, 220);
   }
 
