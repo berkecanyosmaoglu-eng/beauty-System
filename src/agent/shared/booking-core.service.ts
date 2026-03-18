@@ -575,7 +575,11 @@ export class BookingCoreService {
         );
       }
 
-      const globalIntent = this.detectGlobalIntent(raw);
+      const voiceBookingIntentOverride =
+        isVoice && this.hasStrongVoiceBookingIntent(raw, services);
+      const globalIntent = voiceBookingIntentOverride
+        ? 'NEW_BOOKING'
+        : this.detectGlobalIntent(raw);
       const shouldExtractSlots =
         session.state !== WaState.IDLE ||
         globalIntent === 'NEW_BOOKING' ||
@@ -679,7 +683,7 @@ export class BookingCoreService {
       // ✅ Upcoming appointment inquiry (IDLE iken)
       // =========================
       if (
-        looksLikeUpcomingQuery(raw) ||
+        (!voiceBookingIntentOverride && looksLikeUpcomingQuery(raw)) ||
         globalIntent === 'LIST_APPOINTMENTS' ||
         globalIntent === 'MY_APPOINTMENT_TIME'
       ) {
@@ -731,11 +735,12 @@ export class BookingCoreService {
       // Yeni randevu isteği (booking intent) her zaman önceliklidir.
       // =========================
       const explicitEditIntent =
-        globalIntent === 'CANCEL_BOOKING' ||
-        globalIntent === 'RESCHEDULE_BOOKING' ||
-        looksLikeCancelIntent(raw) ||
-        looksLikeRescheduleIntent(raw) ||
-        looksLikeGenericEditIntent(raw);
+        !voiceBookingIntentOverride &&
+        (globalIntent === 'CANCEL_BOOKING' ||
+          globalIntent === 'RESCHEDULE_BOOKING' ||
+          looksLikeCancelIntent(raw) ||
+          looksLikeRescheduleIntent(raw) ||
+          looksLikeGenericEditIntent(raw));
       const explicitNewBookingIntent =
         looksLikeBookingIntent(raw) && !explicitEditIntent;
       if (explicitEditIntent && !explicitNewBookingIntent) {
@@ -1053,13 +1058,21 @@ export class BookingCoreService {
       }
 
       if (looksLikeServiceListRequest(msg)) {
-        const list = servicesToTextShort(services);
+        const list = servicesToTextShort(services, {
+          limit: isVoice ? 4 : 6,
+          compact: isVoice,
+        });
         if (!list)
           return this.safeReply(
             session,
             'Şu an hizmet listem görünmüyor 😕 Birazdan tekrar dener misin?',
           );
-        return this.safeReply(session, `Hizmetlerimiz:\n${list}`);
+        return this.safeReply(
+          session,
+          isVoice
+            ? `Sunabildiğimiz işlemlerden bazıları: ${list}. Hangisi için randevu istersiniz?`
+            : `Hizmetlerimiz:\n${list}`,
+        );
       }
 
       if (looksLikeAddressOrHours(msg)) {
@@ -1622,9 +1635,12 @@ export class BookingCoreService {
     // =========================
     const parsedEarly = parseDateTimeTR(raw);
     if (parsedEarly?.hasTime) {
-      session.pendingStartAt = toIstanbulIso(
-        clampToFuture(parsedEarly.dateUtc),
+      const mergedPendingIso = this.mergePendingDateOnlyWithTime(
+        session.pendingDateOnly,
+        normalizeTr(raw),
       );
+      session.pendingStartAt =
+        mergedPendingIso || toIstanbulIso(clampToFuture(parsedEarly.dateUtc));
       if (!session.draft.startAt && session.pendingStartAt)
         session.draft.startAt = session.pendingStartAt;
       session.pendingDateOnly = undefined;
@@ -1775,7 +1791,11 @@ export class BookingCoreService {
             normalizePersonName(String(p?.name || '')) ===
             normalizePersonName(raw),
         );
-        if (!looksLikeStaffName && maybeName)
+        if (
+          !looksLikeStaffName &&
+          maybeName &&
+          this.shouldCaptureCustomerName(raw, maybeName, isVoice)
+        )
           session.draft.customerName = maybeName;
       }
 
@@ -3683,10 +3703,13 @@ ${historyText}
     }
 
     if (!isNoPreferenceStaff(raw)) {
-      this.tryAutofillStaff(draft, staff, raw);
+      this.tryAutofillStaff(draft, staff, raw, { isVoice });
       if (!draft.staffId) {
         const maybeSpoken = extractLikelyStaffName(raw);
-        if (maybeSpoken) {
+        if (
+          maybeSpoken &&
+          this.shouldCaptureRequestedStaffName(raw, maybeSpoken, isVoice)
+        ) {
           draft.requestedStaffName = maybeSpoken;
           if (staff?.[0]?.id) draft.staffId = String(staff[0].id);
         }
@@ -3703,7 +3726,15 @@ ${historyText}
       hasDate: parsed?.hasDate || false,
       dateOnly: parsed?.dateOnly || null,
     });
-    if (parsed?.hasTime) {
+    const mergedPendingIso =
+      isVoice && !hasExplicitDateMarker(tNorm)
+        ? this.mergePendingDateOnlyWithTime(session.pendingDateOnly, tNorm)
+        : null;
+    if (mergedPendingIso) {
+      draft.startAt = mergedPendingIso;
+      session.pendingStartAt = draft.startAt;
+      session.pendingDateOnly = undefined;
+    } else if (parsed?.hasTime) {
       let nextIso = toIstanbulIso(clampToFuture(parsed.dateUtc));
       // Keep existing date when caller only updates the time ("iki", "saat iki", "iki buçuk").
       if (!hasExplicitDateMarker(tNorm)) {
@@ -3750,13 +3781,19 @@ ${historyText}
       !draft.customerName &&
       canCaptureName &&
       !looksLikeStaffName &&
-      maybeName
+      maybeName &&
+      this.shouldCaptureCustomerName(raw, maybeName, isVoice)
     ) {
       draft.customerName = maybeName;
     }
   }
 
-  private tryAutofillStaff(draft: BookingDraft, staff: any[], msg: string) {
+  private tryAutofillStaff(
+    draft: BookingDraft,
+    staff: any[],
+    msg: string,
+    opts?: { isVoice?: boolean },
+  ) {
     if (draft.staffId) return;
     const t = normalizePersonName(msg);
     const words = normalizePersonName(msg).split(/\s+/).filter(Boolean);
@@ -3770,7 +3807,81 @@ ${historyText}
         return words.some((w) => w.length >= 3 && name.includes(w));
       });
 
-    if (hit?.id) draft.staffId = String(hit.id);
+    if (!hit?.id) return;
+    if (opts?.isVoice && !this.isStrongVoiceStaffSignal(msg, hit)) return;
+    draft.staffId = String(hit.id);
+  }
+
+  private mergePendingDateOnlyWithTime(
+    pendingDateOnly: string | undefined,
+    rawNorm: string,
+  ): string | null {
+    if (!pendingDateOnly) return null;
+    const onlyTime = parseTimeBest(rawNorm);
+    if (!onlyTime) return null;
+
+    const [yy, mm, dd] = pendingDateOnly.split('-').map(Number);
+    const dUtc = new Date(
+      Date.UTC(yy, mm - 1, dd, onlyTime.hh - 3, onlyTime.mm, 0, 0),
+    );
+    return toIstanbulIso(clampToFuture(dUtc));
+  }
+
+  private shouldCaptureCustomerName(
+    raw: string,
+    maybeName: string,
+    isVoice: boolean,
+  ) {
+    if (!isVoice) return true;
+    return isLikelyMeaningfulVoiceName(raw, maybeName);
+  }
+
+  private shouldCaptureRequestedStaffName(
+    raw: string,
+    maybeSpoken: string,
+    isVoice: boolean,
+  ) {
+    if (!isVoice) return true;
+    return isLikelyMeaningfulVoiceStaffPhrase(raw, maybeSpoken);
+  }
+
+  private isStrongVoiceStaffSignal(msg: string, hit: any) {
+    const rawNorm = normalizeTr(msg);
+    const staffName = normalizePersonName(String(hit?.name || ''));
+    if (!rawNorm || !staffName) return false;
+
+    if (normalizePersonName(msg) === staffName) return true;
+    if (
+      rawNorm.includes(` ${staffName} `) ||
+      rawNorm.startsWith(`${staffName} `) ||
+      rawNorm.endsWith(` ${staffName}`)
+    )
+      return true;
+
+    return /(ile|olsun|tercih|istiyorum|hanim|hanım|bey)/.test(rawNorm);
+  }
+
+  private hasStrongVoiceBookingIntent(raw: string, services: any[]) {
+    const t = normalizeTr(raw);
+    if (!t) return false;
+    if (!/(randevu|rezervasyon)/.test(t)) return false;
+    if (
+      /(iptal|degistir|değiştir|ertele|listele|goster|göster|var mi|var mı)/.test(
+        t,
+      )
+    )
+      return false;
+    if (
+      /(almak istiyorum|almak isterim|almak istiyordum|olustur|oluştur|yeni)/.test(
+        t,
+      )
+    )
+      return true;
+
+    const parsed = parseDateTimeTR(raw);
+    if (this.detectServiceFromMessage(raw, services)) return true;
+    if (parsed?.hasDate || parsed?.hasTime) return true;
+    return false;
   }
 
   private detectServiceFromMessage(raw: string, services: any[]) {
@@ -4250,17 +4361,23 @@ function isNo(msg: string) {
   return false;
 }
 
-function servicesToTextShort(services: any[]) {
+function servicesToTextShort(
+  services: any[],
+  opts?: { limit?: number; compact?: boolean },
+) {
   if (!services || services.length === 0) return '';
+  const limit = Math.max(1, opts?.limit ?? 6);
+  const compact = Boolean(opts?.compact);
   return services
-    .slice(0, 6)
+    .slice(0, limit)
     .map((s: any) => {
       const name = String(s?.name || 'Hizmet');
+      if (compact) return name;
       const price = s?.price != null ? `${s.price}₺` : '-';
       const dur = s?.duration != null ? `${s.duration} dk` : '-';
       return `• ${name} (${price}, ${dur})`;
     })
-    .join('\n');
+    .join(compact ? ', ' : '\n');
 }
 
 function staffToTextShort(staff: any[]) {
@@ -4340,6 +4457,61 @@ function extractLikelyStaffName(raw: string): string | null {
   if (!candidate) return null;
   if (candidate.length < 2) return null;
   return candidate;
+}
+
+function isLikelyMeaningfulVoiceName(raw: string, maybeName: string): boolean {
+  const rawNorm = normalizeTr(raw);
+  const candidateNorm = normalizeTr(maybeName);
+  if (!rawNorm || !candidateNorm) return false;
+  if (candidateNorm.length < 2) return false;
+
+  const bannedPhrases = [
+    'bir defa olsun',
+    'bir kere',
+    'fark etmez',
+    'bilmiyorum',
+    'emin degilim',
+    'emin değilim',
+    'uygunsa',
+    'musaitseniz',
+    'müsaitseniz',
+    'yarin',
+    'yarın',
+    'bugun',
+    'bugün',
+    'cuma gunu',
+    'cuma günü',
+  ];
+  if (bannedPhrases.some((phrase) => rawNorm.includes(normalizeTr(phrase))))
+    return false;
+
+  if (
+    /(randevu|saat|yarin|yarın|bugun|bugün|sabah|ogle|öğle|aksam|akşam|lazer|protez|manikur|manikür|pedikur|pedikür)/.test(
+      rawNorm,
+    )
+  )
+    return false;
+
+  const words = candidateNorm.split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 3) return false;
+  return words.every((word) => word.length >= 2);
+}
+
+function isLikelyMeaningfulVoiceStaffPhrase(
+  raw: string,
+  maybeSpoken: string,
+): boolean {
+  const rawNorm = normalizeTr(raw);
+  const candidateNorm = normalizeTr(maybeSpoken);
+  if (!rawNorm || !candidateNorm) return false;
+  if (candidateNorm.length < 2) return false;
+  if (
+    /(bir defa olsun|fark etmez|bilmiyorum|yarin|yarın|bugun|bugün)/.test(
+      rawNorm,
+    )
+  )
+    return false;
+  return /(ile|olsun|tercih|hanim|hanım|bey)/.test(rawNorm);
 }
 
 // ===== TZ + Working hours helpers =====
