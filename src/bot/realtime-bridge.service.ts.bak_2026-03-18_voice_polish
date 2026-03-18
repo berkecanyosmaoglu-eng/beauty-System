@@ -134,7 +134,7 @@ class VoiceBridgeSession {
   private readonly ulawFrameMs = 20;
 
   private readonly ghostRegex =
-    /^(ad[ií]os|bye|bye-bye|thank you|thank you very much|all y['’]all|hallo|hello)\.?$/i;
+    /^(ad[ií]os|bye|bye-bye|thank you|thank you very much|all y['’]all|hallo|hello|alo)\.?$/i;
   private readonly sessionStartedAt = Date.now();
   private readonly timings: Partial<Record<VoiceTimingStage, number>> = {};
 
@@ -760,9 +760,9 @@ class VoiceBridgeSession {
             model_id: modelId,
             language_code: 'tr',
             voice_settings: {
-              stability: 0.35,
+              stability: 0.28,
               similarity_boost: 0.8,
-              speed: 0.96,
+              speed: 1.12,
             },
           }),
           signal: controller.signal,
@@ -1169,37 +1169,11 @@ function shortenReplyForPhone(text: string) {
     .filter(Boolean);
 
   if (sentenceParts.length > 1) {
-    const first = sentenceParts[0] || '';
-    const second = sentenceParts[1] || '';
-    const firstNorm = normalizeTurkishForTime(first);
-    const secondNorm = normalizeTurkishForTime(second);
-
-    const firstIsWeakLead =
-      /^(merhaba|selam|evet|tamam|peki|anladim|anladım|tabii|elbette)[!.? ]*$/.test(firstNorm) ||
-      /^(merhaba|selam)[,.! ]/.test(firstNorm) ||
-      /^(evet|tamam|peki)[,.! ]/.test(firstNorm);
-
-    const secondIsUseful =
-      second.includes('?') ||
-      secondNorm.includes('yardimci olabilir') ||
-      secondNorm.includes('hangi hizmet') ||
-      secondNorm.includes('hangi islem') ||
-      secondNorm.includes('hangi konuda') ||
-      secondNorm.includes('hangi personel') ||
-      secondNorm.includes('hangi gun') ||
-      secondNorm.includes('kacta') ||
-      secondNorm.includes('saat') ||
-      secondNorm.includes('randevu');
-
-    if (firstIsWeakLead && secondIsUseful) {
-      out = `${first} ${second}`.trim();
-    } else {
-      out = first || out;
-    }
+    out = sentenceParts[0] || out;
   }
 
-  if (out.length > 170) {
-    out = out.slice(0, 170).trim();
+  if (out.length > 140) {
+    out = out.slice(0, 140).trim();
     out = out.replace(/[,:;\s]+$/g, '');
     if (!/[.!?]$/.test(out)) out += '.';
   }

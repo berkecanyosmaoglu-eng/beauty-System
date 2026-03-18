@@ -312,6 +312,115 @@ export class AdminService {
     };
   }
 
+  async activityFeed(params: { tenantId: string; limit: number }) {
+    const { tenantId } = params;
+    const limit =
+      Number.isFinite(params.limit) && params.limit > 0 && params.limit <= 50
+        ? params.limit
+        : 10;
+
+    const [latestAppointments, latestCustomers] = await Promise.all([
+      this.prisma.appointments.findMany({
+        where: { tenantId },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        include: {
+          customers: true,
+          services: true,
+          staff: true,
+        },
+      }),
+      this.prisma.customers.findMany({
+        where: { tenantId },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+      }),
+    ]);
+
+    const appointmentItems = latestAppointments.map((a: any) => ({
+      type: 'appointment',
+      message: `${a.customers?.name ?? 'Müşteri'} için ${a.services?.name ?? 'hizmet'} randevusu oluşturuldu`,
+      createdAt: a.createdAt,
+      meta: {
+        appointmentId: a.id,
+        customerName: a.customers?.name ?? null,
+        serviceName: a.services?.name ?? null,
+        staffName: a.staff?.name ?? null,
+        status: a.status ?? null,
+        date: a.date,
+        time: a.time,
+      },
+    }));
+
+    const customerItems = latestCustomers.map((c: any) => ({
+      type: 'customer',
+      message: `${c.name ?? c.phoneNumber ?? 'Yeni müşteri'} müşteri havuzuna eklendi`,
+      createdAt: c.createdAt,
+      meta: {
+        customerId: c.id,
+        customerName: c.name ?? null,
+        phoneNumber: c.phoneNumber ?? null,
+      },
+    }));
+
+    const items = [...appointmentItems, ...customerItems]
+      .sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      )
+      .slice(0, limit);
+
+    return {
+      ok: true,
+      tenantId,
+      total: items.length,
+      items,
+      __debug: 'ADMIN_ACTIVITY_FEED_V1',
+    };
+  }
+
+  async channelPerformance(params: { tenantId: string }) {
+    const { tenantId } = params;
+
+    const grouped = await this.prisma.appointments.groupBy({
+      by: ['channel'],
+      where: { tenantId },
+      _count: { _all: true },
+    });
+
+    const counts = new Map<string, number>();
+    for (const row of grouped as any[]) {
+      counts.set(String(row.channel ?? 'UNKNOWN'), Number(row._count?._all ?? 0));
+    }
+
+    const whatsapp = counts.get('WHATSAPP') ?? 0;
+    const instagram = counts.get('INSTAGRAM') ?? 0;
+    const mail = counts.get('MAIL') ?? 0;
+
+    return {
+      ok: true,
+      tenantId,
+      channels: {
+        whatsapp: {
+          count: whatsapp,
+          label: whatsapp > 0 ? `${whatsapp} randevuya dönüştü` : 'Veri yok',
+        },
+        instagram: {
+          count: instagram,
+          label: instagram > 0 ? `${instagram} randevuya dönüştü` : 'Veri yok',
+        },
+        mail: {
+          count: mail,
+          label: mail > 0 ? `${mail} randevuya dönüştü` : 'Veri yok',
+        },
+      },
+      __debug: 'ADMIN_CHANNEL_PERFORMANCE_V1',
+    };
+  }
+
+
+
+
   async whatsappMessages(params: {
     tenantId: string;
     peer: string;

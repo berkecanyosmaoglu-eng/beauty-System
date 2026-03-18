@@ -120,4 +120,22 @@ export class AdminController {
       limit: Number(limit),
     });
   }
+  @Get('activity-feed')
+  async activityFeed(
+    @Query('tenantId') tenantId: string,
+    @Query('limit') limit = '10',
+  ) {
+    if (!tenantId) throw new BadRequestException('tenantId gerekli');
+    return this.admin.activityFeed({
+      tenantId,
+      limit: Number(limit),
+    });
+  }
+
+  @Get('channel-performance')
+  async channelPerformance(@Query('tenantId') tenantId: string) {
+    if (!tenantId) throw new BadRequestException('tenantId gerekli');
+    return this.admin.channelPerformance({ tenantId });
+  }
+
 }

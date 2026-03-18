@@ -29,7 +29,7 @@ export class ServicesService {
   }
 
   async findAll(tenantId?: string) {
-    return this.prisma.service.findMany({
+    return this.prisma.services.findMany({
       where: tenantId ? { tenantId } : undefined,
       orderBy: { createdAt: 'desc' },
     });

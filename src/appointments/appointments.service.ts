@@ -9,55 +9,43 @@ import { CreateAppointmentDto } from './dto/create-appointment.dto';
 import { UpdateAppointmentDto } from './dto/update-appointment.dto';
 import { NotificationsService } from '../notifications/notifications.service';
 
-
 type NextAvailableInput = {
   tenantId: string;
   staffId: string;
   serviceId: string;
   desiredStart: Date | string;
-  stepMinutes?: number;   // default 15
-  searchHours?: number;   // default 24
-  suggestions?: number;   // default 5
+  stepMinutes?: number; // default 15
+  searchHours?: number; // default 24
+  suggestions?: number; // default 5
 };
-
 
 // --- Booking time rules (TR) ---
 const TR_OFFSET = '+03:00'; // Europe/Istanbul (fixed offset, no DST)
+const TR_OFFSET_MINUTES = 3 * 60;
 const MIN_LEAD_MINUTES = 60; // "şimdi + 60dk" altına randevu alma
-const MAX_FUTURE_DAYS = 30;  // en fazla 30 gün ileri
+const MAX_FUTURE_DAYS = 30; // en fazla 30 gün ileri
 
 function coerceToTrIso(input: string) {
-  // Accept:
-  // - 2026-02-02T14:00
-  // - 2026-02-02 14:00
-  // - 2026-02-02T14:00:00
-  // If timezone missing, assume TR (+03:00)
   const s = String(input).trim();
 
-  // If already has Z or +hh:mm or -hh:mm, keep as is.
   if (/[zZ]$/.test(s) || /[+-]\d{2}:\d{2}$/.test(s)) return s;
 
-  // Normalize space to T
   const normalized = s.includes(' ') ? s.replace(' ', 'T') : s;
 
-  // If has only date, reject (we need time)
-  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return normalized + 'T00:00:00' + TR_OFFSET;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    return normalized + 'T00:00:00' + TR_OFFSET;
+  }
 
-  // If has HH:mm but no seconds
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(normalized)) {
     return normalized + ':00' + TR_OFFSET;
   }
 
-  // If has HH:mm:ss
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(normalized)) {
     return normalized + TR_OFFSET;
   }
 
-  // Fallback: just append offset if no timezone marker
   return normalized + TR_OFFSET;
 }
-
-
 
 @Injectable()
 export class AppointmentsService {
@@ -74,8 +62,49 @@ export class AppointmentsService {
     return d instanceof Date && !Number.isNaN(d.getTime());
   }
 
+  private pad2(n: number) {
+    return String(n).padStart(2, '0');
+  }
+
+  private toTrShiftedDate(d: Date) {
+    return new Date(d.getTime() + TR_OFFSET_MINUTES * 60 * 1000);
+  }
+
+  private toTrDateString(d: Date) {
+    const tr = this.toTrShiftedDate(d);
+    const y = tr.getUTCFullYear();
+    const m = this.pad2(tr.getUTCMonth() + 1);
+    const day = this.pad2(tr.getUTCDate());
+    return `${y}-${m}-${day}`;
+  }
+
+  private toTrTimeString(d: Date) {
+    const tr = this.toTrShiftedDate(d);
+    const hh = this.pad2(tr.getUTCHours());
+    const mm = this.pad2(tr.getUTCMinutes());
+    return `${hh}:${mm}`;
+  }
+
+  private trDayStartAsDate(d: Date) {
+    return new Date(`${this.toTrDateString(d)}T00:00:00${TR_OFFSET}`);
+  }
+
+  private timeToMinutes(time: string) {
+    const [hh, mm] = String(time).split(':').map(Number);
+    return (hh || 0) * 60 + (mm || 0);
+  }
+
+  private minutesToTime(minutes: number) {
+    const safe = ((minutes % (24 * 60)) + 24 * 60) % (24 * 60);
+    const hh = Math.floor(safe / 60);
+    const mm = safe % 60;
+    return `${this.pad2(hh)}:${this.pad2(mm)}`;
+  }
+
   private async getServiceOrThrow(serviceId: string) {
-    const service = await this.prisma.service.findUnique({ where: { id: serviceId } });
+    const service = await this.prisma.services.findUnique({
+      where: { id: serviceId },
+    });
     if (!service) throw new BadRequestException('serviceId geçersiz');
     if (!service.duration || service.duration <= 0) {
       throw new BadRequestException('service duration geçersiz');
@@ -86,30 +115,95 @@ export class AppointmentsService {
   private async hasOverlap(params: {
     tenantId: string;
     staffId: string;
-    startAt: Date;
-    endAt: Date;
+    date: Date;
+    time: string;
+    endTime: string;
     excludeAppointmentId?: string;
   }) {
-    const { tenantId, staffId, startAt, endAt, excludeAppointmentId } = params;
+    const { tenantId, staffId, date, time, endTime, excludeAppointmentId } = params;
 
-    const overlap = await this.prisma.appointment.findFirst({
+    const targetStartMin = this.timeToMinutes(time);
+    const targetEndMin = this.timeToMinutes(endTime);
+
+    const sameDayAppointments = await this.prisma.appointments.findMany({
       where: {
         tenantId,
         staffId,
-        // iptal edilenleri sayma (senin statü isimlerin farklıysa burayı genişletiriz)
-        NOT: { status: 'cancelled' as any },
+        date,
         ...(excludeAppointmentId ? { id: { not: excludeAppointmentId } } : {}),
-        // Overlap şartı: existing.start < new.end && existing.end > new.start
-        startAt: { lt: endAt },
-        endAt: { gt: startAt },
+        NOT: {
+          status: {
+            in: ['cancelled', 'canceled'],
+          },
+        },
+      } as any,
+      include: {
+        services: true,
       },
-      select: { id: true, startAt: true, endAt: true },
     });
 
-    return overlap;
+    for (const appt of sameDayAppointments as any[]) {
+      const existingStartMin = this.timeToMinutes(appt.time);
+
+      let existingEndMin: number;
+      if (appt.endTime) {
+        existingEndMin = this.timeToMinutes(appt.endTime);
+      } else {
+        const duration = Number(appt?.services?.duration ?? 0);
+        existingEndMin = existingStartMin + Math.max(0, duration);
+      }
+
+      const overlaps =
+        existingStartMin < targetEndMin && existingEndMin > targetStartMin;
+
+      if (overlaps) {
+        return appt;
+      }
+    }
+
+    return null;
   }
 
-  // ✅ NEW: slot check + suggestions (controller burayı çağırıyor)
+  private async buildSlotParts(startInput: Date | string, serviceId: string) {
+    const service = await this.getServiceOrThrow(serviceId);
+
+    const start =
+      typeof startInput === 'string'
+        ? new Date(coerceToTrIso(String(startInput)))
+        : new Date(startInput);
+
+    if (!this.isValidDate(start)) {
+      throw new BadRequestException('startAt geçersiz');
+    }
+
+    const now = new Date();
+    const minStart = this.addMinutes(now, MIN_LEAD_MINUTES);
+    if (start < minStart) {
+      throw new BadRequestException(
+        `Randevu en erken ${MIN_LEAD_MINUTES} dakika sonrasına alınabilir`,
+      );
+    }
+
+    const maxStart = this.addMinutes(now, MAX_FUTURE_DAYS * 24 * 60);
+    if (start > maxStart) {
+      throw new BadRequestException(
+        `Randevu en fazla ${MAX_FUTURE_DAYS} gün ileriye alınabilir`,
+      );
+    }
+
+    const end = this.addMinutes(start, Number(service.duration));
+
+    return {
+      service,
+      start,
+      end,
+      date: this.trDayStartAsDate(start),
+      time: this.toTrTimeString(start),
+      endTime: this.toTrTimeString(end),
+    };
+  }
+
+  // ✅ slot check + suggestions
   async nextAvailable(input: NextAvailableInput) {
     const {
       tenantId,
@@ -125,78 +219,75 @@ export class AppointmentsService {
     if (!staffId) throw new BadRequestException('staffId gerekli');
     if (!serviceId) throw new BadRequestException('serviceId gerekli');
 
-    const service = await this.getServiceOrThrow(serviceId);
-
-// desiredStart Date geliyorsa aynen, string geliyorsa TR offset uygula
-const start =
-  typeof (desiredStart as any) === 'string'
-    ? new Date(coerceToTrIso(String(desiredStart)))
-    : new Date(desiredStart);
-
-if (!this.isValidDate(start)) throw new BadRequestException('desiredStart geçersiz');
-
-// Lead time + max future
-const now = new Date();
-const minStart = this.addMinutes(now, MIN_LEAD_MINUTES);
-if (start < minStart) {
-  return {
-    ok: false,
-    message: `En erken ${MIN_LEAD_MINUTES} dakika sonrası için saat seçilebilir`,
-    desired: null,
-    suggestions: [],
-  };
-}
-const maxStart = this.addMinutes(now, MAX_FUTURE_DAYS * 24 * 60);
-if (start > maxStart) {
-  return {
-    ok: false,
-    message: `En fazla ${MAX_FUTURE_DAYS} gün ileriye randevu alınabilir`,
-    desired: null,
-    suggestions: [],
-  };
-}
-
-    const desiredEnd = this.addMinutes(start, Number(service.duration));
-    const conflict = await this.hasOverlap({
-      tenantId,
-      staffId,
-      startAt: start,
-      endAt: desiredEnd,
-    });
-
-    // Uygunsa direkt "ok:true"
-    if (!conflict) {
+    let desired;
+    try {
+      desired = await this.buildSlotParts(desiredStart, serviceId);
+    } catch (err: any) {
       return {
-        ok: true,
-        message: 'Uygun',
-        desired: { startAt: start.toISOString(), endAt: desiredEnd.toISOString() },
+        ok: false,
+        message: err?.message || 'desiredStart geçersiz',
+        desired: null,
         suggestions: [],
       };
     }
 
-    // Doluysa suggestion üret
-    const slots: { startAt: string; endAt: string }[] = [];
-    const endSearch = new Date(start.getTime() + searchHours * 60 * 60 * 1000);
+    const conflict = await this.hasOverlap({
+      tenantId,
+      staffId,
+      date: desired.date,
+      time: desired.time,
+      endTime: desired.endTime,
+    });
 
-    let cursor = new Date(start);
-    // sonsuz döngü koruması
-    const maxIterations = Math.min(2000, Math.ceil((searchHours * 60) / Math.max(1, stepMinutes)) + 10);
+    if (!conflict) {
+      return {
+        ok: true,
+        message: 'Uygun',
+        desired: {
+          startAt: desired.start.toISOString(),
+          endAt: desired.end.toISOString(),
+          date: desired.date.toISOString(),
+          time: desired.time,
+          endTime: desired.endTime,
+        },
+        suggestions: [],
+      };
+    }
+
+    const slots: { startAt: string; endAt: string; date: string; time: string; endTime: string }[] = [];
+    const searchStart = new Date(desired.start);
+    const endSearch = new Date(
+      desired.start.getTime() + searchHours * 60 * 60 * 1000,
+    );
+
+    let cursor = new Date(searchStart);
+    const maxIterations = Math.min(
+      2000,
+      Math.ceil((searchHours * 60) / Math.max(1, stepMinutes)) + 10,
+    );
 
     for (let i = 0; i < maxIterations; i++) {
       if (cursor >= endSearch) break;
 
-      const candStart = new Date(cursor);
-      const candEnd = this.addMinutes(candStart, Number(service.duration));
+      const candidate = await this.buildSlotParts(cursor, serviceId);
 
       const c = await this.hasOverlap({
         tenantId,
         staffId,
-        startAt: candStart,
-        endAt: candEnd,
+        date: candidate.date,
+        time: candidate.time,
+        endTime: candidate.endTime,
       });
 
       if (!c) {
-        slots.push({ startAt: candStart.toISOString(), endAt: candEnd.toISOString() });
+        slots.push({
+          startAt: candidate.start.toISOString(),
+          endAt: candidate.end.toISOString(),
+          date: candidate.date.toISOString(),
+          time: candidate.time,
+          endTime: candidate.endTime,
+        });
+
         if (slots.length >= suggestions) break;
       }
 
@@ -206,7 +297,13 @@ if (start > maxStart) {
     return {
       ok: false,
       message: 'Bu saat dolu',
-      desired: { startAt: start.toISOString(), endAt: desiredEnd.toISOString() },
+      desired: {
+        startAt: desired.start.toISOString(),
+        endAt: desired.end.toISOString(),
+        date: desired.date.toISOString(),
+        time: desired.time,
+        endTime: desired.endTime,
+      },
       suggestions: slots,
     };
   }
@@ -216,40 +313,24 @@ if (start > maxStart) {
     if (!dto?.customerId) throw new BadRequestException('customerId gerekli');
     if (!dto?.serviceId) throw new BadRequestException('serviceId gerekli');
     if (!dto?.staffId) throw new BadRequestException('staffId gerekli');
-    if (!dto?.startAt) throw new BadRequestException('startAt gerekli');
+    if (!(dto as any)?.startAt) throw new BadRequestException('startAt gerekli');
 
-    const service = await this.getServiceOrThrow(dto.serviceId);
-
-const startAt = new Date(coerceToTrIso(String(dto.startAt)));
-if (!this.isValidDate(startAt)) throw new BadRequestException('startAt geçersiz');
-
-// Lead time + max future
-const now = new Date();
-const minStart = this.addMinutes(now, MIN_LEAD_MINUTES);
-if (startAt < minStart) {
-  throw new BadRequestException(`Randevu en erken ${MIN_LEAD_MINUTES} dakika sonrasına alınabilir`);
-}
-const maxStart = this.addMinutes(now, MAX_FUTURE_DAYS * 24 * 60);
-if (startAt > maxStart) {
-  throw new BadRequestException(`Randevu en fazla ${MAX_FUTURE_DAYS} gün ileriye alınabilir`);
-}
-
-const endAt = this.addMinutes(startAt, Number(service.duration));
+    const slot = await this.buildSlotParts((dto as any).startAt, dto.serviceId);
 
     const conflict = await this.hasOverlap({
       tenantId: dto.tenantId,
       staffId: dto.staffId,
-      startAt,
-      endAt,
+      date: slot.date,
+      time: slot.time,
+      endTime: slot.endTime,
     });
 
     if (conflict) {
-      // ✅ doluysa: 409 + suggestions
       const suggest = await this.nextAvailable({
         tenantId: dto.tenantId,
         staffId: dto.staffId,
         serviceId: dto.serviceId,
-        desiredStart: startAt,
+        desiredStart: slot.start,
         stepMinutes: 15,
         searchHours: 24,
         suggestions: 5,
@@ -258,26 +339,23 @@ const endAt = this.addMinutes(startAt, Number(service.duration));
       throw new ConflictException(suggest);
     }
 
-    const created = await this.prisma.appointment.create({
+    const created = await this.prisma.appointments.create({
       data: {
         tenantId: dto.tenantId,
         customerId: dto.customerId,
         serviceId: dto.serviceId,
         staffId: dto.staffId,
-        startAt,
-        endAt,
-        status: (dto as any).status ?? 'scheduled',
-        channel: (dto as any).channel ?? 'API',
-      },
+        date: slot.date,
+        time: slot.time,
+        endTime: slot.endTime,
+        status: ((dto as any).status ?? 'scheduled') as any,
+      } as any,
       include: {
-        customer: true,
-        service: true,
+        customers: true,
+        services: true,
         staff: true,
       },
     });
-
-    // Bildirim/WhatsApp/SMS tarafı sende ayrı modülde zaten var; burada dokunmuyorum.
-    // İstersen create sonrası notificationsService trigger’ı ekleriz.
 
     return created;
   }
@@ -294,95 +372,156 @@ const endAt = this.addMinutes(startAt, Number(service.duration));
 
     if (today) {
       const now = new Date();
-      const start = new Date(now);
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(now);
-      end.setHours(23, 59, 59, 999);
-      where.startAt = { gte: start, lte: end };
+      const start = this.trDayStartAsDate(now);
+      const end = this.addMinutes(start, 24 * 60 - 1);
+      where.date = { gte: start, lte: end };
     } else if (date) {
-      // date=YYYY-MM-DD beklersek
-      const d = new Date(date);
+      const d = new Date(`${date}T00:00:00${TR_OFFSET}`);
       if (this.isValidDate(d)) {
-        const start = new Date(d);
-        start.setHours(0, 0, 0, 0);
-        const end = new Date(d);
-        end.setHours(23, 59, 59, 999);
-        where.startAt = { gte: start, lte: end };
+        const start = this.trDayStartAsDate(d);
+        const end = this.addMinutes(start, 24 * 60 - 1);
+        where.date = { gte: start, lte: end };
       }
     }
 
-    return this.prisma.appointment.findMany({
+    return this.prisma.appointments.findMany({
       where,
-      orderBy: { startAt: 'asc' },
-      include: { customer: true, service: true, staff: true },
+      orderBy: [{ date: 'asc' }, { time: 'asc' }],
+      include: {
+        customers: true,
+        services: true,
+        staff: true,
+      },
     });
   }
 
   async findOne(id: string) {
-    const appt = await this.prisma.appointment.findUnique({
+    const appt = await this.prisma.appointments.findUnique({
       where: { id },
-      include: { customer: true, service: true, staff: true },
+      include: {
+        customers: true,
+        services: true,
+        staff: true,
+      },
     });
+
     if (!appt) throw new NotFoundException('appointment bulunamadı');
     return appt;
   }
 
   async update(id: string, dto: UpdateAppointmentDto) {
-    const existing = await this.prisma.appointment.findUnique({ where: { id } });
+    const existing = await this.prisma.appointments.findUnique({
+      where: { id },
+      include: {
+        services: true,
+      },
+    });
+
     if (!existing) throw new NotFoundException('appointment bulunamadı');
 
-    // startAt değişiyorsa endAt’yi de service duration ile güncelle + overlap kontrol
-    let startAt: Date | undefined;
-    let endAt: Date | undefined;
+    const nextTenantId = ((dto as any).tenantId ?? existing.tenantId) as string;
+    const nextCustomerId = ((dto as any).customerId ?? existing.customerId) as string;
+    const nextServiceId = ((dto as any).serviceId ?? existing.serviceId) as string;
+    const nextStaffId = ((dto as any).staffId ?? existing.staffId) as string;
+
+    let nextDate = existing.date;
+    let nextTime = existing.time;
+    let nextEndTime = existing.endTime;
 
     if ((dto as any).startAt) {
-      const serviceId = (dto as any).serviceId ?? existing.serviceId;
-      const staffId = (dto as any).staffId ?? existing.staffId;
-      const tenantId = (dto as any).tenantId ?? existing.tenantId;
-
-      const service = await this.getServiceOrThrow(serviceId);
-      startAt = new Date(String((dto as any).startAt));
-      if (!this.isValidDate(startAt)) throw new BadRequestException('startAt geçersiz');
-      endAt = this.addMinutes(startAt, Number(service.duration));
+      const slot = await this.buildSlotParts((dto as any).startAt, nextServiceId);
 
       const conflict = await this.hasOverlap({
-        tenantId,
-        staffId,
-        startAt,
-        endAt,
+        tenantId: nextTenantId,
+        staffId: nextStaffId,
+        date: slot.date,
+        time: slot.time,
+        endTime: slot.endTime,
         excludeAppointmentId: id,
       });
 
       if (conflict) {
         const suggest = await this.nextAvailable({
-          tenantId,
-          staffId,
-          serviceId,
-          desiredStart: startAt,
+          tenantId: nextTenantId,
+          staffId: nextStaffId,
+          serviceId: nextServiceId,
+          desiredStart: slot.start,
           stepMinutes: 15,
           searchHours: 24,
           suggestions: 5,
         });
+
+        throw new ConflictException(suggest);
+      }
+
+      nextDate = slot.date;
+      nextTime = slot.time;
+      nextEndTime = slot.endTime;
+    } else if ((dto as any).serviceId) {
+      const service = await this.getServiceOrThrow(nextServiceId);
+      nextEndTime = this.minutesToTime(
+        this.timeToMinutes(existing.time) + Number(service.duration),
+      );
+
+      const conflict = await this.hasOverlap({
+        tenantId: nextTenantId,
+        staffId: nextStaffId,
+        date: existing.date,
+        time: existing.time,
+        endTime: nextEndTime,
+        excludeAppointmentId: id,
+      });
+
+      if (conflict) {
+        const desiredStart = new Date(
+          `${this.toTrDateString(existing.date)}T${existing.time}:00${TR_OFFSET}`,
+        );
+
+        const suggest = await this.nextAvailable({
+          tenantId: nextTenantId,
+          staffId: nextStaffId,
+          serviceId: nextServiceId,
+          desiredStart,
+          stepMinutes: 15,
+          searchHours: 24,
+          suggestions: 5,
+        });
+
         throw new ConflictException(suggest);
       }
     }
 
-    return this.prisma.appointment.update({
+    return this.prisma.appointments.update({
       where: { id },
       data: {
-        ...(dto as any),
-        ...(startAt ? { startAt } : {}),
-        ...(endAt ? { endAt } : {}),
+        tenantId: nextTenantId,
+        customerId: nextCustomerId,
+        serviceId: nextServiceId,
+        staffId: nextStaffId,
+        date: nextDate,
+        time: nextTime,
+        endTime: nextEndTime,
+        ...((dto as any).status !== undefined
+          ? { status: (dto as any).status }
+          : {}),
+      } as any,
+      include: {
+        customers: true,
+        services: true,
+        staff: true,
       },
-      include: { customer: true, service: true, staff: true },
     });
   }
 
   async remove(id: string) {
-    const existing = await this.prisma.appointment.findUnique({ where: { id } });
+    const existing = await this.prisma.appointments.findUnique({
+      where: { id },
+    });
+
     if (!existing) throw new NotFoundException('appointment bulunamadı');
 
-    // Silmek yerine iptal istersen burada status=canceled yaparız
-    return this.prisma.appointment.delete({ where: { id } });
+    return this.prisma.appointments.delete({
+      where: { id },
+    });
   }
 }
