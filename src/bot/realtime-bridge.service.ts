@@ -225,10 +225,12 @@ class VoiceBridgeSession {
   private activeResponse = false;
 
   private speechEnergyFrames = 0;
-  private readonly speechEnergyThreshold = 1700;
-  private readonly speechFramesForBargeIn = 3;
-  private readonly assistantGuardMs = 120;
-  private readonly openingGreetingBargeInGuardMs = 700;
+  private lastObservedSpeechEnergy = 0;
+  private readonly speechEnergyThreshold = 2300;
+  private readonly speechFramesForBargeIn = 7;
+  private readonly speechFramesForSpeechStartedCancel = 5;
+  private readonly assistantGuardMs = 1400;
+  private readonly openingGreetingBargeInGuardMs = 1500;
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
@@ -257,6 +259,8 @@ class VoiceBridgeSession {
   private cachedServices: any[] | null = null;
   private lastGreetingSuppressedAt = 0;
   private lastOpeningGreetingIgnoreLogAt = 0;
+  private lastBargeInSuppressLogAt = 0;
+  private lastBargeInSuppressReason = '';
 
   // 20ms @ 8kHz μ-law = 160 bytes
   private readonly ulawFrameBytes = 160;
@@ -270,6 +274,7 @@ class VoiceBridgeSession {
   private readonly sessionStartedAt = Date.now();
   private readonly timings: Partial<Record<VoiceTimingStage, number>> = {};
   private openingGreetingProtectionUntil = 0;
+  private assistantPlaybackProtectionUntil = 0;
 
   constructor(
     private readonly agentService: VoiceAgentService,
@@ -510,18 +515,21 @@ class VoiceBridgeSession {
         this.parentLogger.log(
           `[voice] speech_started callId=${this.meta.callId}`,
         );
-        this.lastBargeInAt = Date.now();
-        if (
-          this.lastBotReplyText === RealtimeBridgeService.openingGreeting &&
-          Date.now() < this.openingGreetingProtectionUntil
-        ) {
-          this.logOpeningGreetingIgnore(
-            this.openingGreetingProtectionUntil - Date.now(),
+        const protectionRemaining = this.getAssistantProtectionMsRemaining();
+        if (protectionRemaining > 0) {
+          this.logBargeInSuppressed(
+            'inside_protection_window',
+            `protectionMsRemaining=${protectionRemaining}`,
           );
           return;
         }
         if (this.shouldInterruptAssistantOnSpeechStarted()) {
           this.cancelAssistantAudio('speech_started');
+        } else if (this.assistantSpeaking) {
+          this.logBargeInSuppressed(
+            'playback_guard',
+            `speechFrames=${this.speechEnergyFrames} rms=${this.lastObservedSpeechEnergy.toFixed(0)}`,
+          );
         }
         return;
 
@@ -563,6 +571,12 @@ class VoiceBridgeSession {
       rawTranscript,
       this.lastBotReplyText,
     );
+    if (!transcript) {
+      this.parentLogger.warn(
+        `[voice] normalized transcript empty after contamination filter callId=${this.meta.callId} raw="${rawTranscript}"`,
+      );
+      return;
+    }
 
     const merged = mergeVoiceFragments(
       this.pendingTranscriptText,
@@ -757,41 +771,68 @@ class VoiceBridgeSession {
   private handlePossibleBargeIn(payloadB64: string) {
     if (!this.assistantSpeaking) {
       this.openingGreetingProtectionUntil = 0;
+      this.assistantPlaybackProtectionUntil = 0;
       this.speechEnergyFrames = 0;
+      this.lastObservedSpeechEnergy = 0;
       return;
     }
 
     const now = Date.now();
-    const activeGuardMs =
-      this.lastBotReplyText === RealtimeBridgeService.openingGreeting
-        ? this.openingGreetingBargeInGuardMs
-        : this.assistantGuardMs;
-
-    if (now - this.assistantStartedAt < activeGuardMs) {
+    if (now - this.assistantStartedAt < this.assistantGuardMs) {
+      this.logBargeInSuppressed(
+        'playback_guard',
+        `elapsed=${now - this.assistantStartedAt}`,
+      );
       this.speechEnergyFrames = 0;
       return;
     }
 
-    if (
-      this.lastBotReplyText === RealtimeBridgeService.openingGreeting &&
-      now < this.openingGreetingProtectionUntil
-    ) {
-      this.logOpeningGreetingIgnore(this.openingGreetingProtectionUntil - now);
+    const protectionRemaining = this.getAssistantProtectionMsRemaining();
+    if (protectionRemaining > 0) {
+      this.logBargeInSuppressed(
+        'inside_protection_window',
+        `protectionMsRemaining=${protectionRemaining}`,
+      );
       this.speechEnergyFrames = 0;
       return;
     }
 
     const rms = pcmuBase64Rms(payloadB64);
+    this.lastObservedSpeechEnergy = rms;
 
     if (rms >= this.speechEnergyThreshold) {
       this.speechEnergyFrames += 1;
     } else {
+      if (rms > 0) {
+        this.logBargeInSuppressed(
+          'below_threshold',
+          `rms=${rms.toFixed(0)} threshold=${this.speechEnergyThreshold}`,
+        );
+      }
       this.speechEnergyFrames = 0;
+      return;
+    }
+
+    if (this.speechEnergyFrames < this.speechFramesForBargeIn) {
+      this.logBargeInSuppressed(
+        'too_short',
+        `frames=${this.speechEnergyFrames}/${this.speechFramesForBargeIn} rms=${rms.toFixed(0)}`,
+      );
+      return;
+    }
+
+    if (now - this.lastAssistantAudioAt < 240) {
+      this.logBargeInSuppressed(
+        'probable_echo',
+        `sinceAssistantAudio=${now - this.lastAssistantAudioAt} rms=${rms.toFixed(0)}`,
+      );
+      this.speechEnergyFrames = 0;
+      return;
     }
 
     if (this.speechEnergyFrames >= this.speechFramesForBargeIn) {
       this.parentLogger.warn(
-        `[voice] barge-in detected callId=${this.meta.callId} rms=${rms.toFixed(0)}`,
+        `[voice] barge-in detected callId=${this.meta.callId} rms=${rms.toFixed(0)} frames=${this.speechEnergyFrames}`,
       );
       this.lastBargeInAt = Date.now();
       this.cancelAssistantAudio('barge_in');
@@ -800,17 +841,24 @@ class VoiceBridgeSession {
   }
 
   private shouldPassInboundDuringAssistant(payloadB64: string) {
-    if (
-      this.lastBotReplyText === RealtimeBridgeService.openingGreeting &&
-      Date.now() < this.openingGreetingProtectionUntil
-    ) {
-      this.logOpeningGreetingIgnore(
-        this.openingGreetingProtectionUntil - Date.now(),
+    const protectionRemaining = this.getAssistantProtectionMsRemaining();
+    if (protectionRemaining > 0) {
+      this.logBargeInSuppressed(
+        'inside_protection_window',
+        `protectionMsRemaining=${protectionRemaining}`,
       );
       return false;
     }
 
     const rms = pcmuBase64Rms(payloadB64);
+    this.lastObservedSpeechEnergy = rms;
+    if (rms < this.speechEnergyThreshold) {
+      this.logBargeInSuppressed(
+        'below_threshold',
+        `rms=${rms.toFixed(0)} threshold=${this.speechEnergyThreshold}`,
+      );
+      return false;
+    }
     return rms >= this.speechEnergyThreshold;
   }
 
@@ -864,6 +912,8 @@ class VoiceBridgeSession {
     if (!this.assistantSpeaking) return false;
 
     const elapsed = Date.now() - this.assistantStartedAt;
+    if (this.getAssistantProtectionMsRemaining() > 0) return false;
+
     const remaining = Math.max(
       this.currentPlaybackDurationMs -
         Math.floor(this.currentPlaybackOffsetBytes / this.ulawFrameBytes) *
@@ -872,10 +922,25 @@ class VoiceBridgeSession {
     );
     const shortReply = this.lastBotReplyText.length <= 42;
 
-    if (elapsed < 260) return false;
+    if (elapsed < this.assistantGuardMs) return false;
+    if (this.speechEnergyFrames < this.speechFramesForSpeechStartedCancel)
+      return false;
+    if (this.lastObservedSpeechEnergy < this.speechEnergyThreshold) return false;
     if (shortReply && remaining < 700) return false;
-    if (remaining > 0 && remaining < 220) return false;
+    if (remaining > 0 && remaining < 500) return false;
+    if (Date.now() - this.lastAssistantAudioAt < 240) return false;
     return true;
+  }
+
+  private getAssistantProtectionMsRemaining() {
+    const now = Date.now();
+    const protectionUntil = Math.max(
+      this.assistantPlaybackProtectionUntil,
+      this.lastBotReplyText === RealtimeBridgeService.openingGreeting
+        ? this.openingGreetingProtectionUntil
+        : 0,
+    );
+    return protectionUntil > now ? protectionUntil - now : 0;
   }
 
   private logOpeningGreetingIgnore(protectionMsRemaining: number) {
@@ -884,6 +949,27 @@ class VoiceBridgeSession {
     this.lastOpeningGreetingIgnoreLogAt = now;
     this.parentLogger.log(
       `[voice] opening_greeting_barge_in_ignored callId=${this.meta.callId} protectionMsRemaining=${protectionMsRemaining}`,
+    );
+  }
+
+  private logBargeInSuppressed(reason: string, detail?: string) {
+    const now = Date.now();
+    if (
+      reason === 'inside_protection_window' &&
+      this.lastBotReplyText === RealtimeBridgeService.openingGreeting
+    ) {
+      this.logOpeningGreetingIgnore(this.getAssistantProtectionMsRemaining());
+    }
+    if (
+      now - this.lastBargeInSuppressLogAt < 900 &&
+      this.lastBargeInSuppressReason === reason
+    ) {
+      return;
+    }
+    this.lastBargeInSuppressLogAt = now;
+    this.lastBargeInSuppressReason = reason;
+    this.parentLogger.log(
+      `[voice] barge-in suppressed callId=${this.meta.callId} reason=${reason}${detail ? ` ${detail}` : ''}`,
     );
   }
 
@@ -1168,6 +1254,9 @@ class VoiceBridgeSession {
     this.activeResponse = false;
     this.currentPlaybackDurationMs = 0;
     this.currentPlaybackOffsetBytes = 0;
+    this.assistantPlaybackProtectionUntil = 0;
+    this.openingGreetingProtectionUntil = 0;
+    this.lastObservedSpeechEnergy = 0;
   }
 
   private async callAgentBrain(
@@ -1472,38 +1561,14 @@ class VoiceBridgeSession {
       patterns: RegExp[];
     }> = [
       {
-        key: 'greeting',
-        reply: 'Buyurun, dinliyorum.',
-        patterns: [
-          /^(alo|merhaba|selam|iyi gunler|iyi aksamlar|gunaydin)[.!? ]*$/,
-        ],
-      },
-      {
         key: 'voice_check',
         reply: 'Evet, sizi duyuyorum.',
         patterns: [
           /^sesim geliyor mu[.!? ]*$/,
           /^beni duyuyor musunuz[.!? ]*$/,
           /^sesim duyuluyor mu[.!? ]*$/,
-        ],
-      },
-      {
-        key: 'info_request',
-        reply: 'Tabii, hangi konuda bilgi almak istersiniz?',
-        patterns: [
-          /^bilgi almak istiyorum[.!? ]*$/,
-          /^bilgi verebilir misiniz[.!? ]*$/,
-        ],
-      },
-      {
-        key: 'services',
-        reply:
-          'Lazer epilasyon, cilt bakımı, protez tırnak, saç, kaş ve kirpik işlemlerimiz var. Hangisiyle ilgileniyorsunuz?',
-        patterns: [
-          /^hangi hizmetler var[.!? ]*$/,
-          /^hangi hizmetleriniz var[.!? ]*$/,
-          /^ne gibi hizmetler var[.!? ]*$/,
-          /^hangi islemler var[.!? ]*$/,
+          /^ses geliyor mu[.!? ]*$/,
+          /^beni duyabiliyor musunuz[.!? ]*$/,
         ],
       },
     ];
@@ -1657,6 +1722,8 @@ class VoiceBridgeSession {
           this.logTurnLatency('assistant_first_audio_streaming', turnId, {
             ttsBufferedBytes: totalBytes,
           });
+          this.assistantPlaybackProtectionUntil =
+            this.lastAssistantAudioAt + this.assistantGuardMs;
           if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
             this.openingGreetingProtectionUntil =
               this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
@@ -1689,6 +1756,8 @@ class VoiceBridgeSession {
           this.logTurnLatency('assistant_first_audio_streaming', turnId, {
             ttsBufferedBytes: totalBytes,
           });
+          this.assistantPlaybackProtectionUntil =
+            this.lastAssistantAudioAt + this.assistantGuardMs;
         }
         this.sendBridge({
           event: 'media',
@@ -1772,6 +1841,8 @@ class VoiceBridgeSession {
           this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
       }
       if (offset === 0) {
+        this.assistantPlaybackProtectionUntil =
+          this.lastAssistantAudioAt + this.assistantGuardMs;
         this.markTiming('final_audio_send_start', {
           bytes: buf.length,
           streaming: false,
@@ -1870,11 +1941,12 @@ function extractReplyText(result: any): string {
   return '';
 }
 
-function normalizeTranscriptForAgent(
+export function normalizeTranscriptForAgent(
   raw: string,
   lastBotReplyText: string,
 ): string {
-  let text = String(raw || '').trim();
+  let text = stripTranscriptContamination(String(raw || '').trim());
+  if (!text) return '';
 
   text = text
     .replace(/[“”"']/g, '')
@@ -2155,7 +2227,7 @@ function detectRecentIntent(
   return 'general';
 }
 
-function rewriteAgentReplyForVoice(replyText: string) {
+export function rewriteAgentReplyForVoice(replyText: string) {
   let text = sanitizeReplyForVoice(String(replyText || '').trim())
     .replace(/yazar mısınız/gi, 'söyler misiniz')
     .replace(/yazar misiniz/gi, 'söyler misiniz')
@@ -2216,8 +2288,11 @@ function rewriteAgentReplyForVoice(replyText: string) {
   return text;
 }
 
-function shortenReplyForPhone(text: string) {
-  let out = String(text || '')
+export function shortenReplyForPhone(text: string) {
+  const original = String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  let out = original
     .replace(/\s+/g, ' ')
     .trim();
   if (!out) return out;
@@ -2249,7 +2324,82 @@ function shortenReplyForPhone(text: string) {
     if (!/[.!?]$/.test(out)) out += '.';
   }
 
+  if (isUselessShortAck(out) && shouldPreserveMeaningfulReply(original)) {
+    return preserveMeaningfulReply(original);
+  }
+
   return out.replace(/\s{2,}/g, ' ').trim();
+}
+
+function stripTranscriptContamination(text: string) {
+  let cleaned = String(text || '').trim();
+  if (!cleaned) return '';
+
+  const contaminationPatterns = [
+    /\b(guzellik merkezi|güzellik merkezi),?\s*randevu,?\s*rezervasyon\b/gi,
+    /\bben guzellik merkezinden ariyorum\b/gi,
+    /\bben güzellik merkezinden arıyorum\b/gi,
+    /\bsesli yapay zeka asistaniyim\b/gi,
+    /\bsesli yapay zeka asistanıyım\b/gi,
+    /\bsize nasil yardimci olabilirim\b/gi,
+    /\bsize nasıl yardımcı olabilirim\b/gi,
+    /\byou are the voice layer\b/gi,
+    /\byalnizca uygulamanin verdigi yaniti oku\b/gi,
+    /\byalnızca uygulamanın verdiği yanıtı oku\b/gi,
+  ];
+
+  for (const pattern of contaminationPatterns) {
+    cleaned = cleaned.replace(pattern, ' ');
+  }
+
+  cleaned = cleaned
+    .replace(/^[\s,.;:!?-]+|[\s,.;:!?-]+$/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  if (!cleaned) return '';
+
+  const normalized = normalizeVoiceComparisonText(cleaned);
+  const contaminationOnlyPatterns = [
+    /^guzellik merkezi randevu rezervasyon(?: [a-zçğıöşü]+){0,6}$/i,
+    /^ben guzellik merkezinden ariyorum(?: [a-zçğıöşü]+){0,6}$/i,
+    /^sesli yapay zeka asistaniyim(?: [a-zçğıöşü]+){0,6}$/i,
+  ];
+  if (contaminationOnlyPatterns.some((pattern) => pattern.test(normalized))) {
+    return '';
+  }
+
+  return cleaned;
+}
+
+function isUselessShortAck(text: string) {
+  return /^(tamam|tamamdir|tamamdır|peki|tabii|tabi|olur|anladim|anladım)\.?$/i.test(
+    String(text || '').trim(),
+  );
+}
+
+function shouldPreserveMeaningfulReply(text: string) {
+  const normalized = normalizeVoiceComparisonText(text);
+  if (!normalized || isUselessShortAck(normalized)) return false;
+  if (/\?$/.test(text)) return true;
+  if (/\b(nasil|nasıl|hangi|ne zaman|neden|icin|için|fiyat|ucret|ücret|saat|adres|randevu|rezervasyon|yardimci|yardımcı)\b/i.test(text)) {
+    return true;
+  }
+  return normalized.split(/\s+/).filter(Boolean).length >= 4;
+}
+
+function preserveMeaningfulReply(text: string) {
+  const sentenceParts = String(text || '')
+    .split(/(?<=[.!?])\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  let preserved = sentenceParts.slice(0, 2).join(' ').trim();
+  if (preserved.length > 160) {
+    preserved = preserved.slice(0, 160).trim();
+    preserved = preserved.replace(/[,:;\s]+$/g, '');
+    if (!/[.!?]$/.test(preserved)) preserved += '.';
+  }
+  return preserved || String(text || '').trim();
 }
 
 function formatDateForSpeech(dateText: string, now = new Date()) {
