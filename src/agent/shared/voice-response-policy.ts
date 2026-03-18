@@ -62,7 +62,7 @@ export function shapeVoiceAgentReply(reply: string): string {
   }
 
   return deduped
-    .slice(0, 2)
+    .slice(0, 1)
     .map((sentence) =>
       ensureTerminalPunctuation(sentence, /\?$/.test(sentence) ? '?' : '.'),
     )
