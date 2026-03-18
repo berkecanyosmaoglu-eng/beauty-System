@@ -278,9 +278,7 @@ class VoiceBridgeSession {
   private readonly ulawFrameBytes = 160;
   private readonly ulawFrameMs = 20;
   private readonly minBufferedAudioChunkBytes = 640;
-  private readonly realtimeTtsStreamingEnabled =
-    String(process.env.VOICE_TTS_STREAMING_ENABLED || 'true').toLowerCase() !==
-    'false';
+  private readonly realtimeTtsStreamingEnabled = false;
 
   private readonly ghostRegex =
     /^(ad[ií]os|bye|bye-bye|thank you|thank you very much|all y['’]all|hallo|hello)\.?$/i;
@@ -894,18 +892,15 @@ class VoiceBridgeSession {
     this.outboundAudioChunkCount += 1;
     this.outboundAudioByteCount += chunk.length;
 
-    if (this.debugVoice) {
-      this.parentLogger.debug(
-        `[voice] audio_chunk_sent callId=${this.meta.callId} source=${source} size=${chunk.length} chunkIndex=${this.outboundAudioChunkCount}`,
+    const now = Date.now();
+    const shouldLogChunk =
+      this.outboundAudioChunkCount === 1 ||
+      now - this.lastChunkSummaryLogAt >= 4000;
+    if (shouldLogChunk) {
+      this.lastChunkSummaryLogAt = now;
+      this.parentLogger.log(
+        `[voice-test] sendAudioChunk callId=${this.meta.callId} source=${source} chunkIndex=${this.outboundAudioChunkCount} bytes=${chunk.length} totalBytes=${this.outboundAudioByteCount}`,
       );
-    } else {
-      const now = Date.now();
-      if (now - this.lastChunkSummaryLogAt >= 4000) {
-        this.lastChunkSummaryLogAt = now;
-        this.parentLogger.debug(
-          `[voice] audio_stream_progress callId=${this.meta.callId} source=${source} chunks=${this.outboundAudioChunkCount} bytes=${this.outboundAudioByteCount}`,
-        );
-      }
     }
 
     const sent = this.sendBridge({
@@ -913,17 +908,11 @@ class VoiceBridgeSession {
       media: { payload: chunk.toString('base64') },
     });
 
-    if (!sent) {
+    if (sent !== true) {
       this.parentLogger.warn(
         `[voice] playback_skipped callId=${this.meta.callId} reason=bridge_send_failed source=${source} chunkSize=${chunk.length}`,
       );
       return;
-    }
-
-    if (this.debugVoice || this.outboundAudioChunkCount === 1) {
-      this.parentLogger.log(
-        `[voice] audio_chunk_written callId=${this.meta.callId} source=${source} size=${chunk.length} chunkIndex=${this.outboundAudioChunkCount}`,
-      );
     }
   }
 
@@ -952,29 +941,10 @@ class VoiceBridgeSession {
     }
   }
 
-  private shouldPassInboundDuringAssistant(payloadB64: string) {
-    const protectionRemaining = this.getAssistantProtectionMsRemaining();
-    if (protectionRemaining > 0) {
-      this.logBargeInSuppressed(
-        'inside_protection_window',
-        `protectionMsRemaining=${protectionRemaining}`,
-      );
-      return false;
-    }
-
-    const rms = pcmuBase64Rms(payloadB64);
-    const threshold = this.getAdaptiveSpeechThreshold();
-    this.lastObservedSpeechEnergy = rms;
-    if (
-      rms < threshold ||
-      this.speechEnergyFrames < this.speechFramesForBargeIn
-    ) {
-      this.logBargeInSuppressed(
-        'below_threshold',
-        `rms=${this.formatEnergy(rms)} threshold=${threshold} frames=${this.speechEnergyFrames}`,
-      );
-      return false;
-    }
+  private shouldPassInboundDuringAssistant(_payloadB64: string) {
+    // Temporary stabilization mode: always allow inbound audio to continue to
+    // the realtime session while transcript guards prevent assistant echo from
+    // creating a new turn.
     return true;
   }
 
