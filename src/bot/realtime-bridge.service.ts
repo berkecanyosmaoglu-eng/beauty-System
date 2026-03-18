@@ -36,6 +36,22 @@ type OpenAiEvent = {
   [key: string]: any;
 };
 
+type VoiceTimingStage =
+  | 'websocket_connected'
+  | 'openai_connected'
+  | 'session_created'
+  | 'session_updated'
+  | 'first_greeting_started'
+  | 'speech_started'
+  | 'speech_stopped'
+  | 'transcript_normalized'
+  | 'agent_processing_start'
+  | 'agent_reply_ready'
+  | 'elevenlabs_request_start'
+  | 'elevenlabs_first_byte'
+  | 'elevenlabs_success'
+  | 'final_audio_send_start';
+
 @Injectable()
 export class RealtimeBridgeService {
   private readonly logger = new Logger(RealtimeBridgeService.name);
@@ -88,6 +104,9 @@ class VoiceBridgeSession {
 
   private sessionReady = false;
   private greeted = false;
+  private bridgeReady = false;
+  private greetingInFlight = false;
+  private turnSequence = 0;
 
   private lastAssistantAudioAt = 0;
   private assistantSpeaking = false;
@@ -116,6 +135,8 @@ class VoiceBridgeSession {
 
   private readonly ghostRegex =
     /^(ad[ií]os|bye|bye-bye|thank you|thank you very much|all y['’]all|hallo|hello|alo)\.?$/i;
+  private readonly sessionStartedAt = Date.now();
+  private readonly timings: Partial<Record<VoiceTimingStage, number>> = {};
 
   constructor(
     private readonly agentService: VoiceAgentService,
@@ -129,6 +150,8 @@ class VoiceBridgeSession {
   }
 
   start() {
+    this.markTiming('websocket_connected');
+
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       this.parentLogger.error('[voice] OPENAI_API_KEY missing');
@@ -144,6 +167,7 @@ class VoiceBridgeSession {
     });
 
     this.openaiWs.on('open', () => {
+      this.markTiming('openai_connected');
       this.parentLogger.log(
         `[voice] OpenAI realtime connected callId=${this.meta.callId}`,
       );
@@ -250,9 +274,11 @@ class VoiceBridgeSession {
     }
 
     if (msg.event === 'start') {
+      this.bridgeReady = true;
       this.parentLogger.log(
         `[voice] bridge start callId=${this.meta.callId} tenantId=${this.meta.tenantId}`,
       );
+      this.maybeStartOpeningGreeting();
       return;
     }
 
@@ -290,6 +316,7 @@ class VoiceBridgeSession {
   private async onOpenAiEvent(evt: OpenAiEvent) {
     switch (evt.type) {
       case 'session.created':
+        this.markTiming('session_created');
         this.parentLogger.log(
           `[voice] session.created callId=${this.meta.callId}`,
         );
@@ -297,19 +324,11 @@ class VoiceBridgeSession {
 
       case 'session.updated':
         this.sessionReady = true;
+        this.markTiming('session_updated');
         this.parentLogger.log(
           `[voice] session.updated callId=${this.meta.callId}`,
         );
-
-        if (!this.greeted) {
-          this.greeted = true;
-          const openingGreeting =
-            'Merhaba, ben işletmenin sesli asistanıyım. Size nasıl yardımcı olabilirim?';
-          this.parentLogger.log(
-            `[voice] opening_greeting callId=${this.meta.callId} text="${openingGreeting}"`,
-          );
-          await this.speakReply(openingGreeting);
-        }
+        this.maybeStartOpeningGreeting();
         return;
 
       case 'response.created':
@@ -370,12 +389,18 @@ class VoiceBridgeSession {
         this.lastTranscriptAt = Date.now();
         this.lastTranscriptText = transcript;
         this.lastTranscriptNorm = norm;
+        const turnId = ++this.turnSequence;
+        this.markTiming('transcript_normalized', {
+          turnId,
+          rawLength: rawTranscript.length,
+          normalizedLength: transcript.length,
+        });
 
         this.parentLogger.log(
           `[voice] transcript normalized callId=${this.meta.callId} raw="${rawTranscript}" normalized="${transcript}"`,
         );
 
-        const reply = await this.callAgentBrain(transcript);
+        const reply = await this.callAgentBrain(transcript, turnId);
         if (!reply) return;
 
         await this.speakReply(reply);
@@ -383,6 +408,7 @@ class VoiceBridgeSession {
       }
 
       case 'input_audio_buffer.speech_started':
+        this.markTiming('speech_started');
         this.parentLogger.log(
           `[voice] speech_started callId=${this.meta.callId}`,
         );
@@ -393,6 +419,7 @@ class VoiceBridgeSession {
 
       case 'input_audio_buffer.speech_stopped':
         this.lastSpeechStoppedAt = Date.now();
+        this.markTiming('speech_stopped');
         this.parentLogger.log(
           `[voice] speech_stopped callId=${this.meta.callId}`,
         );
@@ -483,6 +510,51 @@ class VoiceBridgeSession {
     return rms >= this.speechEnergyThreshold;
   }
 
+  private maybeStartOpeningGreeting() {
+    if (
+      !this.sessionReady ||
+      !this.bridgeReady ||
+      this.greeted ||
+      this.greetingInFlight
+    ) {
+      return;
+    }
+
+    this.greeted = true;
+    this.greetingInFlight = true;
+
+    const openingGreeting = 'Merhaba, nasıl yardımcı olabilirim?';
+    this.markTiming('first_greeting_started', {
+      textLength: openingGreeting.length,
+    });
+    this.parentLogger.log(
+      `[voice] opening_greeting callId=${this.meta.callId} text="${openingGreeting}"`,
+    );
+
+    void this.speakReply(openingGreeting).finally(() => {
+      this.greetingInFlight = false;
+    });
+  }
+
+  private markTiming(
+    stage: VoiceTimingStage,
+    extra: Record<string, unknown> = {},
+  ) {
+    const now = Date.now();
+    const prev = this.timings[stage];
+    this.timings[stage] = now;
+
+    const sinceSessionStart = now - this.sessionStartedAt;
+    const sincePrevSameStage = prev ? now - prev : 0;
+    const sinceSpeechStopped = this.lastSpeechStoppedAt
+      ? now - this.lastSpeechStoppedAt
+      : undefined;
+
+    this.parentLogger.log(
+      `[voice][timing] stage=${stage} callId=${this.meta.callId} t=${sinceSessionStart}ms delta=${sincePrevSameStage}ms${sinceSpeechStopped != null ? ` sinceSpeechStopped=${sinceSpeechStopped}ms` : ''}${serializeTimingExtras(extra)}`,
+    );
+  }
+
   private cancelAssistantAudio(
     reason: 'barge_in' | 'speech_started' | 'new_reply' | 'close' = 'new_reply',
   ) {
@@ -517,12 +589,25 @@ class VoiceBridgeSession {
     this.activeResponse = false;
   }
 
-  private async callAgentBrain(userText: string): Promise<string> {
+  private async callAgentBrain(
+    userText: string,
+    turnId?: number,
+  ): Promise<string> {
+    this.markTiming('agent_processing_start', {
+      turnId,
+      inputLength: userText.length,
+    });
+
     const greeting = this.buildDeterministicGreetingReply(userText);
     if (greeting) {
       this.parentLogger.log(
         `[voice] deterministic_greeting callId=${this.meta.callId} text="${greeting}"`,
       );
+      this.markTiming('agent_reply_ready', {
+        turnId,
+        source: 'deterministic_greeting',
+        replyLength: greeting.length,
+      });
       return greeting;
     }
 
@@ -569,6 +654,11 @@ class VoiceBridgeSession {
       this.parentLogger.log(
         `[voice] agent reply callId=${this.meta.callId} customerPhone=${customerPhone} reply="${reply}"`,
       );
+      this.markTiming('agent_reply_ready', {
+        turnId,
+        source: 'agent',
+        replyLength: reply.length,
+      });
 
       return (
         reply ||
@@ -580,13 +670,16 @@ class VoiceBridgeSession {
           err?.stack || err?.message || err
         }`,
       );
+      this.markTiming('agent_reply_ready', {
+        turnId,
+        source: 'agent_error',
+      });
       return 'Üzgünüm, kısa bir teknik aksaklık oldu. Tekrar söyler misiniz?';
     }
   }
 
   private async speakReply(replyText: string) {
-    const openingGreeting =
-      'Merhaba, ben işletmenin sesli asistanıyım. Size nasıl yardımcı olabilirim?';
+    const openingGreeting = 'Merhaba, nasıl yardımcı olabilirim?';
     const rewritten = rewriteAgentReplyForVoice(replyText);
     const spoken =
       rewritten === openingGreeting
@@ -610,6 +703,9 @@ class VoiceBridgeSession {
 
     try {
       const token = ++this.playbackToken;
+      this.markTiming('elevenlabs_request_start', {
+        textLength: clean.length,
+      });
       const audioBuffer = await this.generateElevenLabsAudio(clean);
 
       if (audioBuffer && token === this.playbackToken) {
@@ -660,14 +756,19 @@ class VoiceBridgeSession {
             model_id: modelId,
             language_code: 'tr',
             voice_settings: {
-              stability: 0.35,
+              stability: 0.28,
               similarity_boost: 0.8,
-              speed: 1.08,
+              speed: 1.12,
             },
           }),
           signal: controller.signal,
         },
       );
+
+      this.markTiming('elevenlabs_first_byte', {
+        status: response.status,
+        ok: response.ok,
+      });
 
       if (!response.ok) {
         const bodyText = await response.text();
@@ -678,7 +779,9 @@ class VoiceBridgeSession {
       }
 
       const arrayBuffer = await response.arrayBuffer();
-      return Buffer.from(arrayBuffer);
+      const audioBuffer = Buffer.from(arrayBuffer);
+      this.markTiming('elevenlabs_success', { bytes: audioBuffer.length });
+      return audioBuffer;
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         this.parentLogger.warn(
@@ -724,6 +827,9 @@ class VoiceBridgeSession {
       }
 
       this.lastAssistantAudioAt = Date.now();
+      if (offset === 0) {
+        this.markTiming('final_audio_send_start', { bytes: buf.length });
+      }
 
       this.sendBridge({
         event: 'media',
@@ -1048,13 +1154,19 @@ function shortenReplyForPhone(text: string) {
     return `Toplam ${numberedItems.length} seçenek var. İstersen ilk iki uygun olanı söyleyebilirim.`;
   }
 
-  if (out.length > 220) {
-    const short = out
-      .split(/(?<=[.!?])\s+/)
-      .slice(0, 2)
-      .join(' ')
-      .trim();
-    out = short || out.slice(0, 220);
+  const sentenceParts = out
+    .split(/(?<=[.!?])\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (sentenceParts.length > 1) {
+    out = sentenceParts[0] || out;
+  }
+
+  if (out.length > 140) {
+    out = out.slice(0, 140).trim();
+    out = out.replace(/[,:;\s]+$/g, '');
+    if (!/[.!?]$/.test(out)) out += '.';
   }
 
   return out.replace(/\s{2,}/g, ' ').trim();
@@ -1128,4 +1240,15 @@ function ulawToLinear16(uVal: number) {
   let sample = ((mantissa << 3) + 0x84) << exponent;
   sample -= 0x84;
   return sign ? -sample : sample;
+}
+
+function serializeTimingExtras(extra: Record<string, unknown>) {
+  const entries = Object.entries(extra).filter(
+    ([, value]) => value !== undefined,
+  );
+  if (!entries.length) return '';
+
+  return entries
+    .map(([key, value]) => ` ${key}=${JSON.stringify(value)}`)
+    .join('');
 }
