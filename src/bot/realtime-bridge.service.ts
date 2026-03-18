@@ -1916,19 +1916,6 @@ function normalizeTranscriptForAgent(
     return text;
   }
 
-  const askedStaff =
-    lastBot.includes('hangi personel') ||
-    lastBot.includes('kiminle olsun') ||
-    lastBot.includes('isim söyleyebilirsiniz');
-  if (askedStaff) {
-    return text
-      .replace(/\bhan[ıi]m\b/gi, '')
-      .replace(/\bbey\b/gi, '')
-      .replace(/[.!?]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
   const askedTime =
     lastBot.includes('uygun saati') ||
     lastBot.includes('saat kaç') ||
@@ -1955,9 +1942,7 @@ function normalizeTranscriptForAgent(
 }
 
 function isCriticalVoiceState(state?: string | null) {
-  return (
-    state === 'WAIT_NAME' || state === 'WAIT_DATETIME' || state === 'WAIT_STAFF'
-  );
+  return state === 'WAIT_NAME' || state === 'WAIT_DATETIME';
 }
 
 export function shouldBufferShortVoiceTranscript(
@@ -1968,7 +1953,6 @@ export function shouldBufferShortVoiceTranscript(
   const normalized = normalizeTurkishForTime(transcript);
   if (!normalized) return false;
   if (state === 'WAIT_NAME') return normalized.length <= 12;
-  if (state === 'WAIT_STAFF') return normalized.length <= 18;
   if (state === 'WAIT_DATETIME') return normalized.length <= 20;
   return false;
 }
@@ -1986,8 +1970,7 @@ export function mergeVoiceFragments(
   const prevNorm = normalizeTurkishForTime(prev);
   const nextNorm = normalizeTurkishForTime(next);
   if (!prevNorm || !nextNorm || prevNorm === nextNorm) return next;
-  if (state === 'WAIT_NAME' || state === 'WAIT_STAFF')
-    return `${prev} ${next}`.trim();
+  if (state === 'WAIT_NAME') return `${prev} ${next}`.trim();
   if (state === 'WAIT_DATETIME') return `${prev} ${next}`.trim();
   return next;
 }
@@ -2182,10 +2165,6 @@ function rewriteAgentReplyForVoice(replyText: string) {
 
   if (lower.startsWith('randevu özeti:')) {
     return 'Bilgiler doğruysa onaylayayım mı?';
-  }
-
-  if (lower.includes('kiminle olsun') || lower.includes('hangi personeli')) {
-    return 'Hangi personeli tercih edersiniz? İsim söyleyebilirsiniz ya da fark etmez diyebilirsiniz.';
   }
 
   if (lower.includes('o saat dolu') || lower.includes('şunlar uygun')) {
@@ -2415,7 +2394,6 @@ function humanizeBookingSummaryForSpeech(text: string) {
   const hasBookingSignal =
     lower.includes('randevu özeti') ||
     lower.includes('hizmet') ||
-    lower.includes('personel') ||
     lower.includes('tarih') ||
     lower.includes('saat') ||
     lower.includes('isim');
@@ -2425,13 +2403,11 @@ function humanizeBookingSummaryForSpeech(text: string) {
   }
 
   const service = source.match(/hizmet\s*[:\-]\s*([^,.\n]+)/i)?.[1]?.trim();
-  const staff = source.match(/personel\s*[:\-]\s*([^,.\n]+)/i)?.[1]?.trim();
   const customer = source.match(/isim\s*[:\-]\s*([^,.\n]+)/i)?.[1]?.trim();
   const dateTime = source.match(/(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})/);
 
   const summaryParts: string[] = [];
   if (service) summaryParts.push(`${service} için`);
-  if (staff) summaryParts.push(`${staff}'la`);
   if (dateTime) {
     summaryParts.push(formatDateTimeForSpeech(`${dateTime[1]} ${dateTime[2]}`));
   }
@@ -2443,9 +2419,7 @@ function humanizeBookingSummaryForSpeech(text: string) {
     return source;
   }
 
-  const summary = staff
-    ? `${service || 'Randevunuzu'} için randevunuzu ${staff}'a ${dateTime ? formatDateTimeForSpeech(`${dateTime[1]} ${dateTime[2]}`) : 'uygun bir saate'} oluşturalım mı?`
-    : `${summaryParts.join(', ')} uygun görünüyor.`;
+  const summary = `${summaryParts.join(', ')} uygun görünüyor.`;
   const questionMatch = source.match(/[^.?!]*\?/g);
   const question = questionMatch?.length
     ? humanizeConfirmationForSpeech(
