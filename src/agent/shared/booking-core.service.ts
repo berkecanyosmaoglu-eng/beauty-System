@@ -1900,18 +1900,13 @@ export class BookingCoreService {
 
     if (session.state === WaState.WAIT_NAME) {
       if (!session.draft.customerName) {
-        const maybeName = extractName(raw);
-        const looksLikeStaffName = staff?.some(
-          (p: any) =>
-            normalizePersonName(String(p?.name || '')) ===
-            normalizePersonName(raw),
-        );
-        if (
-          !looksLikeStaffName &&
-          maybeName &&
-          this.shouldCaptureCustomerName(raw, maybeName, isVoice)
-        )
-          session.draft.customerName = maybeName;
+        this.trySaveCustomerNameFromVoiceInput({
+          session,
+          raw,
+          staff,
+          isVoice,
+          source: 'wait_name',
+        });
       }
 
       if (!session.draft.customerName)
@@ -4164,22 +4159,17 @@ ${historyText}
       }
     }
 
-    const maybeName = extractName(raw);
-    const looksLikeStaffName = staff?.some(
-      (p: any) =>
-        normalizePersonName(String(p?.name || '')) === normalizePersonName(raw),
-    );
     const canCaptureName =
       session.state === WaState.WAIT_NAME ||
       looksLikeExplicitNameStatement(raw);
-    if (
-      !draft.customerName &&
-      canCaptureName &&
-      !looksLikeStaffName &&
-      maybeName &&
-      this.shouldCaptureCustomerName(raw, maybeName, isVoice)
-    ) {
-      draft.customerName = maybeName;
+    if (!draft.customerName && canCaptureName) {
+      this.trySaveCustomerNameFromVoiceInput({
+        session,
+        raw,
+        staff,
+        isVoice,
+        source: 'slot_extraction',
+      });
     }
 
     this.updateContinuityMemory(session, services, staff);
@@ -4234,6 +4224,86 @@ ${historyText}
   ) {
     if (!isVoice) return true;
     return isLikelyMeaningfulVoiceName(raw, maybeName);
+  }
+
+  private trySaveCustomerNameFromVoiceInput(opts: {
+    session: SessionState;
+    raw: string;
+    staff: any[];
+    isVoice: boolean;
+    source: 'wait_name' | 'slot_extraction';
+  }) {
+    const { session, raw, staff, isVoice, source } = opts;
+    if (session.draft.customerName) return session.draft.customerName;
+
+    const candidate = isVoice
+      ? extractVoiceCustomerName(raw)
+      : extractName(raw);
+
+    if (!candidate) {
+      this.logAction('name_candidate_rejected', {
+        tenantId: session.draft.tenantId,
+        phone: session.draft.customerPhone,
+        state: session.state,
+        source,
+        raw,
+        reason: 'no_candidate',
+      });
+      return null;
+    }
+
+    this.logAction('name_candidate_detected', {
+      tenantId: session.draft.tenantId,
+      phone: session.draft.customerPhone,
+      state: session.state,
+      source,
+      raw,
+      candidate,
+      reason: isVoice ? 'voice_parser' : 'generic_parser',
+    });
+
+    const candidateNorm = normalizePersonName(candidate);
+    const looksLikeStaffName = staff?.some(
+      (p: any) =>
+        normalizePersonName(String(p?.name || '')) === candidateNorm ||
+        normalizePersonName(String(p?.fullName || '')) === candidateNorm,
+    );
+    if (looksLikeStaffName) {
+      this.logAction('name_candidate_rejected', {
+        tenantId: session.draft.tenantId,
+        phone: session.draft.customerPhone,
+        state: session.state,
+        source,
+        raw,
+        candidate,
+        reason: 'matches_staff_name',
+      });
+      return null;
+    }
+
+    if (!this.shouldCaptureCustomerName(raw, candidate, isVoice)) {
+      this.logAction('name_candidate_rejected', {
+        tenantId: session.draft.tenantId,
+        phone: session.draft.customerPhone,
+        state: session.state,
+        source,
+        raw,
+        candidate,
+        reason: 'failed_capture_rules',
+      });
+      return null;
+    }
+
+    session.draft.customerName = candidate;
+    this.logAction('customer_name_saved', {
+      tenantId: session.draft.tenantId,
+      phone: session.draft.customerPhone,
+      state: session.state,
+      source,
+      raw,
+      candidate,
+    });
+    return candidate;
   }
 
   private shouldCaptureRequestedStaffName(
@@ -4897,7 +4967,7 @@ function looksLikeExplicitNameStatement(raw: string) {
 }
 
 function extractName(raw: string) {
-  const s = (raw || '').trim();
+  const s = stripVoiceContextMetadata(raw);
   if (!s) return null;
   if (s.length < 2) return null;
   if (/^\+?\d[\d\s-]+$/.test(s)) return null;
@@ -4942,6 +5012,43 @@ function extractName(raw: string) {
   return name;
 }
 
+function extractVoiceCustomerName(rawText: string): string | null {
+  const cleaned = sanitizeVoiceNameInput(rawText);
+  if (!cleaned) return null;
+
+  const normalized = normalizeTr(cleaned);
+  if (!normalized) return null;
+  if (normalized.includes('?')) return null;
+  if (containsRejectedVoiceNamePhrase(normalized)) return null;
+  if (/\d/.test(cleaned)) return null;
+
+  const withoutPrefix = cleaned.replace(
+    /^(ben(?:im)?(?: adim| adım)?|adim|adım|isim|ismim)\s+/i,
+    '',
+  );
+  const withoutHonorific = withoutPrefix.replace(
+    /\s+(hanim|hanım|bey|beyefendi|hanimefendi)$/i,
+    '',
+  );
+  const candidate = withoutHonorific.trim();
+  if (!candidate) return null;
+
+  const tokens = candidate
+    .split(/\s+/)
+    .map((token) => token.replace(/^[^\p{L}]+|[^\p{L}'’-]+$/gu, ''))
+    .filter(Boolean);
+  if (!tokens.length || tokens.length > 4) return null;
+  if (
+    !tokens.every(
+      (token) => /^[\p{L}][\p{L}'’-]{0,29}$/u.test(token) && token.length >= 2,
+    )
+  ) {
+    return null;
+  }
+
+  return formatSpokenName(tokens);
+}
+
 function extractLikelyStaffName(raw: string): string | null {
   const t = raw.trim();
   if (!t) return null;
@@ -4955,8 +5062,73 @@ function extractLikelyStaffName(raw: string): string | null {
   return candidate;
 }
 
+function stripVoiceContextMetadata(raw: string): string {
+  return String(raw || '')
+    .replace(/\[voice_context:[\s\S]*?\]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function sanitizeVoiceNameInput(raw: string): string {
+  return stripVoiceContextMetadata(raw)
+    .replace(/^[\s"'“”'`.,:;!?-]+|[\s"'“”'`.,:;!?-]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function containsRejectedVoiceNamePhrase(normalized: string): boolean {
+  const banned = [
+    'fark etmez',
+    'tamam',
+    'evet',
+    'hayir',
+    'hayır',
+    'jarvis',
+    'rezervasyon',
+    'randevu',
+    'yarin',
+    'yarın',
+    'bugun',
+    'bugün',
+    'ogle',
+    'öğle',
+    'aksam',
+    'akşam',
+    'musait',
+    'müsait',
+    'uygun',
+    'beni duyuyor musun',
+    'kimsiniz',
+    'sen kimsin',
+    'fiyati ne',
+    'fiyatı ne',
+    'hakaret',
+  ];
+  return banned.some(
+    (phrase) =>
+      normalized === normalizeTr(phrase) ||
+      normalized.includes(normalizeTr(phrase)),
+  );
+}
+
+function formatSpokenName(tokens: string[]): string {
+  return tokens
+    .map((token) =>
+      token
+        .split(/([-'’])/)
+        .map((part) =>
+          /[-'’]/.test(part)
+            ? part
+            : part.charAt(0).toLocaleUpperCase('tr-TR') +
+              part.slice(1).toLocaleLowerCase('tr-TR'),
+        )
+        .join(''),
+    )
+    .join(' ');
+}
+
 function isLikelyMeaningfulVoiceName(raw: string, maybeName: string): boolean {
-  const rawNorm = normalizeTr(raw);
+  const rawNorm = normalizeTr(stripVoiceContextMetadata(raw));
   const candidateNorm = normalizeTr(maybeName);
   if (!rawNorm || !candidateNorm) return false;
   if (candidateNorm.length < 2) return false;
@@ -4989,7 +5161,7 @@ function isLikelyMeaningfulVoiceName(raw: string, maybeName: string): boolean {
     return false;
 
   const words = candidateNorm.split(/\s+/).filter(Boolean);
-  if (!words.length || words.length > 3) return false;
+  if (!words.length || words.length > 4) return false;
   return words.every((word) => word.length >= 2);
 }
 

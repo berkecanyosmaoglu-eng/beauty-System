@@ -283,4 +283,169 @@ describe('BookingCoreService voice booking guards', () => {
     expect(session.draft.staffId).toBeUndefined();
     expect(reply).toMatch(/personel|fark etmez/i);
   });
+
+  it('accepts a single spoken first name in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Berkecan.',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Berkecan');
+    expect(session.state).toBe('WAIT_DATETIME');
+  });
+
+  it('accepts first and last name in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Erke Yosunoğlu.',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Erke Yosunoğlu');
+  });
+
+  it('accepts foreign names in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Jennifer Lopez.',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Jennifer Lopez');
+  });
+
+  it('strips honorifics from customer name in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Elif Hanım',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Elif');
+  });
+
+  it('rejects non-name acknowledgements in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'tamam',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBeUndefined();
+    expect(session.state).toBe('WAIT_NAME');
+    expect(reply).toMatch(/isim|ad soyad/i);
+  });
+
+  it('parses spoken name correctly even when voice_context metadata is present', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Berkecan.\n\n[voice_context: Yakın intent bağlamı: general.]',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Berkecan');
+  });
 });
