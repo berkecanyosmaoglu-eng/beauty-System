@@ -58,6 +58,14 @@ describe('RealtimeBridgeService voice transcript helpers', () => {
     expect(shortenReplyForPhone('Peki.')).toBe('Peki.');
   });
 
+  it('preserves a usable help prompt instead of collapsing to a bare acknowledgement', () => {
+    const spoken = shortenReplyForPhone(
+      rewriteAgentReplyForVoice('Size nasıl yardımcı olabilirim?'),
+    );
+
+    expect(spoken).toBe('Size nasıl yardımcı olabilirim?');
+  });
+
   it('filters assistant/system contamination from normalized transcripts', () => {
     expect(
       normalizeTranscriptForAgent(

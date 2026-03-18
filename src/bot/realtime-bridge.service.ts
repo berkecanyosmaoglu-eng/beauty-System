@@ -226,11 +226,10 @@ class VoiceBridgeSession {
 
   private speechEnergyFrames = 0;
   private lastObservedSpeechEnergy = 0;
-  private readonly speechEnergyThreshold = 2300;
-  private readonly speechFramesForBargeIn = 7;
-  private readonly speechFramesForSpeechStartedCancel = 5;
-  private readonly assistantGuardMs = 1400;
-  private readonly openingGreetingBargeInGuardMs = 1500;
+  private readonly speechEnergyThreshold = 3200;
+  private readonly speechFramesForBargeIn = 12;
+  private readonly assistantGuardMs = 1800;
+  private readonly openingGreetingBargeInGuardMs = 2200;
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
@@ -261,6 +260,7 @@ class VoiceBridgeSession {
   private lastOpeningGreetingIgnoreLogAt = 0;
   private lastBargeInSuppressLogAt = 0;
   private lastBargeInSuppressReason = '';
+  private lastCancellationReason: 'real_barge_in' | 'new_reply' | 'close' | null = null;
 
   // 20ms @ 8kHz μ-law = 160 bytes
   private readonly ulawFrameBytes = 160;
@@ -523,12 +523,10 @@ class VoiceBridgeSession {
           );
           return;
         }
-        if (this.shouldInterruptAssistantOnSpeechStarted()) {
-          this.cancelAssistantAudio('speech_started');
-        } else if (this.assistantSpeaking) {
+        if (this.assistantSpeaking) {
           this.logBargeInSuppressed(
             'playback_guard',
-            `speechFrames=${this.speechEnergyFrames} rms=${this.lastObservedSpeechEnergy.toFixed(0)}`,
+            `event=speech_started speechFrames=${this.speechEnergyFrames} rms=${this.lastObservedSpeechEnergy.toFixed(0)}`,
           );
         }
         return;
@@ -832,7 +830,7 @@ class VoiceBridgeSession {
 
     if (this.speechEnergyFrames >= this.speechFramesForBargeIn) {
       this.parentLogger.warn(
-        `[voice] barge-in detected callId=${this.meta.callId} rms=${rms.toFixed(0)} frames=${this.speechEnergyFrames}`,
+        `[voice] barge_in_detected callId=${this.meta.callId} rms=${rms.toFixed(0)} frames=${this.speechEnergyFrames}`,
       );
       this.lastBargeInAt = Date.now();
       this.cancelAssistantAudio('barge_in');
@@ -908,32 +906,6 @@ class VoiceBridgeSession {
     return turnId === this.activeTurnId;
   }
 
-  private shouldInterruptAssistantOnSpeechStarted() {
-    if (!this.assistantSpeaking) return false;
-
-    const elapsed = Date.now() - this.assistantStartedAt;
-    if (this.getAssistantProtectionMsRemaining() > 0) return false;
-
-    const remaining = Math.max(
-      this.currentPlaybackDurationMs -
-        Math.floor(this.currentPlaybackOffsetBytes / this.ulawFrameBytes) *
-          this.ulawFrameMs,
-      0,
-    );
-    const shortReply = this.lastBotReplyText.length <= 42;
-
-    if (elapsed < this.assistantGuardMs) return false;
-    if (this.speechEnergyFrames < this.speechFramesForSpeechStartedCancel)
-      return false;
-    if (this.lastObservedSpeechEnergy < this.speechEnergyThreshold) return false;
-    if (elapsed < 260) return false;
-    if (this.speechEnergyFrames < 2) return false;
-    if (shortReply && remaining < 700) return false;
-    if (remaining > 0 && remaining < 500) return false;
-    if (Date.now() - this.lastAssistantAudioAt < 240) return false;
-    return true;
-  }
-
   private getAssistantProtectionMsRemaining() {
     const now = Date.now();
     const protectionUntil = Math.max(
@@ -971,7 +943,7 @@ class VoiceBridgeSession {
     this.lastBargeInSuppressLogAt = now;
     this.lastBargeInSuppressReason = reason;
     this.parentLogger.log(
-      `[voice] barge-in suppressed callId=${this.meta.callId} reason=${reason}${detail ? ` ${detail}` : ''}`,
+      `[voice] barge_in_suppressed callId=${this.meta.callId} reason=${reason}${detail ? ` ${detail}` : ''}`,
     );
   }
 
@@ -1223,7 +1195,7 @@ class VoiceBridgeSession {
   }
 
   private cancelAssistantAudio(
-    reason: 'barge_in' | 'speech_started' | 'new_reply' | 'close' = 'new_reply',
+    reason: 'barge_in' | 'new_reply' | 'close' = 'new_reply',
   ) {
     this.playbackToken += 1;
 
@@ -1240,6 +1212,12 @@ class VoiceBridgeSession {
     }
 
     this.sendBridge({ event: 'clear' });
+
+    this.lastCancellationReason =
+      reason === 'barge_in' ? 'real_barge_in' : reason;
+    this.parentLogger.warn(
+      `[voice] cancellation_applied callId=${this.meta.callId} reason=${this.lastCancellationReason}`,
+    );
 
     if (this.activeResponse) {
       this.sendOpenAi({ type: 'response.cancel' });
@@ -1387,9 +1365,30 @@ class VoiceBridgeSession {
       rewritten === openingGreeting
         ? openingGreeting
         : shortenReplyForPhone(rewritten);
+    if (rewritten !== replyText) {
+      this.parentLogger.log(
+        `[voice] rewrite_shortened callId=${this.meta.callId} stage=rewrite replyBefore=${JSON.stringify(replyText)} replyAfter=${JSON.stringify(rewritten)}`,
+      );
+    }
+    if (spoken !== rewritten) {
+      this.parentLogger.log(
+        `[voice] rewrite_shortened callId=${this.meta.callId} stage=phone replyBefore=${JSON.stringify(rewritten)} replyAfter=${JSON.stringify(spoken)}`,
+      );
+    }
     const clean = sanitizeReplyForVoice(spoken);
     const effectiveTurnId = turnId ?? this.activeTurnId;
-    if (!clean || !this.sessionReady) return;
+    if (!clean) {
+      this.parentLogger.warn(
+        `[voice] tts_skipped callId=${this.meta.callId} reason=empty_reply`,
+      );
+      return;
+    }
+    if (!this.sessionReady) {
+      this.parentLogger.warn(
+        `[voice] tts_skipped callId=${this.meta.callId} reason=session_not_ready`,
+      );
+      return;
+    }
     if (!this.isTurnStillActive(effectiveTurnId)) {
       this.parentLogger.warn(
         `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=pre_tts`,
@@ -1400,6 +1399,8 @@ class VoiceBridgeSession {
     if (this.assistantSpeaking || this.activeResponse) {
       this.cancelAssistantAudio('new_reply');
     }
+
+    this.lastCancellationReason = null;
 
     this.lastBotReplyText = clean;
     this.currentReplyTurnId = effectiveTurnId;
@@ -1450,7 +1451,7 @@ class VoiceBridgeSession {
     this.assistantSpeaking = false;
     this.activeResponse = false;
     this.parentLogger.warn(
-      `[voice] elevenlabs_unavailable_skip_tts callId=${this.meta.callId}`,
+      `[voice] tts_skipped callId=${this.meta.callId} reason=${this.lastCancellationReason ? `cancelled_${this.lastCancellationReason}` : 'elevenlabs_unavailable'}`,
     );
   }
 
@@ -1538,7 +1539,7 @@ class VoiceBridgeSession {
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         this.parentLogger.warn(
-          `[voice] ElevenLabs synthesis aborted callId=${this.meta.callId} reason=barge_in_or_cancel`,
+          `[voice] ElevenLabs synthesis aborted callId=${this.meta.callId} reason=${this.lastCancellationReason || 'cancelled'}`,
         );
         return { audioBuffer: null, streamed: false };
       }

@@ -32,4 +32,12 @@ describe('shapeVoiceAgentReply', () => {
 
     expect(reply).toBe('lazer epilasyon için yardımcı olayım.');
   });
+
+  it('keeps a usable help prompt when greeting cleanup removes filler lines', () => {
+    const reply = shapeVoiceAgentReply(
+      'Teşekkür ederim. Size nasıl yardımcı olabilirim?',
+    );
+
+    expect(reply).toBe('Size nasıl yardımcı olabilirim?');
+  });
 });
