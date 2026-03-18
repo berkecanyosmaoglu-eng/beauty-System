@@ -1,10 +1,23 @@
 import { Module } from '@nestjs/common';
-import { AgentService } from './agent.service';
 import { PrismaModule } from '../prisma/prisma.module';
+import { BookingCoreService } from './shared/booking-core.service';
+import { ChatAgentService } from './chat-agent.service';
+import { VoiceAgentService } from './voice-agent.service';
+import { AgentService } from './agent.service';
 
 @Module({
   imports: [PrismaModule],
-  providers: [AgentService],
-  exports: [AgentService],
+  providers: [
+    BookingCoreService,
+    ChatAgentService,
+    VoiceAgentService,
+    AgentService,
+  ],
+  exports: [
+    BookingCoreService,
+    ChatAgentService,
+    VoiceAgentService,
+    AgentService,
+  ],
 })
 export class AgentModule {}

@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { AgentService } from '../agent/agent.service';
+import { ChatAgentService } from '../agent/chat-agent.service';
 import { PrismaService } from '../prisma/prisma.service';
 import * as crypto from 'crypto';
 
@@ -27,7 +27,7 @@ export class WhatsappService {
   private readonly NOTIF_TYPE: 'WHATSAPP' = 'WHATSAPP';
 
   constructor(
-    private readonly agent: AgentService,
+    private readonly agent: ChatAgentService,
     private readonly prisma: PrismaService,
   ) {}
 
@@ -41,7 +41,10 @@ export class WhatsappService {
 
   /** "whatsapp:+9053..." -> "+9053..." , "9053.." -> "+9053.." , "0532.." -> "+90532.." */
   private toE164Plus(phoneRaw: string): string {
-    const p0 = String(phoneRaw || '').trim().replace(/^whatsapp:/i, '').trim();
+    const p0 = String(phoneRaw || '')
+      .trim()
+      .replace(/^whatsapp:/i, '')
+      .trim();
     if (!p0) return '';
 
     // keep only digits and plus
@@ -76,7 +79,9 @@ export class WhatsappService {
   }
 
   private shouldIgnoreInbound(raw: any, text: string): boolean {
-    const msgType = String(raw?.msg?.type || '').trim().toLowerCase();
+    const msgType = String(raw?.msg?.type || '')
+      .trim()
+      .toLowerCase();
     if (msgType === 'reaction') return true;
     if (!text) return true;
     const clean = String(text || '').trim();
@@ -89,7 +94,9 @@ export class WhatsappService {
   // META CLOUD API
   // -------------------------
   private getMetaConfig() {
-    const phoneNumberId = String(process.env.META_WA_PHONE_NUMBER_ID || '').trim();
+    const phoneNumberId = String(
+      process.env.META_WA_PHONE_NUMBER_ID || '',
+    ).trim();
     const token = String(process.env.META_WA_TOKEN || '').trim();
     const version = String(process.env.META_WA_VERSION || 'v25.0').trim();
 
@@ -108,7 +115,8 @@ export class WhatsappService {
     metadata?: any;
   }): Promise<MetaSendResult> {
     const cfg = this.getMetaConfig();
-    if (!cfg) throw new Error('META_WA_PHONE_NUMBER_ID / META_WA_TOKEN missing');
+    if (!cfg)
+      throw new Error('META_WA_PHONE_NUMBER_ID / META_WA_TOKEN missing');
 
     const tenantId = String(params.tenantId || '').trim();
     const toRaw = String(params.toPhone || '').trim();
@@ -158,13 +166,12 @@ export class WhatsappService {
     }
 
     const messageId =
-      data?.messages?.[0]?.id ||
-      data?.message_id ||
-      data?.id ||
-      undefined;
+      data?.messages?.[0]?.id || data?.message_id || data?.id || undefined;
 
     // 🔥 KRİTİK DEBUG LOG
-    this.logger.log(`[META send][resp] status=${resp.status} to=+${toDigits} data=${this.safeOneLine(data)}`);
+    this.logger.log(
+      `[META send][resp] status=${resp.status} to=+${toDigits} data=${this.safeOneLine(data)}`,
+    );
 
     if (!resp.ok) {
       void this.waLogSafe({
@@ -217,14 +224,16 @@ export class WhatsappService {
       process.env.WHATSAPP_FROM ||
       process.env.TWILIO_FROM_WHATSAPP ||
       '';
-    if (!from) throw new Error('TWILIO_WHATSAPP_FROM (or WHATSAPP_FROM) missing');
+    if (!from)
+      throw new Error('TWILIO_WHATSAPP_FROM (or WHATSAPP_FROM) missing');
     return this.normalizeToWhatsapp(from);
   }
 
   private async getTwilioClient() {
     const sid = process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID;
     const token = process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
-    if (!sid || !token) throw new Error('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN missing');
+    if (!sid || !token)
+      throw new Error('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN missing');
 
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const twilio = require('twilio');
@@ -279,7 +288,9 @@ export class WhatsappService {
       if (!tenantId) return;
 
       const now = new Date();
-      const body = String(params.text || '').trim().slice(0, 3900);
+      const body = String(params.text || '')
+        .trim()
+        .slice(0, 3900);
 
       const metadata = {
         tag: params.tag,
@@ -322,14 +333,21 @@ export class WhatsappService {
     const to = this.normalizeWa(input.to);
     const text = String(input.text || '').trim();
 
-    if (!tenantId) return this.replyTextOnly('Merhaba! (tenant bulunamadı) webhook’a tenantId ekleyelim.');
+    if (!tenantId)
+      return this.replyTextOnly(
+        'Merhaba! (tenant bulunamadı) webhook’a tenantId ekleyelim.',
+      );
     if (!from) return '';
     if (this.shouldIgnoreInbound(input.raw, text)) {
-      this.logger.log(`WA inbound ignored tenantId=${tenantId} from=${from} type=${String(input.raw?.msg?.type || 'unknown')}`);
+      this.logger.log(
+        `WA inbound ignored tenantId=${tenantId} from=${from} type=${String(input.raw?.msg?.type || 'unknown')}`,
+      );
       return '';
     }
 
-    this.logger.log(`📩 WA inbound tenantId=${tenantId} from=${from} to=${to} text="${text.slice(0, 200)}"`);
+    this.logger.log(
+      `📩 WA inbound tenantId=${tenantId} from=${from} to=${to} text="${text.slice(0, 200)}"`,
+    );
 
     void this.waLogSafe({
       tenantId,
@@ -367,7 +385,9 @@ export class WhatsappService {
         extra: { error: String(e?.message || e) },
       });
 
-      return this.replyTextOnly('Şu an bir hata oluştu 😕 Lütfen tekrar dener misin?');
+      return this.replyTextOnly(
+        'Şu an bir hata oluştu 😕 Lütfen tekrar dener misin?',
+      );
     }
   }
 
@@ -434,10 +454,14 @@ export class WhatsappService {
 
         // messageId yoksa sent sayma!
         if (!metaRes.ok) {
-          throw new Error(`META send failed: status=${metaRes.status} data=${this.safeOneLine(metaRes.data)}`);
+          throw new Error(
+            `META send failed: status=${metaRes.status} data=${this.safeOneLine(metaRes.data)}`,
+          );
         }
         if (!metaRes.messageId) {
-          throw new Error(`META send returned ok but missing messageId: data=${this.safeOneLine(metaRes.data)}`);
+          throw new Error(
+            `META send returned ok but missing messageId: data=${this.safeOneLine(metaRes.data)}`,
+          );
         }
 
         await this.prisma.notifications.update({
@@ -469,7 +493,11 @@ export class WhatsappService {
           extra: { provider: 'meta', providerMessageId: metaRes.messageId },
         });
 
-        return { provider: 'meta', messageId: metaRes.messageId, data: metaRes.data };
+        return {
+          provider: 'meta',
+          messageId: metaRes.messageId,
+          data: metaRes.data,
+        };
       }
 
       // fallback: Twilio WhatsApp
@@ -477,7 +505,11 @@ export class WhatsappService {
       const fromTw = this.getWhatsappFrom();
       const toTw = this.normalizeToWhatsapp(toE164);
 
-      const twilioRes = await client.messages.create({ from: fromTw, to: toTw, body });
+      const twilioRes = await client.messages.create({
+        from: fromTw,
+        to: toTw,
+        body,
+      });
 
       await this.prisma.notifications.update({
         where: { id: notif.id },
@@ -505,7 +537,10 @@ export class WhatsappService {
         text: body,
         tag: 'WA_OUT_PROACTIVE',
         appointmentId: params.appointmentId || null,
-        extra: { provider: 'twilio', providerMessageId: String(twilioRes?.sid || '') },
+        extra: {
+          provider: 'twilio',
+          providerMessageId: String(twilioRes?.sid || ''),
+        },
       });
 
       return twilioRes;
