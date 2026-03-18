@@ -226,10 +226,13 @@ class VoiceBridgeSession {
 
   private speechEnergyFrames = 0;
   private lastObservedSpeechEnergy = 0;
-  private readonly speechEnergyThreshold = 3200;
-  private readonly speechFramesForBargeIn = 12;
-  private readonly assistantGuardMs = 1800;
-  private readonly openingGreetingBargeInGuardMs = 2200;
+  private ambientNoiseRms = 0;
+  private readonly minSpeechEnergyThreshold = 200;
+  private readonly maxSpeechEnergyThreshold = 400;
+  private readonly speechEnergyThreshold = 260;
+  private readonly speechFramesForBargeIn = 3;
+  private readonly assistantGuardMs = 400;
+  private readonly openingGreetingBargeInGuardMs = 500;
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
@@ -247,6 +250,7 @@ class VoiceBridgeSession {
   private playbackToken = 0;
   private playbackTimer: NodeJS.Timeout | null = null;
   private currentTtsAbort: AbortController | null = null;
+  private speechFailsafeTimer: NodeJS.Timeout | null = null;
   private currentPlaybackDurationMs = 0;
   private currentPlaybackOffsetBytes = 0;
   private currentReplyTurnId = 0;
@@ -260,11 +264,16 @@ class VoiceBridgeSession {
   private lastOpeningGreetingIgnoreLogAt = 0;
   private lastBargeInSuppressLogAt = 0;
   private lastBargeInSuppressReason = '';
-  private lastCancellationReason: 'real_barge_in' | 'new_reply' | 'close' | null = null;
+  private lastCancellationReason:
+    | 'real_barge_in'
+    | 'new_reply'
+    | 'close'
+    | null = null;
 
   // 20ms @ 8kHz μ-law = 160 bytes
   private readonly ulawFrameBytes = 160;
   private readonly ulawFrameMs = 20;
+  private readonly minBufferedAudioChunkBytes = 640;
   private readonly realtimeTtsStreamingEnabled =
     String(process.env.VOICE_TTS_STREAMING_ENABLED || 'true').toLowerCase() !==
     'false';
@@ -436,6 +445,7 @@ class VoiceBridgeSession {
       if (!payload) return;
 
       this.handlePossibleBargeIn(payload);
+      this.refreshSpeechFailsafe();
 
       if (
         this.assistantSpeaking &&
@@ -512,6 +522,7 @@ class VoiceBridgeSession {
 
       case 'input_audio_buffer.speech_started':
         this.markTiming('speech_started');
+        this.refreshSpeechFailsafe();
         this.parentLogger.log(
           `[voice] speech_started callId=${this.meta.callId}`,
         );
@@ -534,6 +545,7 @@ class VoiceBridgeSession {
       case 'input_audio_buffer.speech_stopped':
         this.lastSpeechStoppedAt = Date.now();
         this.markTiming('speech_stopped');
+        this.refreshSpeechFailsafe();
         this.parentLogger.log(
           `[voice] speech_stopped callId=${this.meta.callId}`,
         );
@@ -766,12 +778,86 @@ class VoiceBridgeSession {
     return false;
   }
 
+  private getAdaptiveSpeechThreshold() {
+    const adaptive = Math.round(this.ambientNoiseRms * 2);
+    return Math.max(
+      this.minSpeechEnergyThreshold,
+      Math.min(
+        this.maxSpeechEnergyThreshold,
+        Math.max(this.speechEnergyThreshold, adaptive),
+      ),
+    );
+  }
+
+  private updateAmbientNoise(rms: number) {
+    if (!Number.isFinite(rms) || rms <= 0) return;
+    if (this.assistantSpeaking || this.speechEnergyFrames > 0) return;
+    this.ambientNoiseRms = this.ambientNoiseRms
+      ? this.ambientNoiseRms * 0.92 + rms * 0.08
+      : rms;
+  }
+
+  private refreshSpeechFailsafe() {
+    if (this.speechFailsafeTimer) {
+      clearTimeout(this.speechFailsafeTimer);
+    }
+    this.speechFailsafeTimer = setTimeout(() => {
+      this.speechFailsafeTimer = null;
+      void this.forceResponseAfterSilence();
+    }, 2000);
+  }
+
+  private async forceResponseAfterSilence() {
+    if (this.closed || this.agentTurnInFlight || this.assistantSpeaking) return;
+
+    const buffered = this.pendingTranscriptText.trim();
+    const bufferedState = this.pendingTranscriptState;
+    if (buffered) {
+      this.pendingTranscriptText = '';
+      this.pendingTranscriptState = null;
+      if (this.pendingTranscriptTimer) {
+        clearTimeout(this.pendingTranscriptTimer);
+        this.pendingTranscriptTimer = null;
+      }
+      this.parentLogger.warn(
+        `[voice] speech_failsafe_flush callId=${this.meta.callId} text="${buffered}"`,
+      );
+      await this.enqueueOrProcessTranscript(buffered, bufferedState);
+      return;
+    }
+
+    const sinceSpeechStopped = this.lastSpeechStoppedAt
+      ? Date.now() - this.lastSpeechStoppedAt
+      : Number.POSITIVE_INFINITY;
+    if (sinceSpeechStopped < 1900 || sinceSpeechStopped > 2600) return;
+
+    this.parentLogger.warn(
+      `[voice] speech_failsafe_no_transcript callId=${this.meta.callId} sinceSpeechStopped=${sinceSpeechStopped}`,
+    );
+    await this.speakReply('Buyurun, sizi dinliyorum.');
+  }
+
+  private sendAudioChunk(chunk: Buffer) {
+    if (!chunk.length) return;
+    this.parentLogger.log(
+      `[voice] audio_chunk_sent callId=${this.meta.callId} size=${chunk.length}`,
+    );
+    this.sendBridge({
+      event: 'media',
+      media: { payload: chunk.toString('base64') },
+    });
+  }
+
   private handlePossibleBargeIn(payloadB64: string) {
+    const rms = pcmuBase64Rms(payloadB64);
+    const threshold = this.getAdaptiveSpeechThreshold();
+    this.lastObservedSpeechEnergy = rms;
+    this.updateAmbientNoise(rms);
+
     if (!this.assistantSpeaking) {
       this.openingGreetingProtectionUntil = 0;
       this.assistantPlaybackProtectionUntil = 0;
       this.speechEnergyFrames = 0;
-      this.lastObservedSpeechEnergy = 0;
       return;
     }
 
@@ -795,16 +881,16 @@ class VoiceBridgeSession {
       return;
     }
 
-    const rms = pcmuBase64Rms(payloadB64);
-    this.lastObservedSpeechEnergy = rms;
-
-    if (rms >= this.speechEnergyThreshold) {
+    if (rms >= threshold) {
       this.speechEnergyFrames += 1;
+      this.parentLogger.log(
+        `[voice] speech_detected callId=${this.meta.callId} rms=${rms.toFixed(0)} threshold=${threshold} ambient=${this.ambientNoiseRms.toFixed(0)} frames=${this.speechEnergyFrames}`,
+      );
     } else {
       if (rms > 0) {
         this.logBargeInSuppressed(
           'below_threshold',
-          `rms=${rms.toFixed(0)} threshold=${this.speechEnergyThreshold}`,
+          `rms=${rms.toFixed(0)} threshold=${threshold} ambient=${this.ambientNoiseRms.toFixed(0)}`,
         );
       }
       this.speechEnergyFrames = 0;
@@ -819,7 +905,7 @@ class VoiceBridgeSession {
       return;
     }
 
-    if (now - this.lastAssistantAudioAt < 240) {
+    if (now - this.lastAssistantAudioAt < 120) {
       this.logBargeInSuppressed(
         'probable_echo',
         `sinceAssistantAudio=${now - this.lastAssistantAudioAt} rms=${rms.toFixed(0)}`,
@@ -828,14 +914,12 @@ class VoiceBridgeSession {
       return;
     }
 
-    if (this.speechEnergyFrames >= this.speechFramesForBargeIn) {
-      this.parentLogger.warn(
-        `[voice] barge_in_detected callId=${this.meta.callId} rms=${rms.toFixed(0)} frames=${this.speechEnergyFrames}`,
-      );
-      this.lastBargeInAt = Date.now();
-      this.cancelAssistantAudio('barge_in');
-      this.speechEnergyFrames = 0;
-    }
+    this.parentLogger.warn(
+      `[voice] barge_in_triggered callId=${this.meta.callId} rms=${rms.toFixed(0)} threshold=${threshold} frames=${this.speechEnergyFrames}`,
+    );
+    this.lastBargeInAt = Date.now();
+    this.cancelAssistantAudio('barge_in');
+    this.speechEnergyFrames = 0;
   }
 
   private shouldPassInboundDuringAssistant(payloadB64: string) {
@@ -849,15 +933,19 @@ class VoiceBridgeSession {
     }
 
     const rms = pcmuBase64Rms(payloadB64);
+    const threshold = this.getAdaptiveSpeechThreshold();
     this.lastObservedSpeechEnergy = rms;
-    if (rms < this.speechEnergyThreshold) {
+    if (
+      rms < threshold ||
+      this.speechEnergyFrames < this.speechFramesForBargeIn
+    ) {
       this.logBargeInSuppressed(
         'below_threshold',
-        `rms=${rms.toFixed(0)} threshold=${this.speechEnergyThreshold}`,
+        `rms=${rms.toFixed(0)} threshold=${threshold} frames=${this.speechEnergyFrames}`,
       );
       return false;
     }
-    return rms >= this.speechEnergyThreshold;
+    return true;
   }
 
   private maybeStartOpeningGreeting() {
@@ -1513,6 +1601,10 @@ class VoiceBridgeSession {
         return { audioBuffer: null, streamed: false };
       }
 
+      this.parentLogger.log(
+        `[voice] tts_stream_start callId=${this.meta.callId} streaming=${this.realtimeTtsStreamingEnabled ? 'enabled' : 'disabled'} turnId=${turnId ?? this.activeTurnId}`,
+      );
+
       const streamed =
         this.realtimeTtsStreamingEnabled &&
         !!response.body &&
@@ -1690,6 +1782,64 @@ class VoiceBridgeSession {
     let sentBytes = 0;
     let firstChunkSent = false;
 
+    const flushPending = (force = false) => {
+      const flushable = force
+        ? pending.length
+        : pending.length >= this.minBufferedAudioChunkBytes
+          ? pending.length - (pending.length % this.minBufferedAudioChunkBytes)
+          : 0;
+      if (!flushable) return;
+
+      let outbound = pending.subarray(0, flushable);
+      pending = pending.subarray(flushable);
+
+      if (force && outbound.length % this.ulawFrameBytes !== 0) {
+        const padded = Buffer.alloc(
+          outbound.length +
+            (this.ulawFrameBytes - (outbound.length % this.ulawFrameBytes)),
+          0xff,
+        );
+        outbound.copy(padded);
+        outbound = padded;
+      }
+
+      if (force && outbound.length < this.minBufferedAudioChunkBytes) {
+        const padded = Buffer.alloc(this.minBufferedAudioChunkBytes, 0xff);
+        outbound.copy(padded);
+        outbound = padded;
+      }
+
+      if (
+        this.closed ||
+        token !== this.playbackToken ||
+        !this.isTurnStillActive(turnId)
+      ) {
+        return;
+      }
+
+      this.currentPlaybackOffsetBytes = sentBytes;
+      this.lastAssistantAudioAt = Date.now();
+      if (!firstChunkSent) {
+        firstChunkSent = true;
+        this.markTiming('final_audio_send_start', {
+          bytes: totalBytes,
+          streaming: true,
+        });
+        this.logTurnLatency('assistant_first_audio_streaming', turnId, {
+          ttsBufferedBytes: totalBytes,
+        });
+        this.assistantPlaybackProtectionUntil =
+          this.lastAssistantAudioAt + this.assistantGuardMs;
+        if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
+          this.openingGreetingProtectionUntil =
+            this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
+        }
+      }
+
+      this.sendAudioChunk(outbound);
+      sentBytes += outbound.length;
+    };
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -1700,74 +1850,11 @@ class VoiceBridgeSession {
       totalBytes += chunk.length;
       pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
 
-      while (pending.length >= this.ulawFrameBytes) {
-        if (
-          this.closed ||
-          token !== this.playbackToken ||
-          !this.isTurnStillActive(turnId)
-        ) {
-          return {
-            audioBuffer: Buffer.concat(chunks, totalBytes),
-            streamed: false,
-          };
-        }
-
-        const frame = pending.subarray(0, this.ulawFrameBytes);
-        pending = pending.subarray(this.ulawFrameBytes);
-        this.currentPlaybackOffsetBytes = sentBytes;
-        this.lastAssistantAudioAt = Date.now();
-        if (!firstChunkSent) {
-          firstChunkSent = true;
-          this.markTiming('final_audio_send_start', {
-            bytes: totalBytes,
-            streaming: true,
-          });
-          this.logTurnLatency('assistant_first_audio_streaming', turnId, {
-            ttsBufferedBytes: totalBytes,
-          });
-          this.assistantPlaybackProtectionUntil =
-            this.lastAssistantAudioAt + this.assistantGuardMs;
-          if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
-            this.openingGreetingProtectionUntil =
-              this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
-          }
-        }
-        this.sendBridge({
-          event: 'media',
-          media: { payload: frame.toString('base64') },
-        });
-        sentBytes += frame.length;
-      }
+      flushPending(false);
     }
 
     if (pending.length > 0) {
-      const padded = Buffer.alloc(this.ulawFrameBytes, 0xff);
-      pending.copy(padded);
-      if (
-        !this.closed &&
-        token === this.playbackToken &&
-        this.isTurnStillActive(turnId)
-      ) {
-        this.currentPlaybackOffsetBytes = sentBytes;
-        this.lastAssistantAudioAt = Date.now();
-        if (!firstChunkSent) {
-          firstChunkSent = true;
-          this.markTiming('final_audio_send_start', {
-            bytes: totalBytes,
-            streaming: true,
-          });
-          this.logTurnLatency('assistant_first_audio_streaming', turnId, {
-            ttsBufferedBytes: totalBytes,
-          });
-          this.assistantPlaybackProtectionUntil =
-            this.lastAssistantAudioAt + this.assistantGuardMs;
-        }
-        this.sendBridge({
-          event: 'media',
-          media: { payload: padded.toString('base64') },
-        });
-        sentBytes += padded.length;
-      }
+      flushPending(true);
     }
 
     this.currentPlaybackDurationMs =
@@ -1826,7 +1913,10 @@ class VoiceBridgeSession {
       if (!this.assistantSpeaking) return;
 
       this.currentPlaybackOffsetBytes = offset;
-      const chunk = buf.subarray(offset, offset + this.ulawFrameBytes);
+      const chunk = buf.subarray(
+        offset,
+        offset + this.minBufferedAudioChunkBytes,
+      );
       if (!chunk.length) {
         this.assistantSpeaking = false;
         this.playbackTimer = null;
@@ -1860,13 +1950,16 @@ class VoiceBridgeSession {
         }
       }
 
-      this.sendBridge({
-        event: 'media',
-        media: { payload: chunk.toString('base64') },
-      });
+      this.sendAudioChunk(chunk);
 
-      offset += this.ulawFrameBytes;
-      this.playbackTimer = setTimeout(tick, this.ulawFrameMs);
+      offset += chunk.length;
+      this.playbackTimer = setTimeout(
+        tick,
+        Math.max(
+          this.ulawFrameMs,
+          (chunk.length / this.ulawFrameBytes) * this.ulawFrameMs,
+        ),
+      );
     };
 
     tick();
@@ -1889,6 +1982,10 @@ class VoiceBridgeSession {
     if (this.pendingTranscriptTimer) {
       clearTimeout(this.pendingTranscriptTimer);
       this.pendingTranscriptTimer = null;
+    }
+    if (this.speechFailsafeTimer) {
+      clearTimeout(this.speechFailsafeTimer);
+      this.speechFailsafeTimer = null;
     }
     this.pendingTranscriptText = '';
     this.pendingTranscriptState = null;
@@ -2295,9 +2392,7 @@ export function shortenReplyForPhone(text: string) {
   const original = String(text || '')
     .replace(/\s+/g, ' ')
     .trim();
-  let out = original
-    .replace(/\s+/g, ' ')
-    .trim();
+  let out = original.replace(/\s+/g, ' ').trim();
   if (!out) return out;
 
   const numberedItems = [...out.matchAll(/\b\d\)\s*[^\n]+/g)];
@@ -2384,7 +2479,11 @@ function shouldPreserveMeaningfulReply(text: string) {
   const normalized = normalizeVoiceComparisonText(text);
   if (!normalized || isUselessShortAck(normalized)) return false;
   if (/\?$/.test(text)) return true;
-  if (/\b(nasil|nasıl|hangi|ne zaman|neden|icin|için|fiyat|ucret|ücret|saat|adres|randevu|rezervasyon|yardimci|yardımcı)\b/i.test(text)) {
+  if (
+    /\b(nasil|nasıl|hangi|ne zaman|neden|icin|için|fiyat|ucret|ücret|saat|adres|randevu|rezervasyon|yardimci|yardımcı)\b/i.test(
+      text,
+    )
+  ) {
     return true;
   }
   return normalized.split(/\s+/).filter(Boolean).length >= 4;
