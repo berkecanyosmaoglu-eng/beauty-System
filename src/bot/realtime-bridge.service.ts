@@ -916,10 +916,29 @@ class VoiceBridgeSession {
     }
   }
 
-  private handlePossibleBargeIn(_payloadB64: string) {
-    // Temporary stabilization mode: barge-in is fully disabled so assistant
-    // playback cannot interrupt itself while we harden the bridge pipeline.
+  private handlePossibleBargeIn(payloadB64: string) {
+    const rms = pcmuBase64Rms(payloadB64);
+    this.lastObservedSpeechEnergy = rms;
+    this.updateAmbientNoise(rms);
+
+    if (this.assistantSpeaking || this.activeResponse) {
+      this.parentLogger.debug(
+        `[voice] barge_in_blocked_assistant_speaking callId=${this.meta.callId}`,
+      );
+      this.speechEnergyFrames = 0;
+      return;
+    }
+
+    this.openingGreetingProtectionUntil = 0;
+    this.assistantPlaybackProtectionUntil = 0;
     this.speechEnergyFrames = 0;
+
+    const now = Date.now();
+    if (now - this.lastAssistantAudioAt < 1500) {
+      this.parentLogger.debug(
+        `[voice] barge_in_blocked_cooldown callId=${this.meta.callId}`,
+      );
+    }
   }
 
   private shouldPassInboundDuringAssistant(_payloadB64: string) {
