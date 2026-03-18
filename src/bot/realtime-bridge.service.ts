@@ -226,10 +226,10 @@ class VoiceBridgeSession {
 
   private speechEnergyFrames = 0;
   private lastObservedSpeechEnergy = 0;
-  private readonly speechEnergyThreshold = 3200;
-  private readonly speechFramesForBargeIn = 12;
-  private readonly assistantGuardMs = 1800;
-  private readonly openingGreetingBargeInGuardMs = 2200;
+  private readonly speechEnergyThreshold = 900;
+  private readonly speechFramesForBargeIn = 3;
+  private readonly assistantGuardMs = 400;
+  private readonly openingGreetingBargeInGuardMs = 500;
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
@@ -1732,10 +1732,7 @@ class VoiceBridgeSession {
               this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
           }
         }
-        this.sendBridge({
-          event: 'media',
-          media: { payload: frame.toString('base64') },
-        });
+        this.sendAudioToTwilio(frame);
         sentBytes += frame.length;
       }
     }
@@ -1762,10 +1759,7 @@ class VoiceBridgeSession {
           this.assistantPlaybackProtectionUntil =
             this.lastAssistantAudioAt + this.assistantGuardMs;
         }
-        this.sendBridge({
-          event: 'media',
-          media: { payload: padded.toString('base64') },
-        });
+        this.sendAudioToTwilio(padded);
         sentBytes += padded.length;
       }
     }
@@ -1860,10 +1854,7 @@ class VoiceBridgeSession {
         }
       }
 
-      this.sendBridge({
-        event: 'media',
-        media: { payload: chunk.toString('base64') },
-      });
+      this.sendAudioToTwilio(chunk);
 
       offset += this.ulawFrameBytes;
       this.playbackTimer = setTimeout(tick, this.ulawFrameMs);
@@ -1880,6 +1871,14 @@ class VoiceBridgeSession {
   private sendBridge(obj: any) {
     if (this.clientWs.readyState !== WebSocket.OPEN) return;
     this.clientWs.send(JSON.stringify(obj));
+  }
+
+  private sendAudioToTwilio(audioBuffer: Buffer) {
+    console.log('[VOICE DEBUG] sending audio chunk size=', audioBuffer.length);
+    this.sendBridge({
+      event: 'media',
+      media: { payload: audioBuffer.toString('base64') },
+    });
   }
 
   private safeClose() {
