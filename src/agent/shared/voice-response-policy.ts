@@ -1,5 +1,6 @@
 export function shapeVoiceAgentReply(reply: string): string {
-  let text = String(reply || '').trim();
+  const raw = String(reply || '').trim();
+  let text = raw;
   if (!text) return 'Tamam.';
 
   text = stripGreetingLead(text);
@@ -24,14 +25,18 @@ export function shapeVoiceAgentReply(reply: string): string {
     .replace(/\s{2,}/g, ' ')
     .trim();
 
-  if (!cleaned) return 'Tamam.';
+  if (!cleaned) {
+    return fallbackPromptForGreeting(raw) || 'Tamam.';
+  }
 
   const sentences = splitSentences(cleaned)
     .map((sentence) => cleanupLine(sentence))
     .filter(Boolean)
     .filter((sentence) => !isFillerLine(sentence));
 
-  if (!sentences.length) return 'Tamam.';
+  if (!sentences.length) {
+    return fallbackPromptForGreeting(raw) || 'Tamam.';
+  }
 
   const deduped: string[] = [];
   for (const sentence of sentences) {
@@ -168,4 +173,13 @@ function stripGreetingLead(text: string): string {
     )
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+function fallbackPromptForGreeting(text: string): string | null {
+  const normalized = normalizeVoiceText(text);
+  if (!normalized) return null;
+  if (/yard[ıi]mc[ıi] olabilirim/.test(normalized)) {
+    return 'Size nasıl yardımcı olabilirim?';
+  }
+  return null;
 }
