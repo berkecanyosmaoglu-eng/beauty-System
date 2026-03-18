@@ -15,6 +15,8 @@ describe('BookingCoreService voice booking guards', () => {
   const staff = [
     { id: 'stf-1', name: 'Ayşe' },
     { id: 'stf-2', name: 'Fatma' },
+    { id: 'stf-3', name: 'Esra' },
+    { id: 'stf-4', name: 'Elif Kaya', fullName: 'Elif Kaya' },
   ];
 
   function createPrismaMock() {
@@ -153,6 +155,108 @@ describe('BookingCoreService voice booking guards', () => {
     expect(session.draft.serviceId).toBe('svc-5');
   });
 
+  it('treats short follow-up booking requests like "yarına olsun" as continuity-driven booking', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi alabilir miyim?',
+      channel: 'voice',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Yarına olsun',
+      channel: 'voice',
+    });
+
+    expect(reply).not.toMatch(/hangi hizmet/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.draft.serviceId).toBe('svc-5');
+    expect(session.pendingDateOnly).toBe('2026-03-19');
+    expect(session.state).toBe('WAIT_STAFF');
+  });
+
+  it('resolves ellipsis like "bunu alayım" using recent service continuity', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi alabilir miyim?',
+      channel: 'voice',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Tamam bunu alayım',
+      channel: 'voice',
+    });
+
+    expect(reply).not.toMatch(/hangi hizmet/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.draft.serviceId).toBe('svc-5');
+    expect(session.state).toBe('WAIT_STAFF');
+  });
+
+  it('reuses recent staff context on "Esra Hanım olsun"', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'IDLE',
+      draft: {
+        tenantId,
+        customerPhone: from,
+      },
+      updatedAt: Date.now(),
+      history: [],
+      lastServiceId: 'svc-5',
+      lastServiceName: 'Protez Tırnak',
+      recentStaffId: 'stf-3',
+      recentStaffName: 'Esra',
+      recentIntentContext: 'info',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Esra Hanım olsun',
+      channel: 'voice',
+    });
+
+    expect(reply).not.toMatch(/hangi hizmet/i);
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.serviceId).toBe('svc-5');
+    expect(session.draft.staffId).toBe('stf-3');
+    expect(session.state).toBe('WAIT_NAME');
+  });
+
+  it('does not ask "hangi hizmet" again when continuity already resolved service', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi almak istiyorum',
+      channel: 'voice',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Tamam',
+      channel: 'voice',
+    });
+
+    expect(reply).not.toMatch(/hangi hizmet/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.draft.serviceId).toBe('svc-5');
+  });
+
   it('keeps waiting for staff instead of silently defaulting on weak input', async () => {
     const service = new BookingCoreService(createPrismaMock());
     const key = `${tenantId}:${from}`;
@@ -179,5 +283,287 @@ describe('BookingCoreService voice booking guards', () => {
     expect(session.state).toBe('WAIT_STAFF');
     expect(session.draft.staffId).toBeUndefined();
     expect(reply).toMatch(/personel|fark etmez/i);
+  });
+
+  it('accepts a single spoken first name in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Berkecan.',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Berkecan');
+    expect(session.state).toBe('WAIT_DATETIME');
+  });
+
+  it('accepts first and last name in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Erke Yosunoğlu.',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Erke Yosunoğlu');
+  });
+
+  it('accepts foreign names in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Jennifer Lopez.',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Jennifer Lopez');
+  });
+
+  it('strips honorifics from customer name in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Aylin Hanım',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Aylin');
+  });
+
+  it('rejects non-name acknowledgements in WAIT_NAME', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'tamam',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBeUndefined();
+    expect(session.state).toBe('WAIT_NAME');
+    expect(reply).toMatch(/isim|ad soyad/i);
+  });
+
+  it('parses spoken name correctly even when voice_context metadata is present', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_NAME',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+        staffId: 'stf-1',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Berkecan.\n\n[voice_context: Yakın intent bağlamı: general.]',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.customerName).toBe('Berkecan');
+  });
+
+  it('resolves plain single-token staff reply in WAIT_STAFF without re-asking staff', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_STAFF',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Elif',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.staffId).toBe('stf-4');
+    expect(session.draft.customerName).toBeUndefined();
+    expect(session.state).toBe('WAIT_NAME');
+    expect(reply).toMatch(/isim|ad soyad/i);
+    expect(reply).not.toMatch(/personel/i);
+  });
+
+  it('does not save customer name from "Elif olsun" in WAIT_STAFF', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_STAFF',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Elif olsun',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.staffId).toBe('stf-4');
+    expect(session.draft.customerName).toBeUndefined();
+    expect(session.state).toBe('WAIT_NAME');
+    expect(reply).toMatch(/isim|ad soyad/i);
+  });
+
+  it('does not save customer name from "Esra Hanım olsun" in WAIT_STAFF', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'WAIT_STAFF',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-5',
+      },
+      updatedAt: Date.now(),
+      history: [],
+    });
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Esra Hanım olsun',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.staffId).toBe('stf-3');
+    expect(session.draft.customerName).toBeUndefined();
+    expect(session.state).toBe('WAIT_NAME');
+  });
+
+  it('end-to-end voice booking never stores staff-selection phrase as customer name', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi almak istiyorum',
+      channel: 'voice',
+    });
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Yarına randevu alayım',
+      channel: 'voice',
+    });
+
+    const staffReply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Elif olsun',
+      channel: 'voice',
+    });
+
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.staffId).toBe('stf-4');
+    expect(session.draft.customerName).toBeUndefined();
+    expect(staffReply).toMatch(/isim|ad soyad/i);
   });
 });
