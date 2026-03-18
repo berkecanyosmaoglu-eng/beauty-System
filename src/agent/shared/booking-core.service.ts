@@ -1854,6 +1854,8 @@ export class BookingCoreService {
         return 'Şu an personel listem görünmüyor 😕 Birazdan tekrar dener misin?';
       }
 
+      const previousStaffId = session.draft.staffId;
+
       if (isNoPreferenceStaff(raw)) {
         session.draft.staffId = String(staff[0].id);
         session.state = session.editMode
@@ -1873,6 +1875,25 @@ export class BookingCoreService {
         session.state = session.editMode
           ? WaState.WAIT_CONFIRM
           : WaState.WAIT_NAME;
+      }
+
+      if (
+        session.draft.staffId &&
+        (session.draft.staffId !== previousStaffId || isNoPreferenceStaff(raw))
+      ) {
+        const pickedStaff = staff.find(
+          (item: any) => String(item?.id) === String(session.draft.staffId),
+        );
+        this.logAction('staff_selection_consumed_utterance', {
+          tenantId,
+          phone: from,
+          raw,
+          staffId: String(session.draft.staffId),
+          staffName: String(
+            pickedStaff?.name || pickedStaff?.fullName || session.recentStaffName || '',
+          ),
+          state: session.state,
+        });
       }
 
       if (session.editMode) {
@@ -1895,6 +1916,17 @@ export class BookingCoreService {
               seed: from + (session.draft.startAt || ''),
             })
           : `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+<<<<<<< HEAD
+      }
+
+      if (session.state === WaState.WAIT_NAME && !session.draft.customerName) {
+        return await this.naturalAsk(session, 'name', {
+          services,
+          staff,
+          business: null,
+        });
+=======
+>>>>>>> origin/main
       }
     }
 
@@ -4192,11 +4224,18 @@ ${historyText}
   private detectStaffFromMessage(msg: string, staff: any[]) {
     const t = normalizePersonName(msg);
     const words = t.split(/\s+/).filter(Boolean);
+    const staffNames = (p: any) =>
+      [
+        normalizePersonName(String(p?.name || '')),
+        normalizePersonName(String(p?.fullName || '')),
+      ].filter(Boolean);
     return (
-      staff.find((p: any) => normalizePersonName(String(p?.name || '')) === t) ||
+      staff.find((p: any) => staffNames(p).some((name) => name === t)) ||
       staff.find((p: any) => {
-        const name = normalizePersonName(String(p?.name || ''));
-        return words.some((w) => w.length >= 3 && name.includes(w));
+        const names = staffNames(p);
+        return names.some((name) =>
+          words.some((w) => w.length >= 3 && name.includes(w)),
+        );
       }) ||
       null
     );
@@ -4236,6 +4275,23 @@ ${historyText}
     const { session, raw, staff, isVoice, source } = opts;
     if (session.draft.customerName) return session.draft.customerName;
 
+<<<<<<< HEAD
+    const staffHit = this.detectStaffFromMessage(raw, staff);
+    if (staffHit?.id && this.isStaffSelectionUtterance(raw)) {
+      this.logAction('name_capture_skipped_due_to_staff_match', {
+        tenantId: session.draft.tenantId,
+        phone: session.draft.customerPhone,
+        state: session.state,
+        source,
+        raw,
+        staffId: String(staffHit.id),
+        staffName: String(staffHit.name || staffHit.fullName || ''),
+      });
+      return null;
+    }
+
+=======
+>>>>>>> origin/main
     const candidate = isVoice
       ? extractVoiceCustomerName(raw)
       : extractName(raw);
@@ -4306,6 +4362,29 @@ ${historyText}
     return candidate;
   }
 
+<<<<<<< HEAD
+  private isStaffSelectionUtterance(raw: string) {
+    const cleaned = stripVoiceContextMetadata(raw);
+    const t = normalizeTr(cleaned);
+    if (!t) return false;
+    if (isNoPreferenceStaff(cleaned)) return true;
+    if (
+      /\b(olsun|olabilir|tercih|istiyorum|isterim|o olsun|onunla|kendisiyle|hanim|hanım|bey)\b/.test(
+        t,
+      )
+    ) {
+      return true;
+    }
+    const tokens = cleaned
+      .replace(/[.?!,]+/g, ' ')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    return tokens.length >= 1 && tokens.length <= 2;
+  }
+
+=======
+>>>>>>> origin/main
   private shouldCaptureRequestedStaffName(
     raw: string,
     maybeSpoken: string,
@@ -4319,8 +4398,13 @@ ${historyText}
     const rawNorm = normalizeTr(msg);
     const staffName = normalizePersonName(String(hit?.name || ''));
     if (!rawNorm || !staffName) return false;
+    const rawWords = normalizePersonName(msg)
+      .split(/\s+/)
+      .filter((word) => word.length >= 3);
 
     if (normalizePersonName(msg) === staffName) return true;
+    if (rawWords.length && rawWords.every((word) => staffName.includes(word)))
+      return true;
     if (
       rawNorm.includes(` ${staffName} `) ||
       rawNorm.startsWith(`${staffName} `) ||
