@@ -1916,6 +1916,7 @@ export class BookingCoreService {
               seed: from + (session.draft.startAt || ''),
             })
           : `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+<<<<<<< HEAD
       }
 
       if (session.state === WaState.WAIT_NAME && !session.draft.customerName) {
@@ -1924,6 +1925,8 @@ export class BookingCoreService {
           staff,
           business: null,
         });
+=======
+>>>>>>> origin/main
       }
     }
 
@@ -4272,6 +4275,7 @@ ${historyText}
     const { session, raw, staff, isVoice, source } = opts;
     if (session.draft.customerName) return session.draft.customerName;
 
+<<<<<<< HEAD
     const staffHit = this.detectStaffFromMessage(raw, staff);
     if (staffHit?.id && this.isStaffSelectionUtterance(raw)) {
       this.logAction('name_capture_skipped_due_to_staff_match', {
@@ -4286,6 +4290,8 @@ ${historyText}
       return null;
     }
 
+=======
+>>>>>>> origin/main
     const candidate = isVoice
       ? extractVoiceCustomerName(raw)
       : extractName(raw);
@@ -4356,6 +4362,7 @@ ${historyText}
     return candidate;
   }
 
+<<<<<<< HEAD
   private isStaffSelectionUtterance(raw: string) {
     const cleaned = stripVoiceContextMetadata(raw);
     const t = normalizeTr(cleaned);
@@ -4376,6 +4383,8 @@ ${historyText}
     return tokens.length >= 1 && tokens.length <= 2;
   }
 
+=======
+>>>>>>> origin/main
   private shouldCaptureRequestedStaffName(
     raw: string,
     maybeSpoken: string,

@@ -16,7 +16,10 @@ describe('BookingCoreService voice booking guards', () => {
     { id: 'stf-1', name: 'Ayşe' },
     { id: 'stf-2', name: 'Fatma' },
     { id: 'stf-3', name: 'Esra' },
+<<<<<<< HEAD
     { id: 'stf-4', name: 'Elif Kaya', fullName: 'Elif Kaya' },
+=======
+>>>>>>> origin/main
   ];
 
   function createPrismaMock() {
@@ -386,12 +389,20 @@ describe('BookingCoreService voice booking guards', () => {
     await service.replyText({
       tenantId,
       from,
+<<<<<<< HEAD
       text: 'Aylin Hanım',
+=======
+      text: 'Elif Hanım',
+>>>>>>> origin/main
       channel: 'voice',
     });
 
     const session = (service as any).sessions.get(key);
+<<<<<<< HEAD
     expect(session.draft.customerName).toBe('Aylin');
+=======
+    expect(session.draft.customerName).toBe('Elif');
+>>>>>>> origin/main
   });
 
   it('rejects non-name acknowledgements in WAIT_NAME', async () => {
@@ -449,6 +460,7 @@ describe('BookingCoreService voice booking guards', () => {
     const session = (service as any).sessions.get(key);
     expect(session.draft.customerName).toBe('Berkecan');
   });
+<<<<<<< HEAD
 
   it('resolves plain single-token staff reply in WAIT_STAFF without re-asking staff', async () => {
     const service = new BookingCoreService(createPrismaMock());
@@ -566,4 +578,6 @@ describe('BookingCoreService voice booking guards', () => {
     expect(session.draft.customerName).toBeUndefined();
     expect(staffReply).toMatch(/isim|ad soyad/i);
   });
+=======
+>>>>>>> origin/main
 });
