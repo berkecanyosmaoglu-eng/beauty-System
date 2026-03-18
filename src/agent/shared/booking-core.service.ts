@@ -210,6 +210,25 @@ export class BookingCoreService {
 
   constructor(private readonly prisma: PrismaService) {}
 
+
+
+async prewarmVoiceContext(tenantId: string): Promise<void> {
+  try {
+    const businessPromise = this.safeGetBusinessProfile(tenantId);
+    const servicesPromise = this.safeListServices(tenantId);
+    const staffPromise = this.safeListStaff(tenantId);
+
+    await Promise.all([businessPromise, servicesPromise, staffPromise]);
+  } catch (err) {
+    this.logger?.warn?.(
+      `[voice] prewarmVoiceContext failed tenantId=${tenantId} err=${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+
+
+
   /**
    * Structured logging helper. Emits JSON logs for key actions with context.
    * Logs include the action name and any additional contextual fields passed
