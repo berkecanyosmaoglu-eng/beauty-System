@@ -231,10 +231,6 @@ class VoiceBridgeSession {
   private readonly speechFramesForSpeechStartedCancel = 5;
   private readonly assistantGuardMs = 1400;
   private readonly openingGreetingBargeInGuardMs = 1500;
-  private readonly speechEnergyThreshold = 1700;
-  private readonly speechFramesForBargeIn = 5;
-  private readonly assistantGuardMs = 220;
-  private readonly openingGreetingBargeInGuardMs = 700;
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
