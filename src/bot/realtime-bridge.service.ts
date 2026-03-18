@@ -527,6 +527,16 @@ class VoiceBridgeSession {
         this.parentLogger.log(
           `[voice] speech_started callId=${this.meta.callId}`,
         );
+        if (
+          this.agentTurnInFlight ||
+          this.assistantSpeaking ||
+          this.activeResponse
+        ) {
+          this.parentLogger.debug(
+            `[voice] speech_ignored_during_assistant callId=${this.meta.callId}`,
+          );
+          return;
+        }
         const protectionRemaining = this.getAssistantProtectionMsRemaining();
         if (protectionRemaining > 0) {
           this.logBargeInSuppressed(
@@ -570,6 +580,13 @@ class VoiceBridgeSession {
 
   private async handleCompletedTranscript(rawTranscript: string) {
     const currentState = this.getCurrentVoiceBookingState();
+
+    if (this.agentTurnInFlight || this.assistantSpeaking) {
+      this.parentLogger.debug(
+        `[voice] transcript_ignored_during_assistant callId=${this.meta.callId}`,
+      );
+      return;
+    }
 
     if (this.shouldDropTranscript(rawTranscript, currentState)) {
       this.parentLogger.warn(
@@ -627,15 +644,27 @@ class VoiceBridgeSession {
     transcript: string,
     state: string | null,
   ) {
-    if (this.agentTurnInFlight) {
-      this.activeTurnId = this.turnSequence + 1;
-      this.queuedTranscript = { text: transcript, state };
-      this.parentLogger.log(
-        `[voice] transcript_queued_latest callId=${this.meta.callId} state=${state || '-'} text="${transcript}"`,
+    if (
+      this.agentTurnInFlight ||
+      this.assistantSpeaking ||
+      this.activeResponse
+    ) {
+      this.parentLogger.debug(
+        `[voice] transcript_ignored_during_assistant callId=${this.meta.callId} state=${state || '-'} text="${transcript}"`,
       );
       return;
     }
-    await this.processTranscriptTurn(transcript, state);
+
+    setTimeout(() => {
+      if (this.agentTurnInFlight || this.assistantSpeaking) {
+        this.parentLogger.debug(
+          `[voice] transcript_ignored_during_assistant callId=${this.meta.callId} state=${state || '-'} text="${transcript}" stage=debounce`,
+        );
+        return;
+      }
+
+      void this.processTranscriptTurn(transcript, state);
+    }, 300);
   }
 
   private async processTranscriptTurn(
@@ -670,10 +699,7 @@ class VoiceBridgeSession {
     try {
       const reply = await this.callAgentBrain(transcript, turnId);
       if (!reply) return;
-      if (!this.isTurnStillActive(turnId)) {
-        this.parentLogger.warn(
-          `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=agent_reply`,
-        );
+      if (!this.canPlaybackStaleTurn(turnId, 'agent_reply')) {
         return;
       }
 
@@ -884,7 +910,7 @@ class VoiceBridgeSession {
       }
     }
 
-    this.sendBridge({
+    const sent = this.sendBridge({
       event: 'media',
       media: { payload: chunk.toString('base64') },
     });
@@ -1068,6 +1094,24 @@ class VoiceBridgeSession {
   private isTurnStillActive(turnId?: number) {
     if (!turnId) return true;
     return turnId === this.activeTurnId;
+  }
+
+  private canPlaybackStaleTurn(turnId: number | undefined, stage: string) {
+    if (!turnId || this.isTurnStillActive(turnId)) {
+      return true;
+    }
+
+    if (this.assistantSpeaking || this.agentTurnInFlight) {
+      this.parentLogger.warn(
+        `[voice] stale_turn_allowed callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=${stage}`,
+      );
+      return true;
+    }
+
+    this.parentLogger.warn(
+      `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=${stage}`,
+    );
+    return false;
   }
 
   private getAssistantProtectionMsRemaining() {
@@ -1592,10 +1636,7 @@ class VoiceBridgeSession {
       );
       return;
     }
-    if (!this.isTurnStillActive(effectiveTurnId)) {
-      this.parentLogger.warn(
-        `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=pre_tts`,
-      );
+    if (!this.canPlaybackStaleTurn(effectiveTurnId, 'pre_tts')) {
       return;
     }
 
@@ -1616,7 +1657,7 @@ class VoiceBridgeSession {
     this.currentReplyTurnId = effectiveTurnId;
     this.captureRecentContextsFromText(clean, effectiveTurnId, 'assistant');
     this.assistantSpeaking = true;
-    this.activeResponse = false;
+    this.activeResponse = true;
     this.assistantStartedAt = Date.now();
     this.outboundAudioChunkCount = 0;
     this.outboundAudioByteCount = 0;
@@ -1640,13 +1681,13 @@ class VoiceBridgeSession {
         effectiveTurnId,
       );
 
-      if (!this.isTurnStillActive(effectiveTurnId)) {
-        this.parentLogger.warn(
-          `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=tts_ready`,
-        );
+      if (!this.canPlaybackStaleTurn(effectiveTurnId, 'tts_ready')) {
         this.resetAssistantPlaybackState('stale_turn_tts_ready');
         return;
       }
+
+      this.assistantSpeaking = true;
+      this.activeResponse = true;
 
       if (ttsResult?.audioBuffer && token === this.playbackToken) {
         this.parentLogger.log(
@@ -2029,10 +2070,7 @@ class VoiceBridgeSession {
 
   private streamUlawBuffer(buf: Buffer, token: number, turnId: number) {
     if (!buf.length || token !== this.playbackToken) return;
-    if (!this.isTurnStillActive(turnId)) {
-      this.parentLogger.warn(
-        `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=audio_playback`,
-      );
+    if (!this.canPlaybackStaleTurn(turnId, 'audio_playback')) {
       return;
     }
 
@@ -2043,7 +2081,7 @@ class VoiceBridgeSession {
     const tick = () => {
       if (this.closed) return;
       if (token !== this.playbackToken) return;
-      if (!this.isTurnStillActive(turnId)) {
+      if (!this.canPlaybackStaleTurn(turnId, 'audio_playback_tick')) {
         this.resetAssistantPlaybackState('stale_turn_audio_playback');
         return;
       }
