@@ -14,7 +14,7 @@ const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours session expiry
 const SUGGESTION_TTL_MS = 20 * 60 * 1000; // suggestions live for 20 minutes
 const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000; // 10 minute idempotency window
 const MAX_LLM_OUTPUT_LENGTH = 600; // maximum characters allowed from LLM
-const VOICE_TENANT_CACHE_TTL_MS = 2 * 60 * 1000; // keep tenant voice lookups hot for active calls
+const VOICE_REFERENCE_CACHE_TTL_MS = 60 * 1000;
 
 type BookingDraft = {
   tenantId: string;
@@ -207,12 +207,27 @@ export class BookingCoreService {
   private readonly openai = process.env.OPENAI_API_KEY
     ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
     : null;
-  private readonly tenantVoiceCache = new Map<
-    string,
-    { business: any | null; services: any[]; staff: any[]; cachedAt: number }
-  >();
 
   constructor(private readonly prisma: PrismaService) {}
+
+
+
+async prewarmVoiceContext(tenantId: string): Promise<void> {
+  try {
+    const businessPromise = this.safeGetBusinessProfile(tenantId);
+    const servicesPromise = this.safeListServices(tenantId);
+    const staffPromise = this.safeListStaff(tenantId);
+
+    await Promise.all([businessPromise, servicesPromise, staffPromise]);
+  } catch (err) {
+    this.logger?.warn?.(
+      `[voice] prewarmVoiceContext failed tenantId=${tenantId} err=${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+
+
 
   /**
    * Structured logging helper. Emits JSON logs for key actions with context.
@@ -242,6 +257,10 @@ export class BookingCoreService {
   }
 
   private sessions = new Map<string, SessionState>();
+  private readonly voiceReferenceCache = new Map<
+    string,
+    { expiresAt: number; value: any }
+  >();
 
   // =========================
   // ✅ mini metin motoru
@@ -351,42 +370,6 @@ export class BookingCoreService {
       ],
       seed || startAtIso + apptId,
     );
-  }
-
-  async prewarmVoiceContext(tenantId: string) {
-    await this.getTenantVoiceResources(tenantId, true);
-  }
-
-  private async getTenantVoiceResources(
-    tenantId: string,
-    forceRefresh = false,
-  ) {
-    const cached = this.tenantVoiceCache.get(tenantId);
-    if (
-      !forceRefresh &&
-      cached &&
-      Date.now() - cached.cachedAt < VOICE_TENANT_CACHE_TTL_MS
-    ) {
-      return cached;
-    }
-
-    const [business, services, staff] = await Promise.all([
-      (this.prisma as any).businessProfile
-        ?.findUnique({ where: { tenantId } })
-        .catch(() => null),
-      this.safeListServices(tenantId),
-      this.safeListStaff(tenantId),
-    ]);
-
-    const resources = {
-      business: business || null,
-      services: Array.isArray(services) ? services : [],
-      staff: Array.isArray(staff) ? staff : [],
-      cachedAt: Date.now(),
-    };
-
-    this.tenantVoiceCache.set(tenantId, resources);
-    return resources;
   }
 
   // =========================
@@ -652,8 +635,20 @@ export class BookingCoreService {
         return this.safeReply(session, reply);
       }
 
-      const { business, services, staff } =
-        await this.getTenantVoiceResources(tenantId);
+      const contextLoadStartedAt = Date.now();
+      const [business, services, staff] = await Promise.all([
+        this.safeGetBusinessProfile(tenantId),
+        this.safeListServices(tenantId),
+        this.safeListStaff(tenantId),
+      ]);
+      this.logAction('voice_context_loaded', {
+        tenantId,
+        phone: from,
+        isVoice,
+        durationMs: Date.now() - contextLoadStartedAt,
+        services: Array.isArray(services) ? services.length : 0,
+        staff: Array.isArray(staff) ? staff.length : 0,
+      });
       const recentServiceMention = this.detectServiceFromMessage(raw, services);
       if (recentServiceMention?.id) {
         session.lastServiceId = String(recentServiceMention.id);
@@ -1097,7 +1092,11 @@ export class BookingCoreService {
         if (svc?.name) session.lastServiceName = String(svc.name);
         session.recentIntentContext = 'booking';
 
-        if (!svc?.id && this.hasExplicitUnknownServiceRequest(raw, services)) {
+        if (
+          !svc?.id &&
+          !this.isGenericBookingIntentWithoutService(raw, services) &&
+          this.hasExplicitUnknownServiceRequest(raw, services)
+        ) {
           this.logAction('unknown_service_detected', {
             tenantId,
             phone: from,
@@ -1167,7 +1166,12 @@ export class BookingCoreService {
       // info flows
       // =========================
       if (looksLikePriceQuestion(msg)) {
-        const svc = this.detectServiceFromMessage(raw, services);
+        const svc = this.resolveServiceForVoiceFollowUp(
+          session,
+          raw,
+          services,
+          isVoice,
+        );
         if (svc) {
           const name = String(svc.name || 'Hizmet');
           const price = svc.price ?? null;
@@ -1223,7 +1227,12 @@ export class BookingCoreService {
       }
 
       if (looksLikeProcedureQuestion(msg)) {
-        const svc = this.detectServiceFromMessage(raw, services);
+        const svc = this.resolveServiceForVoiceFollowUp(
+          session,
+          raw,
+          services,
+          isVoice,
+        );
         session.lastTopic = 'procedure';
         session.lastServiceId = svc && svc.id ? String(svc.id) : undefined;
 
@@ -1868,6 +1877,7 @@ export class BookingCoreService {
 
       if (
         !session.draft.serviceId &&
+        !this.isGenericBookingIntentWithoutService(raw, services) &&
         this.hasExplicitUnknownServiceRequest(raw, services)
       ) {
         this.logAction('unknown_service_detected', {
@@ -1958,6 +1968,14 @@ export class BookingCoreService {
               seed: from + (session.draft.startAt || ''),
             })
           : `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+      }
+
+      if (session.state === WaState.WAIT_NAME && !session.draft.customerName) {
+        return await this.naturalAsk(session, 'name', {
+          services,
+          staff,
+          business: null,
+        });
       }
     }
 
@@ -3580,24 +3598,60 @@ ${historyText}
   // =========================
   // DB lists
   // =========================
+  private async safeGetBusinessProfile(tenantId: string) {
+    return this.getCachedVoiceReference(
+      `business:${tenantId}`,
+      async () =>
+        await (this.prisma as any).businessProfile
+          ?.findUnique({ where: { tenantId } })
+          .catch(() => null),
+    );
+  }
+
   private async safeListServices(tenantId: string) {
-    return await (this.prisma as any).services
-      .findMany({
-        where: { tenantId, isActive: true },
-        select: { id: true, name: true, price: true, duration: true },
-        take: 50,
-      })
-      .catch(() => []);
+    return this.getCachedVoiceReference(
+      `services:${tenantId}`,
+      async () =>
+        await (this.prisma as any).services
+          .findMany({
+            where: { tenantId, isActive: true },
+            select: { id: true, name: true, price: true, duration: true },
+            take: 50,
+          })
+          .catch(() => []),
+    );
   }
 
   private async safeListStaff(tenantId: string) {
-    return await (this.prisma as any).staff
-      ?.findMany({
-        where: { tenantId, isActive: true },
-        select: { id: true, name: true },
-        take: 50,
-      })
-      .catch(() => []);
+    return this.getCachedVoiceReference(
+      `staff:${tenantId}`,
+      async () =>
+        await (this.prisma as any).staff
+          ?.findMany({
+            where: { tenantId, isActive: true },
+            select: { id: true, name: true },
+            take: 50,
+          })
+          .catch(() => []),
+    );
+  }
+
+  private async getCachedVoiceReference<T>(
+    key: string,
+    loader: () => Promise<T>,
+  ): Promise<T> {
+    const now = Date.now();
+    const cached = this.voiceReferenceCache.get(key);
+    if (cached && cached.expiresAt > now) {
+      return cached.value as T;
+    }
+
+    const value = await loader();
+    this.voiceReferenceCache.set(key, {
+      value,
+      expiresAt: now + VOICE_REFERENCE_CACHE_TTL_MS,
+    });
+    return value;
   }
 
   // =========================
@@ -4057,6 +4111,32 @@ ${historyText}
     if (!session.recentStaffId && !session.bookingDraftSnapshot?.staffId)
       return false;
     return this.shouldCarryRecentStaffContext(raw, session);
+  }
+
+  private resolveServiceForVoiceFollowUp(
+    session: SessionState,
+    raw: string,
+    services: any[],
+    isVoice: boolean,
+  ) {
+    const explicit = this.detectServiceFromMessage(raw, services);
+    if (explicit?.id) return explicit;
+    if (!isVoice) return null;
+    if (!this.shouldUseContinuityService(session, raw, isVoice)) return null;
+
+    const sourceId = session.bookingDraftSnapshot?.serviceId
+      ? String(session.bookingDraftSnapshot.serviceId)
+      : session.lastServiceId
+        ? String(session.lastServiceId)
+        : '';
+    if (!sourceId) return null;
+    return services.find((item: any) => String(item?.id) === sourceId) || null;
+  }
+
+  private isGenericBookingIntentWithoutService(raw: string, services: any[]) {
+    if (!looksLikeBookingIntent(raw)) return false;
+    if (this.detectServiceFromMessage(raw, services)) return false;
+    return isGenericBookingIntentPhrase(raw);
   }
 
   private detectGlobalIntent(raw: string): GlobalIntent {
@@ -4802,6 +4882,25 @@ function hasStrongServiceRequestCue(raw: string) {
     t.includes('icin') ||
     t.includes('için')
   );
+}
+
+function isGenericBookingIntentPhrase(raw: string) {
+  const t = normalizeTr(raw);
+  if (!t) return false;
+  if (!looksLikeBookingIntent(raw)) return false;
+  if (parseDateTimeTR(raw)?.hasDate || parseDateTimeTR(raw)?.hasTime)
+    return false;
+  const genericPhrases = [
+    'randevu almak istiyorum',
+    'rezervasyon yapmak istiyorum',
+    'rezervasyon yaptirmak istiyorum',
+    'rezervasyon yaptırmak istiyorum',
+    'randevu olusturmak istiyorum',
+    'randevu oluşturmak istiyorum',
+    'randevu istiyorum',
+    'rezervasyon istiyorum',
+  ].map((item) => normalizeTr(item));
+  return genericPhrases.some((phrase) => t === phrase || t.includes(phrase));
 }
 
 function looksLikeBookingIntent(raw: string) {

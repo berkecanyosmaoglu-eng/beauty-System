@@ -2,6 +2,38 @@ import { BookingCoreService } from './booking-core.service';
 import { VoiceAgentService } from '../voice-agent.service';
 
 describe('BookingCoreService voice booking guards', () => {
+  it('asks for service on generic "Randevu almak istiyorum" request', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Randevu almak istiyorum',
+      channel: 'voice',
+    });
+
+    expect(reply).toMatch(/hangi hizmet/i);
+    expect(reply).not.toMatch(/bulamadim|bulamadım/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.state).toBe('WAIT_SERVICE');
+  });
+
+  it('asks for service on generic "Rezervasyon yapmak istiyorum" request', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Rezervasyon yapmak istiyorum',
+      channel: 'voice',
+    });
+
+    expect(reply).toMatch(/hangi hizmet/i);
+    expect(reply).not.toMatch(/bulamadim|bulamadım/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.state).toBe('WAIT_SERVICE');
+  });
+
   const tenantId = 'tenant-1';
   const from = '+905551112233';
 
@@ -131,6 +163,27 @@ describe('BookingCoreService voice booking guards', () => {
     expect(reply).toContain('Pedikür');
     expect(reply).not.toContain('Protez Tırnak');
     expect(reply).toContain('Hangisi için randevu istersiniz?');
+  });
+
+  it('uses recent service context for price follow-up', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi almak istiyorum',
+      channel: 'voice',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Fiyatı ne kadar?',
+      channel: 'voice',
+    });
+
+    expect(reply).toMatch(/Protez Tırnak fiyatı: 1500₺/i);
+    expect(reply).toMatch(/Süre: 90 dk/i);
   });
 
   it('reuses recent service context for a follow-up booking request', async () => {

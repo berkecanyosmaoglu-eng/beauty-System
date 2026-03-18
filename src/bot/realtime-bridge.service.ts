@@ -67,8 +67,6 @@ type VoiceTimingStage =
   | 'openai_connected'
   | 'session_created'
   | 'session_updated'
-  | 'tenant_context_prewarm_start'
-  | 'tenant_context_prewarm_done'
   | 'first_greeting_started'
   | 'speech_started'
   | 'speech_stopped'
@@ -81,7 +79,8 @@ type VoiceTimingStage =
   | 'final_audio_send_start'
   | 'tts_cache_hit'
   | 'tts_cache_miss'
-  | 'deterministic_bypass';
+  | 'deterministic_bypass'
+  | 'bridge_context_loaded';
 
 @Injectable()
 export class RealtimeBridgeService {
@@ -115,7 +114,6 @@ export class RealtimeBridgeService {
       return;
     }
 
-    const startedAt = Date.now();
     this.logger.log('[voice] opening_greeting_prewarm_start');
     const promise = fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000`,
@@ -152,13 +150,13 @@ export class RealtimeBridgeService {
           audioBuffer,
         );
         this.logger.log(
-          `[voice] opening_greeting_prewarm_success bytes=${audioBuffer.length} latencyMs=${Date.now() - startedAt}`,
+          `[voice] opening_greeting_prewarm_success bytes=${audioBuffer.length}`,
         );
         return audioBuffer;
       })
       .catch((err: any) => {
         this.logger.warn(
-          `[voice] opening_greeting_prewarm_failed latencyMs=${Date.now() - startedAt} error=${err?.message || err}`,
+          `[voice] opening_greeting_prewarm_failed error=${err?.message || err}`,
         );
         return null;
       })
@@ -235,6 +233,12 @@ class VoiceBridgeSession {
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
   private lastTranscriptNorm = '';
+  private pendingTranscriptText = '';
+  private pendingTranscriptTimer: NodeJS.Timeout | null = null;
+  private pendingTranscriptState: string | null = null;
+  private agentTurnInFlight = false;
+  private queuedTranscript: { text: string; state: string | null } | null =
+    null;
   private lastBotReplyText = '';
   private lastBargeInAt = 0;
   private lastSpeechStoppedAt = 0;
@@ -251,13 +255,15 @@ class VoiceBridgeSession {
   private recentIntentContext: RecentIntentContext | null = null;
   private bookingDraftSnapshot: BookingDraftSnapshot | null = null;
   private cachedServices: any[] | null = null;
-  private cachedStaff: any[] | null = null;
   private lastGreetingSuppressedAt = 0;
   private lastOpeningGreetingIgnoreLogAt = 0;
 
   // 20ms @ 8kHz μ-law = 160 bytes
   private readonly ulawFrameBytes = 160;
   private readonly ulawFrameMs = 20;
+  private readonly realtimeTtsStreamingEnabled =
+    String(process.env.VOICE_TTS_STREAMING_ENABLED || 'true').toLowerCase() !==
+    'false';
 
   private readonly ghostRegex =
     /^(ad[ií]os|bye|bye-bye|thank you|thank you very much|all y['’]all|hallo|hello)\.?$/i;
@@ -383,9 +389,9 @@ class VoiceBridgeSession {
           type: 'server_vad',
           create_response: false,
           interrupt_response: false,
-          threshold: 0.62,
-          prefix_padding_ms: 140,
-          silence_duration_ms: 180,
+          threshold: 0.58,
+          prefix_padding_ms: 120,
+          silence_duration_ms: 140,
         },
       },
     });
@@ -405,7 +411,6 @@ class VoiceBridgeSession {
       this.parentLogger.log(
         `[voice] bridge start callId=${this.meta.callId} tenantId=${this.meta.tenantId}`,
       );
-      void this.prewarmTenantVoiceContext();
       this.maybeStartOpeningGreeting();
       return;
     }
@@ -496,53 +501,7 @@ class VoiceBridgeSession {
       case 'conversation.item.input_audio_transcription.completed': {
         const rawTranscript = String(evt.transcript || '').trim();
         if (!rawTranscript) return;
-
-        if (this.shouldDropTranscript(rawTranscript)) {
-          this.parentLogger.warn(
-            `[voice] dropped transcript callId=${this.meta.callId} text="${rawTranscript}"`,
-          );
-          return;
-        }
-
-        const transcript = normalizeTranscriptForAgent(
-          rawTranscript,
-          this.lastBotReplyText,
-        );
-
-        const norm = normalizeTurkishForTime(transcript);
-        if (!norm || norm === this.lastTranscriptNorm) {
-          this.parentLogger.warn(
-            `[voice] duplicate transcript callId=${this.meta.callId} text="${transcript}"`,
-          );
-          return;
-        }
-
-        this.lastTranscriptAt = Date.now();
-        this.lastTranscriptText = transcript;
-        this.lastTranscriptNorm = norm;
-        const turnId = ++this.turnSequence;
-        this.activeTurnId = turnId;
-        this.captureRecentContextsFromText(transcript, turnId, 'user');
-        this.markTiming('transcript_normalized', {
-          turnId,
-          rawLength: rawTranscript.length,
-          normalizedLength: transcript.length,
-        });
-
-        this.parentLogger.log(
-          `[voice] transcript normalized callId=${this.meta.callId} turnId=${turnId} raw="${rawTranscript}" normalized="${transcript}"`,
-        );
-
-        const reply = await this.callAgentBrain(transcript, turnId);
-        if (!reply) return;
-        if (!this.isTurnStillActive(turnId)) {
-          this.parentLogger.warn(
-            `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=agent_reply`,
-          );
-          return;
-        }
-
-        await this.speakReply(reply, turnId);
+        await this.handleCompletedTranscript(rawTranscript);
         return;
       }
 
@@ -590,12 +549,140 @@ class VoiceBridgeSession {
     }
   }
 
-  private shouldDropTranscript(text: string) {
+  private async handleCompletedTranscript(rawTranscript: string) {
+    const currentState = this.getCurrentVoiceBookingState();
+
+    if (this.shouldDropTranscript(rawTranscript, currentState)) {
+      this.parentLogger.warn(
+        `[voice] dropped transcript callId=${this.meta.callId} state=${currentState || '-'} text="${rawTranscript}"`,
+      );
+      return;
+    }
+
+    const transcript = normalizeTranscriptForAgent(
+      rawTranscript,
+      this.lastBotReplyText,
+    );
+
+    const merged = mergeVoiceFragments(
+      this.pendingTranscriptText,
+      transcript,
+      currentState,
+    );
+
+    if (shouldBufferShortVoiceTranscript(currentState, merged)) {
+      this.pendingTranscriptText = merged;
+      this.pendingTranscriptState = currentState;
+      if (this.pendingTranscriptTimer)
+        clearTimeout(this.pendingTranscriptTimer);
+      this.pendingTranscriptTimer = setTimeout(() => {
+        const buffered = this.pendingTranscriptText;
+        const bufferedState = this.pendingTranscriptState;
+        this.pendingTranscriptText = '';
+        this.pendingTranscriptState = null;
+        this.pendingTranscriptTimer = null;
+        void this.enqueueOrProcessTranscript(buffered, bufferedState);
+      }, 420);
+      this.parentLogger.log(
+        `[voice] transcript_buffered callId=${this.meta.callId} state=${currentState || '-'} text="${merged}"`,
+      );
+      return;
+    }
+
+    if (this.pendingTranscriptTimer) {
+      clearTimeout(this.pendingTranscriptTimer);
+      this.pendingTranscriptTimer = null;
+    }
+    this.pendingTranscriptText = '';
+    this.pendingTranscriptState = null;
+    await this.enqueueOrProcessTranscript(merged, currentState);
+  }
+
+  private async enqueueOrProcessTranscript(
+    transcript: string,
+    state: string | null,
+  ) {
+    if (this.agentTurnInFlight) {
+      this.activeTurnId = this.turnSequence + 1;
+      this.queuedTranscript = { text: transcript, state };
+      this.parentLogger.log(
+        `[voice] transcript_queued_latest callId=${this.meta.callId} state=${state || '-'} text="${transcript}"`,
+      );
+      return;
+    }
+    await this.processTranscriptTurn(transcript, state);
+  }
+
+  private async processTranscriptTurn(
+    transcript: string,
+    state: string | null,
+  ) {
+    const norm = normalizeTurkishForTime(transcript);
+    if (!norm || norm === this.lastTranscriptNorm) {
+      this.parentLogger.warn(
+        `[voice] duplicate transcript callId=${this.meta.callId} text="${transcript}"`,
+      );
+      return;
+    }
+
+    this.lastTranscriptAt = Date.now();
+    this.lastTranscriptText = transcript;
+    this.lastTranscriptNorm = norm;
+    const turnId = ++this.turnSequence;
+    this.activeTurnId = turnId;
+    this.agentTurnInFlight = true;
+    this.captureRecentContextsFromText(transcript, turnId, 'user');
+    this.markTiming('transcript_normalized', {
+      turnId,
+      state: state || '-',
+      normalizedLength: transcript.length,
+    });
+
+    this.parentLogger.log(
+      `[voice] transcript normalized callId=${this.meta.callId} turnId=${turnId} state=${state || '-'} normalized="${transcript}"`,
+    );
+
+    try {
+      const reply = await this.callAgentBrain(transcript, turnId);
+      if (!reply) return;
+      if (!this.isTurnStillActive(turnId)) {
+        this.parentLogger.warn(
+          `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=agent_reply`,
+        );
+        return;
+      }
+
+      await this.speakReply(reply, turnId);
+    } finally {
+      this.agentTurnInFlight = false;
+      if (this.queuedTranscript) {
+        const queued = this.queuedTranscript;
+        this.queuedTranscript = null;
+        await this.processTranscriptTurn(queued.text, queued.state);
+      }
+    }
+  }
+
+  private getCurrentVoiceBookingState(): string | null {
+    const bookingCore = (this.agentService as any)?.bookingCore as any;
+    const sessions = bookingCore?.sessions as Map<string, any> | undefined;
+    if (!sessions?.get) return null;
+    const customerPhone = normalizePhone(
+      this.meta.from ||
+        this.meta.streamSid ||
+        this.meta.callId ||
+        'voice-caller',
+    );
+    const session = sessions.get(`${this.meta.tenantId}:${customerPhone}`);
+    return session?.state ? String(session.state) : null;
+  }
+
+  private shouldDropTranscript(text: string, state?: string | null) {
     const normalized = text.trim();
     const normalizedTranscript = normalizeVoiceComparisonText(normalized);
 
     if (!normalized) return true;
-    if (normalized.length <= 1) return true;
+    if (normalized.length <= 1 && !isCriticalVoiceState(state)) return true;
     if (this.ghostRegex.test(normalized)) return true;
 
     const preservePartialBooking =
@@ -613,12 +700,14 @@ class VoiceBridgeSession {
 
     if (
       !preservePartialBooking &&
+      !isCriticalVoiceState(state) &&
       msSinceBargeIn < 180 &&
       normalized.length < 18
     )
       return true;
     if (
       !preservePartialBooking &&
+      !isCriticalVoiceState(state) &&
       msSinceSpeechStopped > 0 &&
       msSinceSpeechStopped < 120 &&
       normalized.length < 3
@@ -627,6 +716,7 @@ class VoiceBridgeSession {
 
     if (
       !preservePartialBooking &&
+      !isCriticalVoiceState(state) &&
       msSinceAssistantAudio < 280 &&
       normalized.length < 16
     ) {
@@ -725,12 +815,7 @@ class VoiceBridgeSession {
   }
 
   private maybeStartOpeningGreeting() {
-    if (
-      !this.sessionReady ||
-      !this.bridgeReady ||
-      this.hasIntroducedSelf ||
-      this.greetingInFlight
-    ) {
+    if (!this.sessionReady || this.hasIntroducedSelf || this.greetingInFlight) {
       return;
     }
 
@@ -749,28 +834,6 @@ class VoiceBridgeSession {
     void this.speakReply(openingGreeting).finally(() => {
       this.greetingInFlight = false;
     });
-  }
-
-  private async prewarmTenantVoiceContext() {
-    this.markTiming('tenant_context_prewarm_start');
-    const startedAt = Date.now();
-    try {
-      const svc: any = this.agentService as any;
-      if (typeof svc.prewarmVoiceContext === 'function') {
-        await svc.prewarmVoiceContext(this.meta.tenantId);
-      }
-      await Promise.all([
-        this.getServicesForVoiceContext(),
-        this.getStaffForVoiceContext(),
-      ]);
-      this.markTiming('tenant_context_prewarm_done', {
-        latencyMs: Date.now() - startedAt,
-      });
-    } catch (err: any) {
-      this.parentLogger.warn(
-        `[voice] tenant_context_prewarm_failed callId=${this.meta.callId} latencyMs=${Date.now() - startedAt} error=${err?.message || err}`,
-      );
-    }
   }
 
   private markTiming(
@@ -950,36 +1013,21 @@ class VoiceBridgeSession {
   }
 
   private async detectStaffMention(text: string) {
-    const cachedStaff = await this.getStaffForVoiceContext();
-    const t = normalizeTurkishForTime(text);
-    const exactCached = cachedStaff.find((item: any) => {
-      const name = normalizeTurkishForTime(
-        String(item?.name || item?.fullName || ''),
-      );
-      return name && (t === name || t.includes(name) || name.includes(t));
-    });
-    if (exactCached) return exactCached;
-
     const bookingCore = (this.agentService as any)?.bookingCore as any;
     const listStaff = bookingCore?.safeListStaff;
     if (typeof listStaff !== 'function') return null;
     try {
-      const staff = cachedStaff.length
-        ? cachedStaff
-        : await listStaff.call(bookingCore, this.meta.tenantId);
+      const staff = await listStaff.call(bookingCore, this.meta.tenantId);
+      const t = normalizeTurkishForTime(text);
       const exact = staff.find((item: any) => {
-        const name = normalizeTurkishForTime(
-          String(item?.name || item?.fullName || ''),
-        );
+        const name = normalizeTurkishForTime(String(item?.name || ''));
         return name && (t === name || t.includes(name) || name.includes(t));
       });
       if (exact) return exact;
       const words = t.split(/\s+/).filter((word) => word.length >= 3);
       return (
         staff.find((item: any) => {
-          const name = normalizeTurkishForTime(
-            String(item?.name || item?.fullName || ''),
-          );
+          const name = normalizeTurkishForTime(String(item?.name || ''));
           return words.some((word) => name.includes(word));
         }) || null
       );
@@ -1033,20 +1081,6 @@ class VoiceBridgeSession {
       this.cachedServices = [];
     }
     return this.cachedServices;
-  }
-
-  private async getStaffForVoiceContext() {
-    if (this.cachedStaff) return this.cachedStaff;
-    const bookingCore = (this.agentService as any)?.bookingCore as any;
-    const listStaff = bookingCore?.safeListStaff;
-    if (typeof listStaff !== 'function') return [];
-    try {
-      const staff = await listStaff.call(bookingCore, this.meta.tenantId);
-      this.cachedStaff = Array.isArray(staff) ? staff : [];
-    } catch {
-      this.cachedStaff = [];
-    }
-    return this.cachedStaff;
   }
 
   private captureRecentContextsFromText(
@@ -1177,6 +1211,10 @@ class VoiceBridgeSession {
         source: 'deterministic_bypass',
         replyLength: deterministicReply.reply.length,
       });
+      this.logTurnLatency('agent_reply_ready', turnId, {
+        source: 'deterministic_bypass',
+        replyLength: deterministicReply.reply.length,
+      });
       return deterministicReply.reply;
     }
 
@@ -1227,6 +1265,9 @@ class VoiceBridgeSession {
       this.markTiming('agent_reply_ready', {
         turnId,
         source: 'agent',
+        replyLength: reply.length,
+      });
+      this.logTurnLatency('agent_reply_ready', turnId, {
         replyLength: reply.length,
       });
 
@@ -1287,22 +1328,26 @@ class VoiceBridgeSession {
 
     try {
       const token = ++this.playbackToken;
-      const cachedAudio = this.getCachedTtsAudio(clean);
-
-      if (cachedAudio) {
-        this.parentLogger.log(
-          `[voice] ElevenLabs cache_playback callId=${this.meta.callId} bytes=${cachedAudio.length}`,
-        );
-        this.streamUlawBuffer(cachedAudio, token, effectiveTurnId);
-        return;
-      }
-
-      const streamResult = await this.streamGeneratedTtsAudio(
+      const ttsResult = await this.getOrCreateTtsAudio(
         clean,
         token,
         effectiveTurnId,
       );
-      if (streamResult?.streamed) {
+
+      if (!this.isTurnStillActive(effectiveTurnId)) {
+        this.parentLogger.warn(
+          `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=tts_ready`,
+        );
+        return;
+      }
+
+      if (ttsResult?.audioBuffer && token === this.playbackToken) {
+        this.parentLogger.log(
+          `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${ttsResult.audioBuffer.length} streamed=${ttsResult.streamed ? 'yes' : 'no'}`,
+        );
+        if (!ttsResult.streamed) {
+          this.streamUlawBuffer(ttsResult.audioBuffer, token, effectiveTurnId);
+        }
         return;
       }
     } catch (err) {
@@ -1318,67 +1363,11 @@ class VoiceBridgeSession {
     );
   }
 
-  private getCachedTtsAudio(text: string): Buffer | null {
-    const normalizedText = normalizeTtsCacheKey(text);
-    const isOpeningGreeting =
-      text === RealtimeBridgeService.openingGreeting ||
-      normalizedText ===
-        normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting);
-
-    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingAudio) {
-      this.parentLogger.log(
-        `[voice] opening_greeting_cache_hit callId=${this.meta.callId} bytes=${RealtimeBridgeService.openingGreetingAudio.length}`,
-      );
-      this.markTiming('tts_cache_hit', {
-        cache: 'opening_greeting',
-        textLength: text.length,
-      });
-      return RealtimeBridgeService.openingGreetingAudio;
-    }
-
-    const cached =
-      RealtimeBridgeService.shortReplyAudioCache.get(normalizedText);
-    if (cached) {
-      this.parentLogger.log(
-        `[voice] tts_cache_hit callId=${this.meta.callId} key=${JSON.stringify(normalizedText)} bytes=${cached.length}`,
-      );
-      this.markTiming('tts_cache_hit', {
-        cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
-        textLength: text.length,
-      });
-      return cached;
-    }
-
-    this.parentLogger.log(
-      `[voice] tts_cache_miss callId=${this.meta.callId} key=${JSON.stringify(normalizedText)}`,
-    );
-    this.markTiming('tts_cache_miss', {
-      cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
-      textLength: text.length,
-    });
-    return null;
-  }
-
-  private async streamGeneratedTtsAudio(
+  private async generateElevenLabsAudio(
     text: string,
-    token: number,
-    turnId: number,
-  ): Promise<{ streamed: boolean; bytes: number }> {
-    const normalizedText = normalizeTtsCacheKey(text);
-    const isOpeningGreeting =
-      text === RealtimeBridgeService.openingGreeting ||
-      normalizedText ===
-        normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting);
-
-    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingPromise) {
-      const audioBuffer = await RealtimeBridgeService.openingGreetingPromise;
-      if (audioBuffer && token === this.playbackToken) {
-        this.streamUlawBuffer(audioBuffer, token, turnId);
-        return { streamed: true, bytes: audioBuffer.length };
-      }
-      return { streamed: false, bytes: 0 };
-    }
-
+    token?: number,
+    turnId?: number,
+  ): Promise<{ audioBuffer: Buffer | null; streamed: boolean }> {
     this.markTiming('elevenlabs_request_start', {
       textLength: text.length,
     });
@@ -1387,18 +1376,18 @@ class VoiceBridgeSession {
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
     if (!apiKey || !voiceId) {
       this.parentLogger.error('[voice] ElevenLabs API key or voice ID missing');
-      return { streamed: false, bytes: 0 };
+      return { audioBuffer: null, streamed: false };
     }
 
     const controller = new AbortController();
     this.currentTtsAbort = controller;
-    const startedAt = Date.now();
 
-    const synthesizePromise = (async () => {
+    try {
       const modelId =
         process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
+
       const response = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000&optimize_streaming_latency=3`,
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000`,
         {
           method: 'POST',
           headers: {
@@ -1422,136 +1411,53 @@ class VoiceBridgeSession {
       this.markTiming('elevenlabs_first_byte', {
         status: response.status,
         ok: response.ok,
-        latencyMs: Date.now() - startedAt,
       });
 
       if (!response.ok) {
         const bodyText = await response.text();
-        throw new Error(`ElevenLabs TTS error: ${response.status} ${bodyText}`);
+        this.parentLogger.error(
+          `[voice] ElevenLabs TTS error: ${response.status} ${bodyText}`,
+        );
+        return { audioBuffer: null, streamed: false };
       }
 
-      if (!response.body) {
-        const arrayBuffer = await response.arrayBuffer();
-        return Buffer.from(arrayBuffer);
-      }
+      const streamed =
+        this.realtimeTtsStreamingEnabled &&
+        !!response.body &&
+        token != null &&
+        turnId != null
+          ? await this.streamElevenLabsResponse(response, token, turnId)
+          : null;
 
-      const reader = response.body.getReader();
-      const chunks: Buffer[] = [];
-      let bytes = 0;
-      let pending = Buffer.alloc(0);
-      let sentAnyAudio = false;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!value?.length) continue;
-        const chunk = Buffer.from(value);
-        chunks.push(chunk);
-        bytes += chunk.length;
-        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-
-        while (pending.length >= this.ulawFrameBytes) {
-          if (
-            this.closed ||
-            token !== this.playbackToken ||
-            !this.isTurnStillActive(turnId) ||
-            !this.assistantSpeaking
-          ) {
-            return Buffer.concat(chunks);
-          }
-
-          const frame = pending.subarray(0, this.ulawFrameBytes);
-          pending = pending.subarray(this.ulawFrameBytes);
-          this.sendAudioFrame(frame, bytes, sentAnyAudio);
-          sentAnyAudio = true;
-        }
-      }
-
-      if (pending.length) {
-        const padded = Buffer.alloc(this.ulawFrameBytes, 0xff);
-        pending.copy(padded);
-        this.sendAudioFrame(padded, bytes, sentAnyAudio);
-      }
-
-      this.markTiming('elevenlabs_success', {
-        bytes,
-        streamed: true,
-      });
-
-      return Buffer.concat(chunks);
-    })();
-
-    if (isOpeningGreeting) {
-      RealtimeBridgeService.openingGreetingPromise = synthesizePromise
-        .then((audioBuffer) => {
-          RealtimeBridgeService.openingGreetingAudio = audioBuffer;
-          RealtimeBridgeService.shortReplyAudioCache.set(
-            normalizedText,
-            audioBuffer,
-          );
-          return audioBuffer;
-        })
-        .finally(() => {
-          RealtimeBridgeService.openingGreetingPromise = null;
+      if (streamed?.audioBuffer) {
+        this.markTiming('elevenlabs_success', {
+          bytes: streamed.audioBuffer.length,
+          streamed: true,
         });
-    }
-
-    try {
-      const audioBuffer = await synthesizePromise;
-      if (audioBuffer?.length) {
-        RealtimeBridgeService.shortReplyAudioCache.set(
-          normalizedText,
-          audioBuffer,
-        );
-        if (isOpeningGreeting) {
-          RealtimeBridgeService.openingGreetingAudio = audioBuffer;
-        }
-        this.parentLogger.log(
-          `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${audioBuffer.length} streamed=true`,
-        );
-        this.assistantSpeaking = false;
-        this.currentPlaybackDurationMs = 0;
-        this.currentPlaybackOffsetBytes = 0;
-        return { streamed: true, bytes: audioBuffer.length };
+        return { audioBuffer: streamed.audioBuffer, streamed: true };
       }
-      return { streamed: false, bytes: 0 };
+
+      const arrayBuffer = await response.arrayBuffer();
+      const audioBuffer = Buffer.from(arrayBuffer);
+      this.markTiming('elevenlabs_success', {
+        bytes: audioBuffer.length,
+        streamed: false,
+      });
+      return { audioBuffer, streamed: false };
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         this.parentLogger.warn(
           `[voice] ElevenLabs synthesis aborted callId=${this.meta.callId} reason=barge_in_or_cancel`,
         );
-        return { streamed: false, bytes: 0 };
+        return { audioBuffer: null, streamed: false };
       }
-      this.parentLogger.error(
-        `[voice] ElevenLabs TTS error callId=${this.meta.callId}: ${err?.message || err}`,
-      );
-      return { streamed: false, bytes: 0 };
+      this.parentLogger.error(`[voice] ElevenLabs TTS error: ${err}`);
+      return { audioBuffer: null, streamed: false };
     } finally {
       if (this.currentTtsAbort === controller) {
         this.currentTtsAbort = null;
       }
     }
-  }
-
-  private sendAudioFrame(
-    frame: Buffer,
-    totalBytes: number,
-    alreadySentAudio: boolean,
-  ) {
-    this.lastAssistantAudioAt = Date.now();
-    this.currentPlaybackOffsetBytes += frame.length;
-    if (!alreadySentAudio) {
-      if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
-        this.openingGreetingProtectionUntil =
-          this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
-      }
-      this.markTiming('final_audio_send_start', { bytes: totalBytes });
-    }
-
-    this.sendBridge({
-      event: 'media',
-      media: { payload: frame.toString('base64') },
-    });
   }
 
   private buildDeterministicShortReply(
@@ -1611,6 +1517,222 @@ class VoiceBridgeSession {
     return null;
   }
 
+  private async getOrCreateTtsAudio(
+    text: string,
+    token?: number,
+    turnId?: number,
+  ): Promise<{ audioBuffer: Buffer | null; streamed: boolean } | null> {
+    const normalizedText = normalizeTtsCacheKey(text);
+    const isOpeningGreeting =
+      text === RealtimeBridgeService.openingGreeting ||
+      normalizedText ===
+        normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting);
+
+    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingAudio) {
+      this.parentLogger.log(
+        `[voice] opening_greeting_cache_hit callId=${this.meta.callId} bytes=${RealtimeBridgeService.openingGreetingAudio.length}`,
+      );
+      this.markTiming('tts_cache_hit', {
+        cache: 'opening_greeting',
+        textLength: text.length,
+      });
+      return {
+        audioBuffer: RealtimeBridgeService.openingGreetingAudio,
+        streamed: false,
+      };
+    }
+
+    const cached =
+      RealtimeBridgeService.shortReplyAudioCache.get(normalizedText);
+    if (cached) {
+      this.parentLogger.log(
+        `[voice] tts_cache_hit callId=${this.meta.callId} key=${JSON.stringify(normalizedText)} bytes=${cached.length}`,
+      );
+      this.markTiming('tts_cache_hit', {
+        cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
+        textLength: text.length,
+      });
+      return { audioBuffer: cached, streamed: false };
+    }
+
+    if (isOpeningGreeting) {
+      this.parentLogger.log(
+        `[voice] opening_greeting_cache_miss callId=${this.meta.callId}`,
+      );
+    } else {
+      this.parentLogger.log(
+        `[voice] tts_cache_miss callId=${this.meta.callId} key=${JSON.stringify(normalizedText)}`,
+      );
+    }
+
+    this.markTiming('tts_cache_miss', {
+      cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
+      textLength: text.length,
+    });
+
+    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingPromise) {
+      return (
+        RealtimeBridgeService.openingGreetingPromise?.then((audioBuffer) => ({
+          audioBuffer,
+          streamed: false,
+        })) || null
+      );
+    }
+
+    const synthesisPromise = this.generateElevenLabsAudio(text, token, turnId)
+      .then((result) => {
+        const audioBuffer = result?.audioBuffer || null;
+        if (audioBuffer) {
+          RealtimeBridgeService.shortReplyAudioCache.set(
+            normalizedText,
+            audioBuffer,
+          );
+          if (isOpeningGreeting) {
+            RealtimeBridgeService.openingGreetingAudio = audioBuffer;
+          }
+        }
+        return { audioBuffer, streamed: Boolean(result?.streamed) };
+      })
+      .finally(() => {
+        if (isOpeningGreeting) {
+          RealtimeBridgeService.openingGreetingPromise = null;
+        }
+      });
+
+    if (isOpeningGreeting) {
+      RealtimeBridgeService.openingGreetingPromise = synthesisPromise.then(
+        (result) => result.audioBuffer,
+      );
+    }
+
+    return synthesisPromise;
+  }
+
+  private async streamElevenLabsResponse(
+    response: Response,
+    token: number,
+    turnId: number,
+  ): Promise<{ audioBuffer: Buffer; streamed: boolean } | null> {
+    const reader = response.body?.getReader();
+    if (!reader) return null;
+
+    const chunks: Buffer[] = [];
+    let pending = Buffer.alloc(0);
+    let totalBytes = 0;
+    let sentBytes = 0;
+    let firstChunkSent = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.length) continue;
+
+      const chunk = Buffer.from(value);
+      chunks.push(chunk);
+      totalBytes += chunk.length;
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+
+      while (pending.length >= this.ulawFrameBytes) {
+        if (
+          this.closed ||
+          token !== this.playbackToken ||
+          !this.isTurnStillActive(turnId)
+        ) {
+          return {
+            audioBuffer: Buffer.concat(chunks, totalBytes),
+            streamed: false,
+          };
+        }
+
+        const frame = pending.subarray(0, this.ulawFrameBytes);
+        pending = pending.subarray(this.ulawFrameBytes);
+        this.currentPlaybackOffsetBytes = sentBytes;
+        this.lastAssistantAudioAt = Date.now();
+        if (!firstChunkSent) {
+          firstChunkSent = true;
+          this.markTiming('final_audio_send_start', {
+            bytes: totalBytes,
+            streaming: true,
+          });
+          this.logTurnLatency('assistant_first_audio_streaming', turnId, {
+            ttsBufferedBytes: totalBytes,
+          });
+          if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
+            this.openingGreetingProtectionUntil =
+              this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
+          }
+        }
+        this.sendBridge({
+          event: 'media',
+          media: { payload: frame.toString('base64') },
+        });
+        sentBytes += frame.length;
+      }
+    }
+
+    if (pending.length > 0) {
+      const padded = Buffer.alloc(this.ulawFrameBytes, 0xff);
+      pending.copy(padded);
+      if (
+        !this.closed &&
+        token === this.playbackToken &&
+        this.isTurnStillActive(turnId)
+      ) {
+        this.currentPlaybackOffsetBytes = sentBytes;
+        this.lastAssistantAudioAt = Date.now();
+        if (!firstChunkSent) {
+          firstChunkSent = true;
+          this.markTiming('final_audio_send_start', {
+            bytes: totalBytes,
+            streaming: true,
+          });
+          this.logTurnLatency('assistant_first_audio_streaming', turnId, {
+            ttsBufferedBytes: totalBytes,
+          });
+        }
+        this.sendBridge({
+          event: 'media',
+          media: { payload: padded.toString('base64') },
+        });
+        sentBytes += padded.length;
+      }
+    }
+
+    this.currentPlaybackDurationMs =
+      Math.ceil(sentBytes / this.ulawFrameBytes) * this.ulawFrameMs;
+    this.currentPlaybackOffsetBytes = sentBytes;
+    this.assistantSpeaking = false;
+    this.activeResponse = false;
+    return {
+      audioBuffer: Buffer.concat(chunks, totalBytes),
+      streamed: firstChunkSent,
+    };
+  }
+
+  private logTurnLatency(
+    label: string,
+    turnId?: number,
+    extra: Record<string, unknown> = {},
+  ) {
+    const now = Date.now();
+    const parts = [
+      `label=${label}`,
+      `callId=${this.meta.callId}`,
+      `turnId=${turnId ?? this.activeTurnId}`,
+      this.lastSpeechStoppedAt
+        ? `sinceSpeechStopped=${now - this.lastSpeechStoppedAt}ms`
+        : '',
+      this.timings.agent_processing_start
+        ? `sinceAgentStart=${now - this.timings.agent_processing_start}ms`
+        : '',
+      this.timings.agent_reply_ready
+        ? `sinceAgentReplyReady=${now - this.timings.agent_reply_ready}ms`
+        : '',
+      ...Object.entries(extra).map(([key, value]) => `${key}=${String(value)}`),
+    ].filter(Boolean);
+    this.parentLogger.log(`[voice][latency] ${parts.join(' ')}`);
+  }
+
   private streamUlawBuffer(buf: Buffer, token: number, turnId: number) {
     if (!buf.length || token !== this.playbackToken) return;
     if (!this.isTurnStillActive(turnId)) {
@@ -1650,7 +1772,13 @@ class VoiceBridgeSession {
           this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
       }
       if (offset === 0) {
-        this.markTiming('final_audio_send_start', { bytes: buf.length });
+        this.markTiming('final_audio_send_start', {
+          bytes: buf.length,
+          streaming: false,
+        });
+        this.logTurnLatency('assistant_first_audio_buffered', turnId, {
+          totalBytes: buf.length,
+        });
         if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
           this.parentLogger.log(
             `[voice] opening_greeting_audio_sent callId=${this.meta.callId} bytes=${buf.length}`,
@@ -1683,6 +1811,14 @@ class VoiceBridgeSession {
   private safeClose() {
     if (this.closed) return;
     this.closed = true;
+
+    if (this.pendingTranscriptTimer) {
+      clearTimeout(this.pendingTranscriptTimer);
+      this.pendingTranscriptTimer = null;
+    }
+    this.pendingTranscriptText = '';
+    this.pendingTranscriptState = null;
+    this.queuedTranscript = null;
 
     this.cancelAssistantAudio('close');
 
@@ -1816,6 +1952,44 @@ function normalizeTranscriptForAgent(
   }
 
   return text;
+}
+
+function isCriticalVoiceState(state?: string | null) {
+  return (
+    state === 'WAIT_NAME' || state === 'WAIT_DATETIME' || state === 'WAIT_STAFF'
+  );
+}
+
+export function shouldBufferShortVoiceTranscript(
+  state: string | null | undefined,
+  transcript: string,
+) {
+  if (!isCriticalVoiceState(state)) return false;
+  const normalized = normalizeTurkishForTime(transcript);
+  if (!normalized) return false;
+  if (state === 'WAIT_NAME') return normalized.length <= 12;
+  if (state === 'WAIT_STAFF') return normalized.length <= 18;
+  if (state === 'WAIT_DATETIME') return normalized.length <= 20;
+  return false;
+}
+
+export function mergeVoiceFragments(
+  previous: string,
+  incoming: string,
+  state: string | null | undefined,
+) {
+  const prev = String(previous || '').trim();
+  const next = String(incoming || '').trim();
+  if (!prev) return next;
+  if (!next) return prev;
+  if (!isCriticalVoiceState(state)) return next;
+  const prevNorm = normalizeTurkishForTime(prev);
+  const nextNorm = normalizeTurkishForTime(next);
+  if (!prevNorm || !nextNorm || prevNorm === nextNorm) return next;
+  if (state === 'WAIT_NAME' || state === 'WAIT_STAFF')
+    return `${prev} ${next}`.trim();
+  if (state === 'WAIT_DATETIME') return `${prev} ${next}`.trim();
+  return next;
 }
 
 function normalizeTurkishForTime(s: string) {
@@ -2083,8 +2257,8 @@ function shortenReplyForPhone(text: string) {
     out = sentenceParts.slice(0, 2).join(' ');
   }
 
-  if (out.length > 160) {
-    const shortened = out.slice(0, 160);
+  if (out.length > 220) {
+    const shortened = out.slice(0, 220);
     const cutAt = Math.max(
       shortened.lastIndexOf('. '),
       shortened.lastIndexOf('? '),
