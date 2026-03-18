@@ -41,6 +41,9 @@ type VoiceTimingStage =
   | 'openai_connected'
   | 'session_created'
   | 'session_updated'
+  | 'opening_greeting_queued'
+  | 'opening_greeting_tts_start'
+  | 'opening_greeting_audio_sent'
   | 'first_greeting_started'
   | 'speech_started'
   | 'speech_stopped'
@@ -106,6 +109,10 @@ class VoiceBridgeSession {
   private greeted = false;
   private bridgeReady = false;
   private greetingInFlight = false;
+  private openingGreetingQueued = false;
+  private openingGreetingStarted = false;
+  private openingGreetingFinished = false;
+  private pendingInboundAudio: string[] = [];
   private turnSequence = 0;
 
   private lastAssistantAudioAt = 0;
@@ -297,6 +304,11 @@ class VoiceBridgeSession {
       const payload = msg.media?.payload;
       if (!payload) return;
 
+      if (!this.openingGreetingStarted) {
+        this.bufferInboundAudioUntilGreetingStarts(payload);
+        return;
+      }
+
       this.handlePossibleBargeIn(payload);
 
       if (
@@ -413,6 +425,12 @@ class VoiceBridgeSession {
           `[voice] speech_started callId=${this.meta.callId}`,
         );
         this.lastBargeInAt = Date.now();
+        if (!this.openingGreetingStarted) {
+          this.parentLogger.log(
+            `[voice] speech_started buffered_until_opening callId=${this.meta.callId}`,
+          );
+          return;
+        }
         // Aggressive barge-in: stop any queued playback immediately.
         this.cancelAssistantAudio('speech_started');
         return;
@@ -510,6 +528,38 @@ class VoiceBridgeSession {
     return rms >= this.speechEnergyThreshold;
   }
 
+  private bufferInboundAudioUntilGreetingStarts(payload: string) {
+    if (this.pendingInboundAudio.length >= 12) {
+      this.pendingInboundAudio.shift();
+    }
+    this.pendingInboundAudio.push(payload);
+  }
+
+  private flushBufferedInboundAudio(reason: string) {
+    if (!this.pendingInboundAudio.length) return;
+
+    const pending = this.pendingInboundAudio.splice(0);
+    this.parentLogger.log(
+      `[voice] flushing_buffered_audio callId=${this.meta.callId} frames=${pending.length} reason=${reason}`,
+    );
+
+    for (const payload of pending) {
+      this.handlePossibleBargeIn(payload);
+
+      if (
+        this.assistantSpeaking &&
+        !this.shouldPassInboundDuringAssistant(payload)
+      ) {
+        continue;
+      }
+
+      this.sendOpenAi({
+        type: 'input_audio_buffer.append',
+        audio: payload,
+      });
+    }
+  }
+
   private maybeStartOpeningGreeting() {
     if (
       !this.sessionReady ||
@@ -522,8 +572,12 @@ class VoiceBridgeSession {
 
     this.greeted = true;
     this.greetingInFlight = true;
+    this.openingGreetingQueued = true;
 
     const openingGreeting = 'Merhaba, nasıl yardımcı olabilirim?';
+    this.markTiming('opening_greeting_queued', {
+      textLength: openingGreeting.length,
+    });
     this.markTiming('first_greeting_started', {
       textLength: openingGreeting.length,
     });
@@ -531,8 +585,11 @@ class VoiceBridgeSession {
       `[voice] opening_greeting callId=${this.meta.callId} text="${openingGreeting}"`,
     );
 
-    void this.speakReply(openingGreeting).finally(() => {
+    void this.speakReply(openingGreeting, { isOpeningGreeting: true }).finally(() => {
       this.greetingInFlight = false;
+      if (!this.openingGreetingStarted) {
+        this.flushBufferedInboundAudio('opening_greeting_not_started');
+      }
     });
   }
 
@@ -678,7 +735,10 @@ class VoiceBridgeSession {
     }
   }
 
-  private async speakReply(replyText: string) {
+  private async speakReply(
+    replyText: string,
+    options: { isOpeningGreeting?: boolean } = {},
+  ) {
     const openingGreeting = 'Merhaba, nasıl yardımcı olabilirim?';
     const rewritten = rewriteAgentReplyForVoice(replyText);
     const spoken =
@@ -703,6 +763,11 @@ class VoiceBridgeSession {
 
     try {
       const token = ++this.playbackToken;
+      if (options.isOpeningGreeting) {
+        this.markTiming('opening_greeting_tts_start', {
+          textLength: clean.length,
+        });
+      }
       this.markTiming('elevenlabs_request_start', {
         textLength: clean.length,
       });
@@ -712,7 +777,7 @@ class VoiceBridgeSession {
         this.parentLogger.log(
           `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${audioBuffer.length}`,
         );
-        this.streamUlawBuffer(audioBuffer, token);
+        this.streamUlawBuffer(audioBuffer, token, options);
         return;
       }
     } catch (err) {
@@ -809,7 +874,11 @@ class VoiceBridgeSession {
     return null;
   }
 
-  private streamUlawBuffer(buf: Buffer, token: number) {
+  private streamUlawBuffer(
+    buf: Buffer,
+    token: number,
+    options: { isOpeningGreeting?: boolean } = {},
+  ) {
     if (!buf.length || token !== this.playbackToken) return;
 
     let offset = 0;
@@ -823,11 +892,19 @@ class VoiceBridgeSession {
       if (!chunk.length) {
         this.assistantSpeaking = false;
         this.playbackTimer = null;
+        if (options.isOpeningGreeting) {
+          this.openingGreetingFinished = true;
+        }
         return;
       }
 
       this.lastAssistantAudioAt = Date.now();
       if (offset === 0) {
+        if (options.isOpeningGreeting) {
+          this.openingGreetingStarted = true;
+          this.markTiming('opening_greeting_audio_sent', { bytes: buf.length });
+          this.flushBufferedInboundAudio('opening_greeting_started');
+        }
         this.markTiming('final_audio_send_start', { bytes: buf.length });
       }
 
@@ -1160,16 +1237,44 @@ function shortenReplyForPhone(text: string) {
     .filter(Boolean);
 
   if (sentenceParts.length > 1) {
-    out = sentenceParts[0] || out;
+    const first = sentenceParts[0] || '';
+    const second = sentenceParts[1] || '';
+    if (shouldKeepTwoSentenceReply(first, second)) {
+      out = `${first} ${second}`.trim();
+    } else {
+      out = first || out;
+    }
   }
 
-  if (out.length > 140) {
-    out = out.slice(0, 140).trim();
+  if (out.length > 170) {
+    out = out.slice(0, 170).trim();
     out = out.replace(/[,:;\s]+$/g, '');
     if (!/[.!?]$/.test(out)) out += '.';
   }
 
   return out.replace(/\s{2,}/g, ' ').trim();
+}
+
+function shouldKeepTwoSentenceReply(first: string, second: string) {
+  const normalizedFirst = normalizeTurkishForTime(first);
+  const normalizedSecond = normalizeTurkishForTime(second);
+
+  if (!normalizedFirst || !normalizedSecond) return false;
+
+  const greetingOnly = /^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin|hos geldiniz)[.!? ]*$/.test(
+    normalizedFirst,
+  );
+  const actionableSecond = /(nasil yardimci olabilirim|hangi hizmet|hangi islem|hangi gun|hangi saat|tercih edersiniz|soyler misiniz|deneyelim|devam edelim|yardimci olayim)/.test(
+    normalizedSecond,
+  );
+
+  if (greetingOnly && actionableSecond) return true;
+
+  if (first.length < 20 && second.length < 110 && actionableSecond) {
+    return true;
+  }
+
+  return false;
 }
 
 function naturalTimeSpeech(hhmm: string) {
