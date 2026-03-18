@@ -227,12 +227,12 @@ class VoiceBridgeSession {
   private speechEnergyFrames = 0;
   private lastObservedSpeechEnergy = 0;
   private ambientNoiseRms = 0;
-  private readonly minSpeechEnergyThreshold = 200;
-  private readonly maxSpeechEnergyThreshold = 400;
-  private readonly speechEnergyThreshold = 260;
-  private readonly speechFramesForBargeIn = 3;
-  private readonly assistantGuardMs = 400;
-  private readonly openingGreetingBargeInGuardMs = 500;
+  private readonly minSpeechEnergyThreshold = 220;
+  private readonly maxSpeechEnergyThreshold = 520;
+  private readonly speechEnergyThreshold = 300;
+  private readonly speechFramesForBargeIn = 4;
+  private readonly assistantGuardMs = 650;
+  private readonly openingGreetingBargeInGuardMs = 900;
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
@@ -264,6 +264,10 @@ class VoiceBridgeSession {
   private lastOpeningGreetingIgnoreLogAt = 0;
   private lastBargeInSuppressLogAt = 0;
   private lastBargeInSuppressReason = '';
+  private lastChunkSummaryLogAt = 0;
+  private outboundAudioChunkCount = 0;
+  private outboundAudioByteCount = 0;
+  private readonly debugVoice = process.env.DEBUG_VOICE === '1';
   private lastCancellationReason:
     | 'real_barge_in'
     | 'new_reply'
@@ -476,15 +480,12 @@ class VoiceBridgeSession {
         this.parentLogger.log(
           `[voice] session.updated callId=${this.meta.callId}`,
         );
-        this.parentLogger.log(
-          `[voice] opening_greeting_queued callId=${this.meta.callId} sessionReady=${this.sessionReady} bridgeReady=${this.bridgeReady}`,
-        );
         this.maybeStartOpeningGreeting();
         return;
 
       case 'response.created':
-        this.assistantSpeaking = true;
         this.activeResponse = true;
+        this.assistantSpeaking = true;
         this.assistantStartedAt = Date.now();
         this.parentLogger.log(
           `[voice] response.created callId=${this.meta.callId}`,
@@ -508,8 +509,7 @@ class VoiceBridgeSession {
       case 'response.output_audio.done':
       case 'response.audio.done':
       case 'response.done':
-        this.assistantSpeaking = false;
-        this.activeResponse = false;
+        this.completeAssistantPlayback(`openai_${evt.type}`);
         this.parentLogger.log(`[voice] ${evt.type} callId=${this.meta.callId}`);
         return;
 
@@ -779,12 +779,14 @@ class VoiceBridgeSession {
   }
 
   private getAdaptiveSpeechThreshold() {
-    const adaptive = Math.round(this.ambientNoiseRms * 2);
+    const ambientFloor = this.ambientNoiseRms
+      ? Math.round(this.ambientNoiseRms * 1.85 + 110)
+      : this.speechEnergyThreshold;
     return Math.max(
       this.minSpeechEnergyThreshold,
       Math.min(
         this.maxSpeechEnergyThreshold,
-        Math.max(this.speechEnergyThreshold, adaptive),
+        Math.max(this.speechEnergyThreshold, ambientFloor),
       ),
     );
   }
@@ -793,7 +795,7 @@ class VoiceBridgeSession {
     if (!Number.isFinite(rms) || rms <= 0) return;
     if (this.assistantSpeaking || this.speechEnergyFrames > 0) return;
     this.ambientNoiseRms = this.ambientNoiseRms
-      ? this.ambientNoiseRms * 0.92 + rms * 0.08
+      ? this.ambientNoiseRms * 0.95 + rms * 0.05
       : rms;
   }
 
@@ -837,11 +839,28 @@ class VoiceBridgeSession {
     await this.speakReply('Buyurun, sizi dinliyorum.');
   }
 
-  private sendAudioChunk(chunk: Buffer) {
+  private sendAudioChunk(
+    chunk: Buffer,
+    source: 'streaming' | 'buffered' = 'buffered',
+  ) {
     if (!chunk.length) return;
-    this.parentLogger.log(
-      `[voice] audio_chunk_sent callId=${this.meta.callId} size=${chunk.length}`,
-    );
+    this.outboundAudioChunkCount += 1;
+    this.outboundAudioByteCount += chunk.length;
+
+    if (this.debugVoice) {
+      this.parentLogger.debug(
+        `[voice] audio_chunk_sent callId=${this.meta.callId} source=${source} size=${chunk.length} chunkIndex=${this.outboundAudioChunkCount}`,
+      );
+    } else {
+      const now = Date.now();
+      if (now - this.lastChunkSummaryLogAt >= 4000) {
+        this.lastChunkSummaryLogAt = now;
+        this.parentLogger.debug(
+          `[voice] audio_stream_progress callId=${this.meta.callId} source=${source} chunks=${this.outboundAudioChunkCount} bytes=${this.outboundAudioByteCount}`,
+        );
+      }
+    }
+
     this.sendBridge({
       event: 'media',
       media: { payload: chunk.toString('base64') },
@@ -881,11 +900,17 @@ class VoiceBridgeSession {
       return;
     }
 
+    const echoWindowMs =
+      this.lastBotReplyText === RealtimeBridgeService.openingGreeting
+        ? 240
+        : 160;
     if (rms >= threshold) {
       this.speechEnergyFrames += 1;
-      this.parentLogger.log(
-        `[voice] speech_detected callId=${this.meta.callId} rms=${rms.toFixed(0)} threshold=${threshold} ambient=${this.ambientNoiseRms.toFixed(0)} frames=${this.speechEnergyFrames}`,
-      );
+      if (this.debugVoice) {
+        this.parentLogger.debug(
+          `[voice] speech_detected callId=${this.meta.callId} rms=${rms.toFixed(0)} threshold=${threshold} ambient=${this.ambientNoiseRms.toFixed(0)} frames=${this.speechEnergyFrames}`,
+        );
+      }
     } else {
       if (rms > 0) {
         this.logBargeInSuppressed(
@@ -905,7 +930,7 @@ class VoiceBridgeSession {
       return;
     }
 
-    if (now - this.lastAssistantAudioAt < 120) {
+    if (now - this.lastAssistantAudioAt < echoWindowMs) {
       this.logBargeInSuppressed(
         'probable_echo',
         `sinceAssistantAudio=${now - this.lastAssistantAudioAt} rms=${rms.toFixed(0)}`,
@@ -949,7 +974,22 @@ class VoiceBridgeSession {
   }
 
   private maybeStartOpeningGreeting() {
-    if (!this.sessionReady || this.hasIntroducedSelf || this.greetingInFlight) {
+    const canStart =
+      !this.closed &&
+      this.sessionReady &&
+      this.bridgeReady &&
+      !this.hasIntroducedSelf &&
+      !this.greetingInFlight &&
+      !this.agentTurnInFlight &&
+      !this.pendingTranscriptText.trim() &&
+      !this.queuedTranscript;
+
+    if (!canStart) {
+      if (this.debugVoice || (this.sessionReady && !this.bridgeReady)) {
+        this.parentLogger.debug(
+          `[voice] opening_greeting_waiting callId=${this.meta.callId} sessionReady=${this.sessionReady} bridgeReady=${this.bridgeReady} greetingInFlight=${this.greetingInFlight} introduced=${this.hasIntroducedSelf} agentTurnInFlight=${this.agentTurnInFlight} pendingTranscript=${this.pendingTranscriptText ? 'yes' : 'no'} queuedTranscript=${this.queuedTranscript ? 'yes' : 'no'}`,
+        );
+      }
       return;
     }
 
@@ -1022,17 +1062,25 @@ class VoiceBridgeSession {
     ) {
       this.logOpeningGreetingIgnore(this.getAssistantProtectionMsRemaining());
     }
-    if (
-      now - this.lastBargeInSuppressLogAt < 900 &&
-      this.lastBargeInSuppressReason === reason
-    ) {
+
+    const throttleMs = reason === this.lastBargeInSuppressReason ? 2500 : 1200;
+    if (now - this.lastBargeInSuppressLogAt < throttleMs) {
+      if (this.debugVoice) {
+        this.parentLogger.debug(
+          `[voice] barge_in_suppressed callId=${this.meta.callId} reason=${reason}${detail ? ` ${detail}` : ''}`,
+        );
+      }
       return;
     }
+
     this.lastBargeInSuppressLogAt = now;
     this.lastBargeInSuppressReason = reason;
-    this.parentLogger.log(
-      `[voice] barge_in_suppressed callId=${this.meta.callId} reason=${reason}${detail ? ` ${detail}` : ''}`,
-    );
+    const message = `[voice] barge_in_suppressed callId=${this.meta.callId} reason=${reason}${detail ? ` ${detail}` : ''}`;
+    if (this.debugVoice) {
+      this.parentLogger.debug(message);
+      return;
+    }
+    this.parentLogger.log(message);
   }
 
   private isMeaningfulPartialBookingTranscript(text: string) {
@@ -1318,13 +1366,44 @@ class VoiceBridgeSession {
       `[voice] assistant output cleared callId=${this.meta.callId} reason=${reason}`,
     );
 
+    this.resetAssistantPlaybackState(`cancel_${reason}`);
+  }
+
+  private resetAssistantPlaybackState(reason: string) {
+    const hadPlayback =
+      this.assistantSpeaking ||
+      this.activeResponse ||
+      this.currentPlaybackDurationMs > 0 ||
+      this.currentPlaybackOffsetBytes > 0 ||
+      this.outboundAudioChunkCount > 0;
+
     this.assistantSpeaking = false;
     this.activeResponse = false;
+    this.assistantStartedAt = 0;
     this.currentPlaybackDurationMs = 0;
     this.currentPlaybackOffsetBytes = 0;
+    this.currentReplyTurnId = 0;
     this.assistantPlaybackProtectionUntil = 0;
     this.openingGreetingProtectionUntil = 0;
     this.lastObservedSpeechEnergy = 0;
+    this.speechEnergyFrames = 0;
+
+    if (hadPlayback) {
+      this.parentLogger.log(
+        `[voice] playback_state_reset callId=${this.meta.callId} reason=${reason} chunks=${this.outboundAudioChunkCount} bytes=${this.outboundAudioByteCount}`,
+      );
+    }
+
+    this.outboundAudioChunkCount = 0;
+    this.outboundAudioByteCount = 0;
+    this.lastChunkSummaryLogAt = 0;
+  }
+
+  private completeAssistantPlayback(reason: string) {
+    this.parentLogger.log(
+      `[voice] playback_completed callId=${this.meta.callId} reason=${reason} durationMs=${this.currentPlaybackDurationMs} bytesSent=${this.outboundAudioByteCount} chunksSent=${this.outboundAudioChunkCount}`,
+    );
+    this.resetAssistantPlaybackState(reason);
   }
 
   private async callAgentBrain(
@@ -1494,7 +1573,11 @@ class VoiceBridgeSession {
     this.currentReplyTurnId = effectiveTurnId;
     this.captureRecentContextsFromText(clean, effectiveTurnId, 'assistant');
     this.assistantSpeaking = true;
+    this.activeResponse = false;
     this.assistantStartedAt = Date.now();
+    this.outboundAudioChunkCount = 0;
+    this.outboundAudioByteCount = 0;
+    this.lastChunkSummaryLogAt = 0;
 
     this.parentLogger.log(
       `[voice] final_outgoing_text_before_elevenlabs callId=${this.meta.callId} text="${clean}"`,
@@ -1518,6 +1601,7 @@ class VoiceBridgeSession {
         this.parentLogger.warn(
           `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=tts_ready`,
         );
+        this.resetAssistantPlaybackState('stale_turn_tts_ready');
         return;
       }
 
@@ -1530,14 +1614,19 @@ class VoiceBridgeSession {
         }
         return;
       }
+
+      this.resetAssistantPlaybackState('tts_empty');
     } catch (err) {
       this.parentLogger.error(
         `[voice] ElevenLabs failure callId=${this.meta.callId}: ${err}`,
       );
     }
 
-    this.assistantSpeaking = false;
-    this.activeResponse = false;
+    this.resetAssistantPlaybackState(
+      this.lastCancellationReason
+        ? `tts_cancelled_${this.lastCancellationReason}`
+        : 'tts_unavailable',
+    );
     this.parentLogger.warn(
       `[voice] tts_skipped callId=${this.meta.callId} reason=${this.lastCancellationReason ? `cancelled_${this.lastCancellationReason}` : 'elevenlabs_unavailable'}`,
     );
@@ -1836,7 +1925,7 @@ class VoiceBridgeSession {
         }
       }
 
-      this.sendAudioChunk(outbound);
+      this.sendAudioChunk(outbound, 'streaming');
       sentBytes += outbound.length;
     };
 
@@ -1860,8 +1949,11 @@ class VoiceBridgeSession {
     this.currentPlaybackDurationMs =
       Math.ceil(sentBytes / this.ulawFrameBytes) * this.ulawFrameMs;
     this.currentPlaybackOffsetBytes = sentBytes;
-    this.assistantSpeaking = false;
-    this.activeResponse = false;
+    if (firstChunkSent) {
+      this.completeAssistantPlayback('streaming_finished');
+    } else {
+      this.resetAssistantPlaybackState('streaming_no_audio');
+    }
     return {
       audioBuffer: Buffer.concat(chunks, totalBytes),
       streamed: firstChunkSent,
@@ -1908,7 +2000,10 @@ class VoiceBridgeSession {
     const tick = () => {
       if (this.closed) return;
       if (token !== this.playbackToken) return;
-      if (!this.isTurnStillActive(turnId)) return;
+      if (!this.isTurnStillActive(turnId)) {
+        this.resetAssistantPlaybackState('stale_turn_audio_playback');
+        return;
+      }
 
       if (!this.assistantSpeaking) return;
 
@@ -1918,10 +2013,8 @@ class VoiceBridgeSession {
         offset + this.minBufferedAudioChunkBytes,
       );
       if (!chunk.length) {
-        this.assistantSpeaking = false;
         this.playbackTimer = null;
-        this.currentPlaybackDurationMs = 0;
-        this.currentPlaybackOffsetBytes = 0;
+        this.completeAssistantPlayback('buffered_finished');
         return;
       }
 
@@ -1950,7 +2043,7 @@ class VoiceBridgeSession {
         }
       }
 
-      this.sendAudioChunk(chunk);
+      this.sendAudioChunk(chunk, 'buffered');
 
       offset += chunk.length;
       this.playbackTimer = setTimeout(
