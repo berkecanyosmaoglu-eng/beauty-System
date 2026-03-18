@@ -228,9 +228,9 @@ class VoiceBridgeSession {
   private lastObservedSpeechEnergy = 0;
   private ambientNoiseRms = 0;
   private readonly minSpeechEnergyThreshold = 220;
-  private readonly maxSpeechEnergyThreshold = 520;
-  private readonly speechEnergyThreshold = 300;
-  private readonly speechFramesForBargeIn = 4;
+  private readonly maxSpeechEnergyThreshold = 1200;
+  private readonly speechEnergyThreshold = 600;
+  private readonly speechFramesForBargeIn = 8;
   private readonly assistantGuardMs = 650;
   private readonly openingGreetingBargeInGuardMs = 900;
 
@@ -527,6 +527,16 @@ class VoiceBridgeSession {
         this.parentLogger.log(
           `[voice] speech_started callId=${this.meta.callId}`,
         );
+        if (
+          this.agentTurnInFlight ||
+          this.assistantSpeaking ||
+          this.activeResponse
+        ) {
+          this.parentLogger.debug(
+            `[voice] speech_ignored_during_assistant callId=${this.meta.callId}`,
+          );
+          return;
+        }
         const protectionRemaining = this.getAssistantProtectionMsRemaining();
         if (protectionRemaining > 0) {
           this.logBargeInSuppressed(
@@ -570,6 +580,13 @@ class VoiceBridgeSession {
 
   private async handleCompletedTranscript(rawTranscript: string) {
     const currentState = this.getCurrentVoiceBookingState();
+
+    if (this.agentTurnInFlight || this.assistantSpeaking) {
+      this.parentLogger.debug(
+        `[voice] transcript_ignored_during_assistant callId=${this.meta.callId}`,
+      );
+      return;
+    }
 
     if (this.shouldDropTranscript(rawTranscript, currentState)) {
       this.parentLogger.warn(
@@ -627,15 +644,27 @@ class VoiceBridgeSession {
     transcript: string,
     state: string | null,
   ) {
-    if (this.agentTurnInFlight) {
-      this.activeTurnId = this.turnSequence + 1;
-      this.queuedTranscript = { text: transcript, state };
-      this.parentLogger.log(
-        `[voice] transcript_queued_latest callId=${this.meta.callId} state=${state || '-'} text="${transcript}"`,
+    if (
+      this.agentTurnInFlight ||
+      this.assistantSpeaking ||
+      this.activeResponse
+    ) {
+      this.parentLogger.debug(
+        `[voice] transcript_ignored_during_assistant callId=${this.meta.callId} state=${state || '-'} text="${transcript}"`,
       );
       return;
     }
-    await this.processTranscriptTurn(transcript, state);
+
+    setTimeout(() => {
+      if (this.agentTurnInFlight || this.assistantSpeaking) {
+        this.parentLogger.debug(
+          `[voice] transcript_ignored_during_assistant callId=${this.meta.callId} state=${state || '-'} text="${transcript}" stage=debounce`,
+        );
+        return;
+      }
+
+      void this.processTranscriptTurn(transcript, state);
+    }, 300);
   }
 
   private async processTranscriptTurn(
@@ -670,10 +699,7 @@ class VoiceBridgeSession {
     try {
       const reply = await this.callAgentBrain(transcript, turnId);
       if (!reply) return;
-      if (!this.isTurnStillActive(turnId)) {
-        this.parentLogger.warn(
-          `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=agent_reply`,
-        );
+      if (!this.canPlaybackStaleTurn(turnId, 'agent_reply')) {
         return;
       }
 
@@ -802,15 +828,13 @@ class VoiceBridgeSession {
   }
 
   private getAdaptiveSpeechThreshold() {
-    const ambientFloor = this.ambientNoiseRms
-      ? Math.round(this.ambientNoiseRms * 1.85 + 110)
+    const adaptive = this.ambientNoiseRms
+      ? Math.round(this.ambientNoiseRms * 3)
       : this.speechEnergyThreshold;
+    const threshold = Math.max(adaptive, 600);
     return Math.max(
       this.minSpeechEnergyThreshold,
-      Math.min(
-        this.maxSpeechEnergyThreshold,
-        Math.max(this.speechEnergyThreshold, ambientFloor),
-      ),
+      Math.min(this.maxSpeechEnergyThreshold, threshold),
     );
   }
 
@@ -884,7 +908,7 @@ class VoiceBridgeSession {
       }
     }
 
-    this.sendBridge({
+    const sent = this.sendBridge({
       event: 'media',
       media: { payload: chunk.toString('base64') },
     });
@@ -905,82 +929,27 @@ class VoiceBridgeSession {
 
   private handlePossibleBargeIn(payloadB64: string) {
     const rms = pcmuBase64Rms(payloadB64);
-    const threshold = this.getAdaptiveSpeechThreshold();
     this.lastObservedSpeechEnergy = rms;
     this.updateAmbientNoise(rms);
 
-    if (!this.assistantSpeaking) {
-      this.openingGreetingProtectionUntil = 0;
-      this.assistantPlaybackProtectionUntil = 0;
+    if (this.assistantSpeaking || this.activeResponse) {
+      this.parentLogger.debug(
+        `[voice] barge_in_blocked_assistant_speaking callId=${this.meta.callId}`,
+      );
       this.speechEnergyFrames = 0;
       return;
     }
+
+    this.openingGreetingProtectionUntil = 0;
+    this.assistantPlaybackProtectionUntil = 0;
+    this.speechEnergyFrames = 0;
 
     const now = Date.now();
-    if (now - this.assistantStartedAt < this.assistantGuardMs) {
-      this.logBargeInSuppressed(
-        'playback_guard',
-        `elapsed=${now - this.assistantStartedAt}`,
+    if (now - this.lastAssistantAudioAt < 1500) {
+      this.parentLogger.debug(
+        `[voice] barge_in_blocked_cooldown callId=${this.meta.callId}`,
       );
-      this.speechEnergyFrames = 0;
-      return;
     }
-
-    const protectionRemaining = this.getAssistantProtectionMsRemaining();
-    if (protectionRemaining > 0) {
-      this.logBargeInSuppressed(
-        'inside_protection_window',
-        `protectionMsRemaining=${protectionRemaining}`,
-      );
-      this.speechEnergyFrames = 0;
-      return;
-    }
-
-    const echoWindowMs =
-      this.lastBotReplyText === RealtimeBridgeService.openingGreeting
-        ? 240
-        : 160;
-    if (rms >= threshold) {
-      this.speechEnergyFrames += 1;
-      if (this.debugVoice) {
-        this.parentLogger.debug(
-          `[voice] speech_detected callId=${this.meta.callId} rms=${rms.toFixed(0)} threshold=${threshold} ambient=${this.ambientNoiseRms.toFixed(0)} frames=${this.speechEnergyFrames}`,
-        );
-      }
-    } else {
-      if (rms > 0) {
-        this.logBargeInSuppressed(
-          'below_threshold',
-          `rms=${this.formatEnergy(rms)} threshold=${threshold} ambient=${this.formatEnergy(this.ambientNoiseRms)}`,
-        );
-      }
-      this.speechEnergyFrames = 0;
-      return;
-    }
-
-    if (this.speechEnergyFrames < this.speechFramesForBargeIn) {
-      this.logBargeInSuppressed(
-        'too_short',
-        `frames=${this.speechEnergyFrames}/${this.speechFramesForBargeIn} rms=${this.formatEnergy(rms)}`,
-      );
-      return;
-    }
-
-    if (now - this.lastAssistantAudioAt < echoWindowMs) {
-      this.logBargeInSuppressed(
-        'probable_echo',
-        `sinceAssistantAudio=${now - this.lastAssistantAudioAt} rms=${this.formatEnergy(rms)}`,
-      );
-      this.speechEnergyFrames = 0;
-      return;
-    }
-
-    this.parentLogger.warn(
-      `[voice] barge_in_triggered callId=${this.meta.callId} rms=${this.formatEnergy(rms)} threshold=${threshold} frames=${this.speechEnergyFrames}`,
-    );
-    this.lastBargeInAt = Date.now();
-    this.cancelAssistantAudio('barge_in');
-    this.speechEnergyFrames = 0;
   }
 
   private shouldPassInboundDuringAssistant(payloadB64: string) {
@@ -1068,6 +1037,24 @@ class VoiceBridgeSession {
   private isTurnStillActive(turnId?: number) {
     if (!turnId) return true;
     return turnId === this.activeTurnId;
+  }
+
+  private canPlaybackStaleTurn(turnId: number | undefined, stage: string) {
+    if (!turnId || this.isTurnStillActive(turnId)) {
+      return true;
+    }
+
+    if (this.assistantSpeaking || this.agentTurnInFlight) {
+      this.parentLogger.warn(
+        `[voice] stale_turn_allowed callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=${stage}`,
+      );
+      return true;
+    }
+
+    this.parentLogger.warn(
+      `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=${stage}`,
+    );
+    return false;
   }
 
   private getAssistantProtectionMsRemaining() {
@@ -1369,6 +1356,17 @@ class VoiceBridgeSession {
   private cancelAssistantAudio(
     reason: 'barge_in' | 'new_reply' | 'close' = 'new_reply',
   ) {
+    if (
+      reason === 'barge_in' &&
+      this.assistantStartedAt &&
+      Date.now() - this.assistantStartedAt < 1200
+    ) {
+      this.parentLogger.debug(
+        `[voice] cancellation_blocked_recent_tts_start callId=${this.meta.callId} reason=${reason}`,
+      );
+      return;
+    }
+
     this.playbackToken += 1;
 
     if (this.playbackTimer) {
@@ -1439,6 +1437,7 @@ class VoiceBridgeSession {
     this.parentLogger.log(
       `[voice] playback_completed callId=${this.meta.callId} reason=${reason} durationMs=${this.currentPlaybackDurationMs} bytesSent=${this.outboundAudioByteCount} chunksSent=${this.outboundAudioChunkCount}`,
     );
+    this.lastAssistantAudioAt = Date.now();
     this.resetAssistantPlaybackState(reason);
   }
 
@@ -1592,10 +1591,7 @@ class VoiceBridgeSession {
       );
       return;
     }
-    if (!this.isTurnStillActive(effectiveTurnId)) {
-      this.parentLogger.warn(
-        `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=pre_tts`,
-      );
+    if (!this.canPlaybackStaleTurn(effectiveTurnId, 'pre_tts')) {
       return;
     }
 
@@ -1616,7 +1612,7 @@ class VoiceBridgeSession {
     this.currentReplyTurnId = effectiveTurnId;
     this.captureRecentContextsFromText(clean, effectiveTurnId, 'assistant');
     this.assistantSpeaking = true;
-    this.activeResponse = false;
+    this.activeResponse = true;
     this.assistantStartedAt = Date.now();
     this.outboundAudioChunkCount = 0;
     this.outboundAudioByteCount = 0;
@@ -1640,13 +1636,13 @@ class VoiceBridgeSession {
         effectiveTurnId,
       );
 
-      if (!this.isTurnStillActive(effectiveTurnId)) {
-        this.parentLogger.warn(
-          `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=tts_ready`,
-        );
+      if (!this.canPlaybackStaleTurn(effectiveTurnId, 'tts_ready')) {
         this.resetAssistantPlaybackState('stale_turn_tts_ready');
         return;
       }
+
+      this.assistantSpeaking = true;
+      this.activeResponse = true;
 
       if (ttsResult?.audioBuffer && token === this.playbackToken) {
         this.parentLogger.log(
@@ -2029,10 +2025,7 @@ class VoiceBridgeSession {
 
   private streamUlawBuffer(buf: Buffer, token: number, turnId: number) {
     if (!buf.length || token !== this.playbackToken) return;
-    if (!this.isTurnStillActive(turnId)) {
-      this.parentLogger.warn(
-        `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=audio_playback`,
-      );
+    if (!this.canPlaybackStaleTurn(turnId, 'audio_playback')) {
       return;
     }
 
@@ -2043,7 +2036,7 @@ class VoiceBridgeSession {
     const tick = () => {
       if (this.closed) return;
       if (token !== this.playbackToken) return;
-      if (!this.isTurnStillActive(turnId)) {
+      if (!this.canPlaybackStaleTurn(turnId, 'audio_playback_tick')) {
         this.resetAssistantPlaybackState('stale_turn_audio_playback');
         return;
       }
