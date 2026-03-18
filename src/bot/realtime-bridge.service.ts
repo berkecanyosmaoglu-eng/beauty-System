@@ -41,10 +41,14 @@ type VoiceTimingStage =
   | 'openai_connected'
   | 'session_created'
   | 'session_updated'
+<<<<<<< HEAD
   | 'opening_greeting_queued'
   | 'opening_greeting_started'
   | 'opening_greeting_tts_start'
   | 'opening_greeting_audio_sent'
+=======
+  | 'first_greeting_started'
+>>>>>>> b0ef2bd (Revert "Merge pull request #10 from berkecanyosmaoglu-eng/codex/fix-voice-greeting-flow-and-shaping")
   | 'speech_started'
   | 'speech_stopped'
   | 'transcript_normalized'
@@ -109,10 +113,6 @@ class VoiceBridgeSession {
   private greeted = false;
   private bridgeReady = false;
   private greetingInFlight = false;
-  private openingGreetingQueued = false;
-  private openingGreetingStarted = false;
-  private openingGreetingFinished = false;
-  private pendingInboundAudio: string[] = [];
   private turnSequence = 0;
 
   private lastAssistantAudioAt = 0;
@@ -304,11 +304,6 @@ class VoiceBridgeSession {
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      if (!this.openingGreetingStarted) {
-        this.bufferInboundAudioUntilGreetingStarts(payload);
-        return;
-      }
-
       this.handlePossibleBargeIn(payload);
 
       if (
@@ -425,12 +420,6 @@ class VoiceBridgeSession {
           `[voice] speech_started callId=${this.meta.callId}`,
         );
         this.lastBargeInAt = Date.now();
-        if (!this.openingGreetingStarted) {
-          this.parentLogger.log(
-            `[voice] speech_started buffered_until_opening callId=${this.meta.callId}`,
-          );
-          return;
-        }
         // Aggressive barge-in: stop any queued playback immediately.
         this.cancelAssistantAudio('speech_started');
         return;
@@ -529,38 +518,6 @@ class VoiceBridgeSession {
     return rms >= this.speechEnergyThreshold;
   }
 
-  private bufferInboundAudioUntilGreetingStarts(payload: string) {
-    if (this.pendingInboundAudio.length >= 12) {
-      this.pendingInboundAudio.shift();
-    }
-    this.pendingInboundAudio.push(payload);
-  }
-
-  private flushBufferedInboundAudio(reason: string) {
-    if (!this.pendingInboundAudio.length) return;
-
-    const pending = this.pendingInboundAudio.splice(0);
-    this.parentLogger.log(
-      `[voice] flushing_buffered_audio callId=${this.meta.callId} frames=${pending.length} reason=${reason}`,
-    );
-
-    for (const payload of pending) {
-      this.handlePossibleBargeIn(payload);
-
-      if (
-        this.assistantSpeaking &&
-        !this.shouldPassInboundDuringAssistant(payload)
-      ) {
-        continue;
-      }
-
-      this.sendOpenAi({
-        type: 'input_audio_buffer.append',
-        audio: payload,
-      });
-    }
-  }
-
   private maybeStartOpeningGreeting() {
     if (
       !this.sessionReady ||
@@ -572,13 +529,16 @@ class VoiceBridgeSession {
     }
 
     this.greetingInFlight = true;
-    this.openingGreetingQueued = true;
 
     const openingGreeting = 'Merhaba, nasıl yardımcı olabilirim?';
+<<<<<<< HEAD
     this.markTiming('opening_greeting_queued', {
       textLength: openingGreeting.length,
     });
     this.markTiming('opening_greeting_started', {
+=======
+    this.markTiming('first_greeting_started', {
+>>>>>>> b0ef2bd (Revert "Merge pull request #10 from berkecanyosmaoglu-eng/codex/fix-voice-greeting-flow-and-shaping")
       textLength: openingGreeting.length,
     });
     this.parentLogger.log(
@@ -588,6 +548,7 @@ class VoiceBridgeSession {
       `[voice] opening_greeting_started callId=${this.meta.callId}`,
     );
 
+<<<<<<< HEAD
     void this.speakReply(openingGreeting, { isOpeningGreeting: true }).finally(
       () => {
         this.greetingInFlight = false;
@@ -603,6 +564,11 @@ class VoiceBridgeSession {
         this.flushBufferedInboundAudio('opening_greeting_not_started');
       },
     );
+=======
+    void this.speakReply(openingGreeting).finally(() => {
+      this.greetingInFlight = false;
+    });
+>>>>>>> b0ef2bd (Revert "Merge pull request #10 from berkecanyosmaoglu-eng/codex/fix-voice-greeting-flow-and-shaping")
   }
 
   private markTiming(
@@ -747,10 +713,7 @@ class VoiceBridgeSession {
     }
   }
 
-  private async speakReply(
-    replyText: string,
-    options: { isOpeningGreeting?: boolean } = {},
-  ) {
+  private async speakReply(replyText: string) {
     const openingGreeting = 'Merhaba, nasıl yardımcı olabilirim?';
     const rewritten = rewriteAgentReplyForVoice(replyText);
     const spoken =
@@ -775,6 +738,7 @@ class VoiceBridgeSession {
 
     try {
       const token = ++this.playbackToken;
+<<<<<<< HEAD
       if (options.isOpeningGreeting) {
         this.parentLogger.log(
           `[voice] opening_greeting_tts_start callId=${this.meta.callId} textLength=${clean.length}`,
@@ -783,6 +747,8 @@ class VoiceBridgeSession {
           textLength: clean.length,
         });
       }
+=======
+>>>>>>> b0ef2bd (Revert "Merge pull request #10 from berkecanyosmaoglu-eng/codex/fix-voice-greeting-flow-and-shaping")
       this.markTiming('elevenlabs_request_start', {
         textLength: clean.length,
       });
@@ -792,7 +758,7 @@ class VoiceBridgeSession {
         this.parentLogger.log(
           `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${audioBuffer.length}`,
         );
-        this.streamUlawBuffer(audioBuffer, token, options);
+        this.streamUlawBuffer(audioBuffer, token);
         return;
       }
     } catch (err) {
@@ -889,11 +855,7 @@ class VoiceBridgeSession {
     return null;
   }
 
-  private streamUlawBuffer(
-    buf: Buffer,
-    token: number,
-    options: { isOpeningGreeting?: boolean } = {},
-  ) {
+  private streamUlawBuffer(buf: Buffer, token: number) {
     if (!buf.length || token !== this.playbackToken) return;
 
     let offset = 0;
@@ -907,14 +869,12 @@ class VoiceBridgeSession {
       if (!chunk.length) {
         this.assistantSpeaking = false;
         this.playbackTimer = null;
-        if (options.isOpeningGreeting) {
-          this.openingGreetingFinished = true;
-        }
         return;
       }
 
       this.lastAssistantAudioAt = Date.now();
       if (offset === 0) {
+<<<<<<< HEAD
         if (options.isOpeningGreeting) {
           this.greeted = true;
           this.openingGreetingStarted = true;
@@ -924,6 +884,8 @@ class VoiceBridgeSession {
           this.markTiming('opening_greeting_audio_sent', { bytes: buf.length });
           this.flushBufferedInboundAudio('opening_greeting_started');
         }
+=======
+>>>>>>> b0ef2bd (Revert "Merge pull request #10 from berkecanyosmaoglu-eng/codex/fix-voice-greeting-flow-and-shaping")
         this.markTiming('final_audio_send_start', { bytes: buf.length });
       }
 
@@ -1256,17 +1218,11 @@ function shortenReplyForPhone(text: string) {
     .filter(Boolean);
 
   if (sentenceParts.length > 1) {
-    const first = sentenceParts[0] || '';
-    const second = sentenceParts[1] || '';
-    if (shouldKeepTwoSentenceReply(first, second)) {
-      out = `${first} ${second}`.trim();
-    } else {
-      out = first || out;
-    }
+    out = sentenceParts[0] || out;
   }
 
-  if (out.length > 170) {
-    out = out.slice(0, 170).trim();
+  if (out.length > 140) {
+    out = out.slice(0, 140).trim();
     out = out.replace(/[,:;\s]+$/g, '');
     if (!/[.!?]$/.test(out)) out += '.';
   }
@@ -1274,6 +1230,7 @@ function shortenReplyForPhone(text: string) {
   return out.replace(/\s{2,}/g, ' ').trim();
 }
 
+<<<<<<< HEAD
 function shouldKeepTwoSentenceReply(first: string, second: string) {
   const normalizedFirst = normalizeTurkishForTime(first);
   const normalizedSecond = normalizeTurkishForTime(second);
@@ -1298,6 +1255,8 @@ function shouldKeepTwoSentenceReply(first: string, second: string) {
   return false;
 }
 
+=======
+>>>>>>> b0ef2bd (Revert "Merge pull request #10 from berkecanyosmaoglu-eng/codex/fix-voice-greeting-flow-and-shaping")
 function naturalTimeSpeech(hhmm: string) {
   const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
   if (!m) return hhmm;
