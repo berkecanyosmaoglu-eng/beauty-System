@@ -226,8 +226,8 @@ class VoiceBridgeSession {
 
   private speechEnergyFrames = 0;
   private readonly speechEnergyThreshold = 1700;
-  private readonly speechFramesForBargeIn = 3;
-  private readonly assistantGuardMs = 120;
+  private readonly speechFramesForBargeIn = 5;
+  private readonly assistantGuardMs = 220;
   private readonly openingGreetingBargeInGuardMs = 700;
 
   private lastTranscriptAt = 0;
@@ -563,6 +563,12 @@ class VoiceBridgeSession {
       rawTranscript,
       this.lastBotReplyText,
     );
+    if (!transcript) {
+      this.parentLogger.warn(
+        `[voice] normalized transcript empty after contamination filter callId=${this.meta.callId} raw="${rawTranscript}"`,
+      );
+      return;
+    }
 
     const merged = mergeVoiceFragments(
       this.pendingTranscriptText,
@@ -873,6 +879,7 @@ class VoiceBridgeSession {
     const shortReply = this.lastBotReplyText.length <= 42;
 
     if (elapsed < 260) return false;
+    if (this.speechEnergyFrames < 2) return false;
     if (shortReply && remaining < 700) return false;
     if (remaining > 0 && remaining < 220) return false;
     return true;
@@ -1870,11 +1877,12 @@ function extractReplyText(result: any): string {
   return '';
 }
 
-function normalizeTranscriptForAgent(
+export function normalizeTranscriptForAgent(
   raw: string,
   lastBotReplyText: string,
 ): string {
-  let text = String(raw || '').trim();
+  let text = stripTranscriptContamination(String(raw || '').trim());
+  if (!text) return '';
 
   text = text
     .replace(/[“”"']/g, '')
@@ -2155,7 +2163,7 @@ function detectRecentIntent(
   return 'general';
 }
 
-function rewriteAgentReplyForVoice(replyText: string) {
+export function rewriteAgentReplyForVoice(replyText: string) {
   let text = sanitizeReplyForVoice(String(replyText || '').trim())
     .replace(/yazar mısınız/gi, 'söyler misiniz')
     .replace(/yazar misiniz/gi, 'söyler misiniz')
@@ -2216,8 +2224,11 @@ function rewriteAgentReplyForVoice(replyText: string) {
   return text;
 }
 
-function shortenReplyForPhone(text: string) {
-  let out = String(text || '')
+export function shortenReplyForPhone(text: string) {
+  const original = String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  let out = original
     .replace(/\s+/g, ' ')
     .trim();
   if (!out) return out;
@@ -2249,7 +2260,82 @@ function shortenReplyForPhone(text: string) {
     if (!/[.!?]$/.test(out)) out += '.';
   }
 
+  if (isUselessShortAck(out) && shouldPreserveMeaningfulReply(original)) {
+    return preserveMeaningfulReply(original);
+  }
+
   return out.replace(/\s{2,}/g, ' ').trim();
+}
+
+function stripTranscriptContamination(text: string) {
+  let cleaned = String(text || '').trim();
+  if (!cleaned) return '';
+
+  const contaminationPatterns = [
+    /\b(guzellik merkezi|güzellik merkezi),?\s*randevu,?\s*rezervasyon\b/gi,
+    /\bben guzellik merkezinden ariyorum\b/gi,
+    /\bben güzellik merkezinden arıyorum\b/gi,
+    /\bsesli yapay zeka asistaniyim\b/gi,
+    /\bsesli yapay zeka asistanıyım\b/gi,
+    /\bsize nasil yardimci olabilirim\b/gi,
+    /\bsize nasıl yardımcı olabilirim\b/gi,
+    /\byou are the voice layer\b/gi,
+    /\byalnizca uygulamanin verdigi yaniti oku\b/gi,
+    /\byalnızca uygulamanın verdiği yanıtı oku\b/gi,
+  ];
+
+  for (const pattern of contaminationPatterns) {
+    cleaned = cleaned.replace(pattern, ' ');
+  }
+
+  cleaned = cleaned
+    .replace(/^[\s,.;:!?-]+|[\s,.;:!?-]+$/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  if (!cleaned) return '';
+
+  const normalized = normalizeVoiceComparisonText(cleaned);
+  const contaminationOnlyPatterns = [
+    /^guzellik merkezi randevu rezervasyon(?: [a-zçğıöşü]+){0,6}$/i,
+    /^ben guzellik merkezinden ariyorum(?: [a-zçğıöşü]+){0,6}$/i,
+    /^sesli yapay zeka asistaniyim(?: [a-zçğıöşü]+){0,6}$/i,
+  ];
+  if (contaminationOnlyPatterns.some((pattern) => pattern.test(normalized))) {
+    return '';
+  }
+
+  return cleaned;
+}
+
+function isUselessShortAck(text: string) {
+  return /^(tamam|tamamdir|tamamdır|peki|tabii|tabi|olur|anladim|anladım)\.?$/i.test(
+    String(text || '').trim(),
+  );
+}
+
+function shouldPreserveMeaningfulReply(text: string) {
+  const normalized = normalizeVoiceComparisonText(text);
+  if (!normalized || isUselessShortAck(normalized)) return false;
+  if (/\?$/.test(text)) return true;
+  if (/\b(nasil|nasıl|hangi|ne zaman|neden|icin|için|fiyat|ucret|ücret|saat|adres|randevu|rezervasyon|yardimci|yardımcı)\b/i.test(text)) {
+    return true;
+  }
+  return normalized.split(/\s+/).filter(Boolean).length >= 4;
+}
+
+function preserveMeaningfulReply(text: string) {
+  const sentenceParts = String(text || '')
+    .split(/(?<=[.!?])\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  let preserved = sentenceParts.slice(0, 2).join(' ').trim();
+  if (preserved.length > 160) {
+    preserved = preserved.slice(0, 160).trim();
+    preserved = preserved.replace(/[,:;\s]+$/g, '');
+    if (!/[.!?]$/.test(preserved)) preserved += '.';
+  }
+  return preserved || String(text || '').trim();
 }
 
 function formatDateForSpeech(dateText: string, now = new Date()) {
