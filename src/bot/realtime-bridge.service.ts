@@ -42,9 +42,9 @@ type VoiceTimingStage =
   | 'session_created'
   | 'session_updated'
   | 'opening_greeting_queued'
+  | 'opening_greeting_started'
   | 'opening_greeting_tts_start'
   | 'opening_greeting_audio_sent'
-  | 'first_greeting_started'
   | 'speech_started'
   | 'speech_stopped'
   | 'transcript_normalized'
@@ -464,7 +464,8 @@ class VoiceBridgeSession {
 
     if (!normalized) return true;
     if (normalized.length <= 1) return true;
-    if (this.ghostRegex.test(normalized)) return true;
+    if (this.ghostRegex.test(normalized) && this.openingGreetingFinished)
+      return true;
 
     const now = Date.now();
     const msSinceAssistantAudio = now - this.lastAssistantAudioAt;
@@ -570,7 +571,6 @@ class VoiceBridgeSession {
       return;
     }
 
-    this.greeted = true;
     this.greetingInFlight = true;
     this.openingGreetingQueued = true;
 
@@ -578,19 +578,31 @@ class VoiceBridgeSession {
     this.markTiming('opening_greeting_queued', {
       textLength: openingGreeting.length,
     });
-    this.markTiming('first_greeting_started', {
+    this.markTiming('opening_greeting_started', {
       textLength: openingGreeting.length,
     });
     this.parentLogger.log(
-      `[voice] opening_greeting callId=${this.meta.callId} text="${openingGreeting}"`,
+      `[voice] opening_greeting_queued callId=${this.meta.callId} text="${openingGreeting}"`,
+    );
+    this.parentLogger.log(
+      `[voice] opening_greeting_started callId=${this.meta.callId}`,
     );
 
-    void this.speakReply(openingGreeting, { isOpeningGreeting: true }).finally(() => {
-      this.greetingInFlight = false;
-      if (!this.openingGreetingStarted) {
+    void this.speakReply(openingGreeting, { isOpeningGreeting: true }).finally(
+      () => {
+        this.greetingInFlight = false;
+        if (this.openingGreetingStarted) {
+          this.greeted = true;
+          return;
+        }
+
+        this.openingGreetingQueued = false;
+        this.parentLogger.warn(
+          `[voice] opening_greeting_not_started callId=${this.meta.callId} allowing_retry=true`,
+        );
         this.flushBufferedInboundAudio('opening_greeting_not_started');
-      }
-    });
+      },
+    );
   }
 
   private markTiming(
@@ -764,6 +776,9 @@ class VoiceBridgeSession {
     try {
       const token = ++this.playbackToken;
       if (options.isOpeningGreeting) {
+        this.parentLogger.log(
+          `[voice] opening_greeting_tts_start callId=${this.meta.callId} textLength=${clean.length}`,
+        );
         this.markTiming('opening_greeting_tts_start', {
           textLength: clean.length,
         });
@@ -901,7 +916,11 @@ class VoiceBridgeSession {
       this.lastAssistantAudioAt = Date.now();
       if (offset === 0) {
         if (options.isOpeningGreeting) {
+          this.greeted = true;
           this.openingGreetingStarted = true;
+          this.parentLogger.log(
+            `[voice] opening_greeting_audio_sent callId=${this.meta.callId} bytes=${buf.length}`,
+          );
           this.markTiming('opening_greeting_audio_sent', { bytes: buf.length });
           this.flushBufferedInboundAudio('opening_greeting_started');
         }
@@ -1261,12 +1280,14 @@ function shouldKeepTwoSentenceReply(first: string, second: string) {
 
   if (!normalizedFirst || !normalizedSecond) return false;
 
-  const greetingOnly = /^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin|hos geldiniz)[.!? ]*$/.test(
-    normalizedFirst,
-  );
-  const actionableSecond = /(nasil yardimci olabilirim|hangi hizmet|hangi islem|hangi gun|hangi saat|tercih edersiniz|soyler misiniz|deneyelim|devam edelim|yardimci olayim)/.test(
-    normalizedSecond,
-  );
+  const greetingOnly =
+    /^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin|hos geldiniz)[.!? ]*$/.test(
+      normalizedFirst,
+    );
+  const actionableSecond =
+    /(nasil yardimci olabilirim|hangi hizmet|hangi islem|hangi gun|hangi saat|tercih edersiniz|soyler misiniz|deneyelim|devam edelim|yardimci olayim)/.test(
+      normalizedSecond,
+    );
 
   if (greetingOnly && actionableSecond) return true;
 
