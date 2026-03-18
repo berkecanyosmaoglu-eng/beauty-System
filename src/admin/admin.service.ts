@@ -1,10 +1,13 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { WhatsappService } from '../whatsapp/whatsapp.service';
+import { SendWhatsappMessageDto } from './dto/send-whatsapp-message.dto';
 
 function parseDateOrThrow(v?: string, name?: string) {
   if (!v) return undefined;
   const d = new Date(v);
-  if (Number.isNaN(d.getTime())) throw new BadRequestException(`${name ?? 'date'} geçersiz: ${v}`);
+  if (Number.isNaN(d.getTime()))
+    throw new BadRequestException(`${name ?? 'date'} geçersiz: ${v}`);
   return d;
 }
 
@@ -14,7 +17,10 @@ function pad(n: number) {
 
 @Injectable()
 export class AdminService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly whatsapp: WhatsappService,
+  ) {}
 
   private parseDateOrNull(v?: string) {
     if (!v) return null;
@@ -39,6 +45,70 @@ export class AdminService {
     return { fromD, toD };
   }
 
+  async sendWhatsappMessage(body: SendWhatsappMessageDto) {
+    const tenantId = String(body.tenantId || '').trim();
+    const to = String(body.to || '').trim();
+    const message = String(body.message || '').trim();
+
+    if (!tenantId) throw new BadRequestException('tenantId gerekli');
+    if (!to) throw new BadRequestException('to gerekli');
+    if (!message) throw new BadRequestException('message gerekli');
+
+    const tenant = await this.prisma.tenants.findUnique({
+      where: { id: tenantId },
+      select: { id: true },
+    });
+
+    if (!tenant) {
+      throw new BadRequestException(`tenant bulunamadı: ${tenantId}`);
+    }
+
+    const result = await this.whatsapp.sendProactiveWhatsApp({
+      tenantId,
+      toPhone: to,
+      body: message,
+      subject: 'Admin panel WhatsApp message',
+      metadata: {
+        source: 'admin-panel',
+        route: 'POST /admin/whatsapp/send',
+      },
+    });
+
+    const provider = String((result as any)?.provider || 'twilio');
+    const providerMessageId =
+      String((result as any)?.messageId || (result as any)?.sid || '').trim() ||
+      null;
+
+    const notification = await this.prisma.notifications.findFirst({
+      where: {
+        tenantId,
+        type: 'WHATSAPP' as any,
+        body: message,
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        tenantId: true,
+        type: true,
+        recipient: true,
+        subject: true,
+        body: true,
+        status: true,
+        metadata: true,
+        sentAt: true,
+        createdAt: true,
+      },
+    });
+
+    return {
+      ok: true,
+      route: 'POST /admin/whatsapp/send',
+      provider,
+      providerMessageId,
+      notification,
+    };
+  }
+
   async listAppointments(params: {
     tenantId: string;
     from?: string;
@@ -57,9 +127,12 @@ export class AdminService {
     const fromD = parseDateOrThrow(params.from, 'from');
     const toD = parseDateOrThrow(params.to, 'to');
 
-    const page = Number.isFinite(params.page) && params.page > 0 ? params.page : 1;
+    const page =
+      Number.isFinite(params.page) && params.page > 0 ? params.page : 1;
     const limit =
-      Number.isFinite(params.limit) && params.limit > 0 && params.limit <= 200 ? params.limit : 30;
+      Number.isFinite(params.limit) && params.limit > 0 && params.limit <= 200
+        ? params.limit
+        : 30;
     const skip = (page - 1) * limit;
 
     // Schema: appointments { date: DateTime, time: String, startAtUtc?: DateTime }
@@ -133,7 +206,8 @@ export class AdminService {
     // date+time tabanlı sistemde "hour" bucket tam doğru olsun diye startAtUtc varsa onu kullanmak daha iyi.
     // Ama minimum viable: date üzerinden özet.
     const fromD =
-      parseDateOrThrow(params.from, 'from') ?? new Date(Date.now() - 1000 * 60 * 60 * 24 * 30);
+      parseDateOrThrow(params.from, 'from') ??
+      new Date(Date.now() - 1000 * 60 * 60 * 24 * 30);
     const toD = parseDateOrThrow(params.to, 'to') ?? new Date();
 
     const rows = await this.prisma.appointments.findMany({
@@ -160,13 +234,20 @@ export class AdminService {
       from: fromD.toISOString(),
       to: toD.toISOString(),
       bucket,
-      points: Array.from(map.entries()).map(([label, count]) => ({ label, count })),
+      points: Array.from(map.entries()).map(([label, count]) => ({
+        label,
+        count,
+      })),
       total: rows.length,
       __debug: 'ADMIN_APPT_SUMMARY_V4_SCHEMA_MATCH',
     };
   }
 
-  async appointmentsMetrics(params: { tenantId: string; from?: string; to?: string }) {
+  async appointmentsMetrics(params: {
+    tenantId: string;
+    from?: string;
+    to?: string;
+  }) {
     const { tenantId } = params;
 
     const fromD = this.parseDateOrNull(params.from);
@@ -186,9 +267,15 @@ export class AdminService {
 
     const [total, pending, confirmed, canceled, byChannel] = await Promise.all([
       this.prisma.appointments.count({ where: whereBase }),
-      this.prisma.appointments.count({ where: { ...whereBase, status: 'PENDING' as any } }),
-      this.prisma.appointments.count({ where: { ...whereBase, status: 'CONFIRMED' as any } }),
-      this.prisma.appointments.count({ where: { ...whereBase, status: 'CANCELLED' as any } }),
+      this.prisma.appointments.count({
+        where: { ...whereBase, status: 'PENDING' as any },
+      }),
+      this.prisma.appointments.count({
+        where: { ...whereBase, status: 'CONFIRMED' as any },
+      }),
+      this.prisma.appointments.count({
+        where: { ...whereBase, status: 'CANCELLED' as any },
+      }),
       this.prisma.appointments.groupBy({
         by: ['channel'],
         where: whereBase,
@@ -219,19 +306,20 @@ export class AdminService {
     const { tenantId } = params;
     const { fromD, toD } = this.resolveRange(params.from, params.to);
 
-    const [tenantCount, rangeAppointments, outboundWhatsapps] = await Promise.all([
-      this.prisma.tenants.count(),
-      this.prisma.appointments.count({
-        where: { tenantId, date: { gte: fromD, lte: toD } },
-      }),
-      this.prisma.notifications.count({
-        where: {
-          tenantId,
-          type: 'WHATSAPP' as any,
-          createdAt: { gte: fromD, lte: toD },
-        },
-      }),
-    ]);
+    const [tenantCount, rangeAppointments, outboundWhatsapps] =
+      await Promise.all([
+        this.prisma.tenants.count(),
+        this.prisma.appointments.count({
+          where: { tenantId, date: { gte: fromD, lte: toD } },
+        }),
+        this.prisma.notifications.count({
+          where: {
+            tenantId,
+            type: 'WHATSAPP' as any,
+            createdAt: { gte: fromD, lte: toD },
+          },
+        }),
+      ]);
 
     // Schema’da inbound WA mesaj tablosu yok -> şimdilik 0
     const whatsappInbound = 0;
@@ -294,9 +382,12 @@ export class AdminService {
     const { fromD, toD } = this.resolveRange(params.from, params.to);
 
     // Message table yok → empty
-    const page = Number.isFinite(params.page) && params.page > 0 ? params.page : 1;
+    const page =
+      Number.isFinite(params.page) && params.page > 0 ? params.page : 1;
     const limit =
-      Number.isFinite(params.limit) && params.limit > 0 && params.limit <= 200 ? params.limit : 30;
+      Number.isFinite(params.limit) && params.limit > 0 && params.limit <= 200
+        ? params.limit
+        : 30;
 
     return {
       ok: true,
@@ -390,7 +481,10 @@ export class AdminService {
 
     const counts = new Map<string, number>();
     for (const row of grouped as any[]) {
-      counts.set(String(row.channel ?? 'UNKNOWN'), Number(row._count?._all ?? 0));
+      counts.set(
+        String(row.channel ?? 'UNKNOWN'),
+        Number(row._count?._all ?? 0),
+      );
     }
 
     const whatsapp = counts.get('WHATSAPP') ?? 0;
@@ -418,9 +512,6 @@ export class AdminService {
     };
   }
 
-
-
-
   async whatsappMessages(params: {
     tenantId: string;
     peer: string;
@@ -435,9 +526,12 @@ export class AdminService {
     const peer = String(params.peer || '').trim();
     if (!peer) throw new BadRequestException('peer gerekli (müşteri telefonu)');
 
-    const page = Number.isFinite(params.page) && params.page > 0 ? params.page : 1;
+    const page =
+      Number.isFinite(params.page) && params.page > 0 ? params.page : 1;
     const limit =
-      Number.isFinite(params.limit) && params.limit > 0 && params.limit <= 200 ? params.limit : 50;
+      Number.isFinite(params.limit) && params.limit > 0 && params.limit <= 200
+        ? params.limit
+        : 50;
 
     return {
       ok: true,

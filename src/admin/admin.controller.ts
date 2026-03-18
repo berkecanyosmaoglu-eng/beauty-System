@@ -1,5 +1,13 @@
-import { Controller, Get, Query, BadRequestException } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Query,
+  BadRequestException,
+  Body,
+  Post,
+} from '@nestjs/common';
 import { AdminService } from './admin.service';
+import { SendWhatsappMessageDto } from './dto/send-whatsapp-message.dto';
 
 @Controller('admin')
 export class AdminController {
@@ -65,6 +73,11 @@ export class AdminController {
   ) {
     if (!tenantId) throw new BadRequestException('tenantId gerekli');
     return this.admin.metrics({ tenantId, from, to });
+  }
+
+  @Post('whatsapp/send')
+  async sendWhatsappMessage(@Body() body: SendWhatsappMessageDto) {
+    return this.admin.sendWhatsappMessage(body);
   }
 
   @Get('whatsapp/series')
@@ -137,5 +150,4 @@ export class AdminController {
     if (!tenantId) throw new BadRequestException('tenantId gerekli');
     return this.admin.channelPerformance({ tenantId });
   }
-
 }
