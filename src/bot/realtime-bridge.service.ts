@@ -231,6 +231,10 @@ class VoiceBridgeSession {
   private readonly speechFramesForSpeechStartedCancel = 5;
   private readonly assistantGuardMs = 1400;
   private readonly openingGreetingBargeInGuardMs = 1500;
+  private readonly speechEnergyThreshold = 1700;
+  private readonly speechFramesForBargeIn = 5;
+  private readonly assistantGuardMs = 220;
+  private readonly openingGreetingBargeInGuardMs = 700;
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
@@ -926,6 +930,8 @@ class VoiceBridgeSession {
     if (this.speechEnergyFrames < this.speechFramesForSpeechStartedCancel)
       return false;
     if (this.lastObservedSpeechEnergy < this.speechEnergyThreshold) return false;
+    if (elapsed < 260) return false;
+    if (this.speechEnergyFrames < 2) return false;
     if (shortReply && remaining < 700) return false;
     if (remaining > 0 && remaining < 500) return false;
     if (Date.now() - this.lastAssistantAudioAt < 240) return false;
