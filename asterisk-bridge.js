@@ -23,7 +23,7 @@ const TENANT_ID =
 const FRAME_SIZE = 160;
 const FRAME_MS = 20;
 
-const MAX_QUEUE_FRAMES = 50;
+const MAX_QUEUE_FRAMES = 12;
 const MAX_QUEUE_BYTES = FRAME_SIZE * MAX_QUEUE_FRAMES;
 
 const CLEAR_FLUSH_SILENCE_FRAMES = 6;
@@ -317,6 +317,8 @@ function createRtpBridge(callId) {
 
   let pendingSilence = 0;
 
+  let queueDropCount = 0;
+
   const api = {
 
     port: null,
@@ -362,7 +364,12 @@ function createRtpBridge(callId) {
           queue.shift();
 
           queuedBytes -= FRAME_SIZE;
+          queueDropCount++;
 
+        }
+
+        if (queueDropCount === 1 || queueDropCount % 25 === 0) {
+          log('rtp playback queue trimmed', `callId=${callId}`, `droppedFrames=${queueDropCount}`, `queueFrames=${queue.length}`);
         }
 
       }

@@ -79,7 +79,8 @@ type VoiceTimingStage =
   | 'final_audio_send_start'
   | 'tts_cache_hit'
   | 'tts_cache_miss'
-  | 'deterministic_bypass';
+  | 'deterministic_bypass'
+  | 'bridge_context_loaded';
 
 @Injectable()
 export class RealtimeBridgeService {
@@ -232,6 +233,12 @@ class VoiceBridgeSession {
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
   private lastTranscriptNorm = '';
+  private pendingTranscriptText = '';
+  private pendingTranscriptTimer: NodeJS.Timeout | null = null;
+  private pendingTranscriptState: string | null = null;
+  private agentTurnInFlight = false;
+  private queuedTranscript: { text: string; state: string | null } | null =
+    null;
   private lastBotReplyText = '';
   private lastBargeInAt = 0;
   private lastSpeechStoppedAt = 0;
@@ -254,6 +261,9 @@ class VoiceBridgeSession {
   // 20ms @ 8kHz μ-law = 160 bytes
   private readonly ulawFrameBytes = 160;
   private readonly ulawFrameMs = 20;
+  private readonly realtimeTtsStreamingEnabled =
+    String(process.env.VOICE_TTS_STREAMING_ENABLED || 'true').toLowerCase() !==
+    'false';
 
   private readonly ghostRegex =
     /^(ad[ií]os|bye|bye-bye|thank you|thank you very much|all y['’]all|hallo|hello)\.?$/i;
@@ -379,9 +389,9 @@ class VoiceBridgeSession {
           type: 'server_vad',
           create_response: false,
           interrupt_response: false,
-          threshold: 0.62,
-          prefix_padding_ms: 140,
-          silence_duration_ms: 180,
+          threshold: 0.58,
+          prefix_padding_ms: 120,
+          silence_duration_ms: 140,
         },
       },
     });
@@ -491,53 +501,7 @@ class VoiceBridgeSession {
       case 'conversation.item.input_audio_transcription.completed': {
         const rawTranscript = String(evt.transcript || '').trim();
         if (!rawTranscript) return;
-
-        if (this.shouldDropTranscript(rawTranscript)) {
-          this.parentLogger.warn(
-            `[voice] dropped transcript callId=${this.meta.callId} text="${rawTranscript}"`,
-          );
-          return;
-        }
-
-        const transcript = normalizeTranscriptForAgent(
-          rawTranscript,
-          this.lastBotReplyText,
-        );
-
-        const norm = normalizeTurkishForTime(transcript);
-        if (!norm || norm === this.lastTranscriptNorm) {
-          this.parentLogger.warn(
-            `[voice] duplicate transcript callId=${this.meta.callId} text="${transcript}"`,
-          );
-          return;
-        }
-
-        this.lastTranscriptAt = Date.now();
-        this.lastTranscriptText = transcript;
-        this.lastTranscriptNorm = norm;
-        const turnId = ++this.turnSequence;
-        this.activeTurnId = turnId;
-        this.captureRecentContextsFromText(transcript, turnId, 'user');
-        this.markTiming('transcript_normalized', {
-          turnId,
-          rawLength: rawTranscript.length,
-          normalizedLength: transcript.length,
-        });
-
-        this.parentLogger.log(
-          `[voice] transcript normalized callId=${this.meta.callId} turnId=${turnId} raw="${rawTranscript}" normalized="${transcript}"`,
-        );
-
-        const reply = await this.callAgentBrain(transcript, turnId);
-        if (!reply) return;
-        if (!this.isTurnStillActive(turnId)) {
-          this.parentLogger.warn(
-            `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=agent_reply`,
-          );
-          return;
-        }
-
-        await this.speakReply(reply, turnId);
+        await this.handleCompletedTranscript(rawTranscript);
         return;
       }
 
@@ -585,17 +549,144 @@ class VoiceBridgeSession {
     }
   }
 
-  private shouldDropTranscript(text: string) {
+  private async handleCompletedTranscript(rawTranscript: string) {
+    const currentState = this.getCurrentVoiceBookingState();
+
+    if (this.shouldDropTranscript(rawTranscript, currentState)) {
+      this.parentLogger.warn(
+        `[voice] dropped transcript callId=${this.meta.callId} state=${currentState || '-'} text="${rawTranscript}"`,
+      );
+      return;
+    }
+
+    const transcript = normalizeTranscriptForAgent(
+      rawTranscript,
+      this.lastBotReplyText,
+    );
+
+    const merged = mergeVoiceFragments(
+      this.pendingTranscriptText,
+      transcript,
+      currentState,
+    );
+
+    if (shouldBufferShortVoiceTranscript(currentState, merged)) {
+      this.pendingTranscriptText = merged;
+      this.pendingTranscriptState = currentState;
+      if (this.pendingTranscriptTimer)
+        clearTimeout(this.pendingTranscriptTimer);
+      this.pendingTranscriptTimer = setTimeout(() => {
+        const buffered = this.pendingTranscriptText;
+        const bufferedState = this.pendingTranscriptState;
+        this.pendingTranscriptText = '';
+        this.pendingTranscriptState = null;
+        this.pendingTranscriptTimer = null;
+        void this.enqueueOrProcessTranscript(buffered, bufferedState);
+      }, 420);
+      this.parentLogger.log(
+        `[voice] transcript_buffered callId=${this.meta.callId} state=${currentState || '-'} text="${merged}"`,
+      );
+      return;
+    }
+
+    if (this.pendingTranscriptTimer) {
+      clearTimeout(this.pendingTranscriptTimer);
+      this.pendingTranscriptTimer = null;
+    }
+    this.pendingTranscriptText = '';
+    this.pendingTranscriptState = null;
+    await this.enqueueOrProcessTranscript(merged, currentState);
+  }
+
+  private async enqueueOrProcessTranscript(
+    transcript: string,
+    state: string | null,
+  ) {
+    if (this.agentTurnInFlight) {
+      this.activeTurnId = this.turnSequence + 1;
+      this.queuedTranscript = { text: transcript, state };
+      this.parentLogger.log(
+        `[voice] transcript_queued_latest callId=${this.meta.callId} state=${state || '-'} text="${transcript}"`,
+      );
+      return;
+    }
+    await this.processTranscriptTurn(transcript, state);
+  }
+
+  private async processTranscriptTurn(
+    transcript: string,
+    state: string | null,
+  ) {
+    const norm = normalizeTurkishForTime(transcript);
+    if (!norm || norm === this.lastTranscriptNorm) {
+      this.parentLogger.warn(
+        `[voice] duplicate transcript callId=${this.meta.callId} text="${transcript}"`,
+      );
+      return;
+    }
+
+    this.lastTranscriptAt = Date.now();
+    this.lastTranscriptText = transcript;
+    this.lastTranscriptNorm = norm;
+    const turnId = ++this.turnSequence;
+    this.activeTurnId = turnId;
+    this.agentTurnInFlight = true;
+    this.captureRecentContextsFromText(transcript, turnId, 'user');
+    this.markTiming('transcript_normalized', {
+      turnId,
+      state: state || '-',
+      normalizedLength: transcript.length,
+    });
+
+    this.parentLogger.log(
+      `[voice] transcript normalized callId=${this.meta.callId} turnId=${turnId} state=${state || '-'} normalized="${transcript}"`,
+    );
+
+    try {
+      const reply = await this.callAgentBrain(transcript, turnId);
+      if (!reply) return;
+      if (!this.isTurnStillActive(turnId)) {
+        this.parentLogger.warn(
+          `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${turnId} activeTurnId=${this.activeTurnId} stage=agent_reply`,
+        );
+        return;
+      }
+
+      await this.speakReply(reply, turnId);
+    } finally {
+      this.agentTurnInFlight = false;
+      if (this.queuedTranscript) {
+        const queued = this.queuedTranscript;
+        this.queuedTranscript = null;
+        await this.processTranscriptTurn(queued.text, queued.state);
+      }
+    }
+  }
+
+  private getCurrentVoiceBookingState(): string | null {
+    const bookingCore = (this.agentService as any)?.bookingCore as any;
+    const sessions = bookingCore?.sessions as Map<string, any> | undefined;
+    if (!sessions?.get) return null;
+    const customerPhone = normalizePhone(
+      this.meta.from ||
+        this.meta.streamSid ||
+        this.meta.callId ||
+        'voice-caller',
+    );
+    const session = sessions.get(`${this.meta.tenantId}:${customerPhone}`);
+    return session?.state ? String(session.state) : null;
+  }
+
+  private shouldDropTranscript(text: string, state?: string | null) {
     const normalized = text.trim();
     const normalizedTranscript = normalizeVoiceComparisonText(normalized);
 
     if (!normalized) return true;
-    if (normalized.length <= 1) return true;
+    if (normalized.length <= 1 && !isCriticalVoiceState(state)) return true;
     if (this.ghostRegex.test(normalized)) return true;
 
-    const preservePartialBooking = this.isMeaningfulPartialBookingTranscript(
-      normalized,
-    );
+    const preservePartialBooking =
+      this.isMeaningfulPartialBookingTranscript(normalized);
     if (preservePartialBooking) {
       this.parentLogger.log(
         `[voice] partial_booking_transcript_preserved callId=${this.meta.callId} text="${normalized}"`,
@@ -607,17 +698,28 @@ class VoiceBridgeSession {
     const msSinceBargeIn = now - this.lastBargeInAt;
     const msSinceSpeechStopped = now - this.lastSpeechStoppedAt;
 
-    if (!preservePartialBooking && msSinceBargeIn < 180 && normalized.length < 18)
+    if (
+      !preservePartialBooking &&
+      !isCriticalVoiceState(state) &&
+      msSinceBargeIn < 180 &&
+      normalized.length < 18
+    )
       return true;
     if (
       !preservePartialBooking &&
+      !isCriticalVoiceState(state) &&
       msSinceSpeechStopped > 0 &&
       msSinceSpeechStopped < 120 &&
       normalized.length < 3
     )
       return true;
 
-    if (!preservePartialBooking && msSinceAssistantAudio < 280 && normalized.length < 16) {
+    if (
+      !preservePartialBooking &&
+      !isCriticalVoiceState(state) &&
+      msSinceAssistantAudio < 280 &&
+      normalized.length < 16
+    ) {
       return true;
     }
 
@@ -629,7 +731,10 @@ class VoiceBridgeSession {
     }
 
     const assistantEchoSimilarity = Math.max(
-      similarityScore(normalizedTranscript, normalizeVoiceComparisonText(this.lastBotReplyText)),
+      similarityScore(
+        normalizedTranscript,
+        normalizeVoiceComparisonText(this.lastBotReplyText),
+      ),
       similarityScore(
         normalizedTranscript,
         normalizeVoiceComparisonText(RealtimeBridgeService.openingGreeting),
@@ -671,9 +776,7 @@ class VoiceBridgeSession {
       this.lastBotReplyText === RealtimeBridgeService.openingGreeting &&
       now < this.openingGreetingProtectionUntil
     ) {
-      this.logOpeningGreetingIgnore(
-        this.openingGreetingProtectionUntil - now,
-      );
+      this.logOpeningGreetingIgnore(this.openingGreetingProtectionUntil - now);
       this.speechEnergyFrames = 0;
       return;
     }
@@ -799,21 +902,40 @@ class VoiceBridgeSession {
     return patterns.some((pattern) => pattern.test(t));
   }
 
-  private async buildAgentInputWithVoiceContext(userText: string, turnId: number) {
+  private async buildAgentInputWithVoiceContext(
+    userText: string,
+    turnId: number,
+  ) {
     const explicitService = await this.detectServiceMention(userText);
     const explicitStaff = await this.detectStaffMention(userText);
     const hasBookingIntent = this.hasBookingIntentCue(userText);
     const hints: string[] = [];
 
-    if (hasBookingIntent && !explicitService && this.isRecentServiceContextStrong(turnId) && this.recentServiceContext) {
-      hints.push(`Az önce konuşulan hizmet: ${this.recentServiceContext.name}. Kullanıcı yeni hizmet belirtmediyse booking akışını bu hizmetle sürdür.`);
+    if (
+      hasBookingIntent &&
+      !explicitService &&
+      this.isRecentServiceContextStrong(turnId) &&
+      this.recentServiceContext
+    ) {
+      hints.push(
+        `Az önce konuşulan hizmet: ${this.recentServiceContext.name}. Kullanıcı yeni hizmet belirtmediyse booking akışını bu hizmetle sürdür.`,
+      );
       this.parentLogger.log(
         `[voice] recent_service_context_reused callId=${this.meta.callId} turnId=${turnId} service=${JSON.stringify(this.recentServiceContext.name)}`,
       );
     }
 
-    if (!explicitStaff && this.recentStaffContext && this.isRecentEntityContextStrong(this.recentStaffContext, turnId) && /(o olsun|onunla|kendisiyle|ayni kisi|aynı kişi|ayni personel|aynı personel)/i.test(userText)) {
-      hints.push(`Az önce konuşulan personel: ${this.recentStaffContext.name}. Kullanıcı başka bir personel söylemediyse staff tercihi olarak bunu kullan.`);
+    if (
+      !explicitStaff &&
+      this.recentStaffContext &&
+      this.isRecentEntityContextStrong(this.recentStaffContext, turnId) &&
+      /(o olsun|onunla|kendisiyle|ayni kisi|aynı kişi|ayni personel|aynı personel)/i.test(
+        userText,
+      )
+    ) {
+      hints.push(
+        `Az önce konuşulan personel: ${this.recentStaffContext.name}. Kullanıcı başka bir personel söylemediyse staff tercihi olarak bunu kullan.`,
+      );
     }
 
     if (this.bookingDraftSnapshot && hasBookingIntent) {
@@ -825,7 +947,9 @@ class VoiceBridgeSession {
         snap.state ? `state=${snap.state}` : '',
       ].filter(Boolean);
       if (parts.length) {
-        hints.push(`Mevcut booking taslağı: ${parts.join(', ')}. Alakasız kısa input gelirse akışı bozma, taslağı koru.`);
+        hints.push(
+          `Mevcut booking taslağı: ${parts.join(', ')}. Alakasız kısa input gelirse akışı bozma, taslağı koru.`,
+        );
       }
     }
 
@@ -845,7 +969,10 @@ class VoiceBridgeSession {
       : false;
   }
 
-  private isRecentEntityContextStrong(context: RecentEntityContext, turnId: number) {
+  private isRecentEntityContextStrong(
+    context: RecentEntityContext,
+    turnId: number,
+  ) {
     const withinTurns = turnId - context.turnId <= 6;
     const withinMs = Date.now() - context.timestamp <= 240000;
     return withinTurns && withinMs;
@@ -860,7 +987,9 @@ class VoiceBridgeSession {
 
   private hasBookingIntentCue(text: string) {
     const t = normalizeTurkishForTime(text);
-    return /(randevu|rezervasyon|gelebilir miyim|uygun musunuz|uygun mu|buna randevu|bunu yaptiralim|bunu yaptiralim|olur mu)/.test(t);
+    return /(randevu|rezervasyon|gelebilir miyim|uygun musunuz|uygun mu|buna randevu|bunu yaptiralim|bunu yaptiralim|olur mu)/.test(
+      t,
+    );
   }
 
   private async detectServiceMention(text: string) {
@@ -896,10 +1025,12 @@ class VoiceBridgeSession {
       });
       if (exact) return exact;
       const words = t.split(/\s+/).filter((word) => word.length >= 3);
-      return staff.find((item: any) => {
-        const name = normalizeTurkishForTime(String(item?.name || ''));
-        return words.some((word) => name.includes(word));
-      }) || null;
+      return (
+        staff.find((item: any) => {
+          const name = normalizeTurkishForTime(String(item?.name || ''));
+          return words.some((word) => name.includes(word));
+        }) || null
+      );
     } catch {
       return null;
     }
@@ -914,12 +1045,25 @@ class VoiceBridgeSession {
     if (!session?.draft) return;
 
     this.bookingDraftSnapshot = {
-      serviceId: session.draft.serviceId ? String(session.draft.serviceId) : undefined,
-      serviceName: session.lastBookingContext?.serviceName || this.recentServiceContext?.name,
-      staffId: session.draft.staffId ? String(session.draft.staffId) : undefined,
-      staffName: session.lastBookingContext?.staffName || this.recentStaffContext?.name || session.draft.requestedStaffName,
-      customerName: session.draft.customerName ? String(session.draft.customerName) : undefined,
-      startAt: session.draft.startAt ? String(session.draft.startAt) : undefined,
+      serviceId: session.draft.serviceId
+        ? String(session.draft.serviceId)
+        : undefined,
+      serviceName:
+        session.lastBookingContext?.serviceName ||
+        this.recentServiceContext?.name,
+      staffId: session.draft.staffId
+        ? String(session.draft.staffId)
+        : undefined,
+      staffName:
+        session.lastBookingContext?.staffName ||
+        this.recentStaffContext?.name ||
+        session.draft.requestedStaffName,
+      customerName: session.draft.customerName
+        ? String(session.draft.customerName)
+        : undefined,
+      startAt: session.draft.startAt
+        ? String(session.draft.startAt)
+        : undefined,
       state: session.state ? String(session.state) : undefined,
       updatedAt: Date.now(),
     };
@@ -982,7 +1126,12 @@ class VoiceBridgeSession {
   ) {
     const intent = detectRecentIntent(text);
     if (!intent) return;
-    this.recentIntentContext = { intent, source, turnId, timestamp: Date.now() };
+    this.recentIntentContext = {
+      intent,
+      source,
+      turnId,
+      timestamp: Date.now(),
+    };
   }
 
   private cancelAssistantAudio(
@@ -1062,6 +1211,10 @@ class VoiceBridgeSession {
         source: 'deterministic_bypass',
         replyLength: deterministicReply.reply.length,
       });
+      this.logTurnLatency('agent_reply_ready', turnId, {
+        source: 'deterministic_bypass',
+        replyLength: deterministicReply.reply.length,
+      });
       return deterministicReply.reply;
     }
 
@@ -1112,6 +1265,9 @@ class VoiceBridgeSession {
       this.markTiming('agent_reply_ready', {
         turnId,
         source: 'agent',
+        replyLength: reply.length,
+      });
+      this.logTurnLatency('agent_reply_ready', turnId, {
         replyLength: reply.length,
       });
 
@@ -1172,7 +1328,11 @@ class VoiceBridgeSession {
 
     try {
       const token = ++this.playbackToken;
-      const audioBuffer = await this.getOrCreateTtsAudio(clean);
+      const ttsResult = await this.getOrCreateTtsAudio(
+        clean,
+        token,
+        effectiveTurnId,
+      );
 
       if (!this.isTurnStillActive(effectiveTurnId)) {
         this.parentLogger.warn(
@@ -1181,11 +1341,13 @@ class VoiceBridgeSession {
         return;
       }
 
-      if (audioBuffer && token === this.playbackToken) {
+      if (ttsResult?.audioBuffer && token === this.playbackToken) {
         this.parentLogger.log(
-          `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${audioBuffer.length}`,
+          `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${ttsResult.audioBuffer.length} streamed=${ttsResult.streamed ? 'yes' : 'no'}`,
         );
-        this.streamUlawBuffer(audioBuffer, token, effectiveTurnId);
+        if (!ttsResult.streamed) {
+          this.streamUlawBuffer(ttsResult.audioBuffer, token, effectiveTurnId);
+        }
         return;
       }
     } catch (err) {
@@ -1201,7 +1363,11 @@ class VoiceBridgeSession {
     );
   }
 
-  private async generateElevenLabsAudio(text: string): Promise<Buffer | null> {
+  private async generateElevenLabsAudio(
+    text: string,
+    token?: number,
+    turnId?: number,
+  ): Promise<{ audioBuffer: Buffer | null; streamed: boolean }> {
     this.markTiming('elevenlabs_request_start', {
       textLength: text.length,
     });
@@ -1210,7 +1376,7 @@ class VoiceBridgeSession {
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
     if (!apiKey || !voiceId) {
       this.parentLogger.error('[voice] ElevenLabs API key or voice ID missing');
-      return null;
+      return { audioBuffer: null, streamed: false };
     }
 
     const controller = new AbortController();
@@ -1252,22 +1418,41 @@ class VoiceBridgeSession {
         this.parentLogger.error(
           `[voice] ElevenLabs TTS error: ${response.status} ${bodyText}`,
         );
-        return null;
+        return { audioBuffer: null, streamed: false };
+      }
+
+      const streamed =
+        this.realtimeTtsStreamingEnabled &&
+        !!response.body &&
+        token != null &&
+        turnId != null
+          ? await this.streamElevenLabsResponse(response, token, turnId)
+          : null;
+
+      if (streamed?.audioBuffer) {
+        this.markTiming('elevenlabs_success', {
+          bytes: streamed.audioBuffer.length,
+          streamed: true,
+        });
+        return { audioBuffer: streamed.audioBuffer, streamed: true };
       }
 
       const arrayBuffer = await response.arrayBuffer();
       const audioBuffer = Buffer.from(arrayBuffer);
-      this.markTiming('elevenlabs_success', { bytes: audioBuffer.length });
-      return audioBuffer;
+      this.markTiming('elevenlabs_success', {
+        bytes: audioBuffer.length,
+        streamed: false,
+      });
+      return { audioBuffer, streamed: false };
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         this.parentLogger.warn(
           `[voice] ElevenLabs synthesis aborted callId=${this.meta.callId} reason=barge_in_or_cancel`,
         );
-        return null;
+        return { audioBuffer: null, streamed: false };
       }
       this.parentLogger.error(`[voice] ElevenLabs TTS error: ${err}`);
-      return null;
+      return { audioBuffer: null, streamed: false };
     } finally {
       if (this.currentTtsAbort === controller) {
         this.currentTtsAbort = null;
@@ -1312,7 +1497,8 @@ class VoiceBridgeSession {
       },
       {
         key: 'services',
-        reply: 'Lazer epilasyon, cilt bakımı, protez tırnak, saç, kaş ve kirpik işlemlerimiz var. Hangisiyle ilgileniyorsunuz?',
+        reply:
+          'Lazer epilasyon, cilt bakımı, protez tırnak, saç, kaş ve kirpik işlemlerimiz var. Hangisiyle ilgileniyorsunuz?',
         patterns: [
           /^hangi hizmetler var[.!? ]*$/,
           /^hangi hizmetleriniz var[.!? ]*$/,
@@ -1331,42 +1517,51 @@ class VoiceBridgeSession {
     return null;
   }
 
-  private async getOrCreateTtsAudio(text: string): Promise<Buffer | null> {
+  private async getOrCreateTtsAudio(
+    text: string,
+    token?: number,
+    turnId?: number,
+  ): Promise<{ audioBuffer: Buffer | null; streamed: boolean } | null> {
     const normalizedText = normalizeTtsCacheKey(text);
     const isOpeningGreeting =
       text === RealtimeBridgeService.openingGreeting ||
-      normalizedText === normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting);
+      normalizedText ===
+        normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting);
 
     if (isOpeningGreeting && RealtimeBridgeService.openingGreetingAudio) {
       this.parentLogger.log(
-        `[voice] opening_greeting_cache_hit callId=${this.meta.callId} bytes=${RealtimeBridgeService.openingGreetingAudio.length}` ,
+        `[voice] opening_greeting_cache_hit callId=${this.meta.callId} bytes=${RealtimeBridgeService.openingGreetingAudio.length}`,
       );
       this.markTiming('tts_cache_hit', {
         cache: 'opening_greeting',
         textLength: text.length,
       });
-      return RealtimeBridgeService.openingGreetingAudio;
+      return {
+        audioBuffer: RealtimeBridgeService.openingGreetingAudio,
+        streamed: false,
+      };
     }
 
-    const cached = RealtimeBridgeService.shortReplyAudioCache.get(normalizedText);
+    const cached =
+      RealtimeBridgeService.shortReplyAudioCache.get(normalizedText);
     if (cached) {
       this.parentLogger.log(
-        `[voice] tts_cache_hit callId=${this.meta.callId} key=${JSON.stringify(normalizedText)} bytes=${cached.length}` ,
+        `[voice] tts_cache_hit callId=${this.meta.callId} key=${JSON.stringify(normalizedText)} bytes=${cached.length}`,
       );
       this.markTiming('tts_cache_hit', {
         cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
         textLength: text.length,
       });
-      return cached;
+      return { audioBuffer: cached, streamed: false };
     }
 
     if (isOpeningGreeting) {
       this.parentLogger.log(
-        `[voice] opening_greeting_cache_miss callId=${this.meta.callId}` ,
+        `[voice] opening_greeting_cache_miss callId=${this.meta.callId}`,
       );
     } else {
       this.parentLogger.log(
-        `[voice] tts_cache_miss callId=${this.meta.callId} key=${JSON.stringify(normalizedText)}` ,
+        `[voice] tts_cache_miss callId=${this.meta.callId} key=${JSON.stringify(normalizedText)}`,
       );
     }
 
@@ -1376,28 +1571,166 @@ class VoiceBridgeSession {
     });
 
     if (isOpeningGreeting && RealtimeBridgeService.openingGreetingPromise) {
-      return RealtimeBridgeService.openingGreetingPromise;
+      return (
+        RealtimeBridgeService.openingGreetingPromise?.then((audioBuffer) => ({
+          audioBuffer,
+          streamed: false,
+        })) || null
+      );
     }
 
-    const synthesisPromise = this.generateElevenLabsAudio(text).then((audioBuffer) => {
-      if (audioBuffer) {
-        RealtimeBridgeService.shortReplyAudioCache.set(normalizedText, audioBuffer);
-        if (isOpeningGreeting) {
-          RealtimeBridgeService.openingGreetingAudio = audioBuffer;
+    const synthesisPromise = this.generateElevenLabsAudio(text, token, turnId)
+      .then((result) => {
+        const audioBuffer = result?.audioBuffer || null;
+        if (audioBuffer) {
+          RealtimeBridgeService.shortReplyAudioCache.set(
+            normalizedText,
+            audioBuffer,
+          );
+          if (isOpeningGreeting) {
+            RealtimeBridgeService.openingGreetingAudio = audioBuffer;
+          }
         }
-      }
-      return audioBuffer;
-    }).finally(() => {
-      if (isOpeningGreeting) {
-        RealtimeBridgeService.openingGreetingPromise = null;
-      }
-    });
+        return { audioBuffer, streamed: Boolean(result?.streamed) };
+      })
+      .finally(() => {
+        if (isOpeningGreeting) {
+          RealtimeBridgeService.openingGreetingPromise = null;
+        }
+      });
 
     if (isOpeningGreeting) {
-      RealtimeBridgeService.openingGreetingPromise = synthesisPromise;
+      RealtimeBridgeService.openingGreetingPromise = synthesisPromise.then(
+        (result) => result.audioBuffer,
+      );
     }
 
     return synthesisPromise;
+  }
+
+  private async streamElevenLabsResponse(
+    response: Response,
+    token: number,
+    turnId: number,
+  ): Promise<{ audioBuffer: Buffer; streamed: boolean } | null> {
+    const reader = response.body?.getReader();
+    if (!reader) return null;
+
+    const chunks: Buffer[] = [];
+    let pending = Buffer.alloc(0);
+    let totalBytes = 0;
+    let sentBytes = 0;
+    let firstChunkSent = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.length) continue;
+
+      const chunk = Buffer.from(value);
+      chunks.push(chunk);
+      totalBytes += chunk.length;
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+
+      while (pending.length >= this.ulawFrameBytes) {
+        if (
+          this.closed ||
+          token !== this.playbackToken ||
+          !this.isTurnStillActive(turnId)
+        ) {
+          return {
+            audioBuffer: Buffer.concat(chunks, totalBytes),
+            streamed: false,
+          };
+        }
+
+        const frame = pending.subarray(0, this.ulawFrameBytes);
+        pending = pending.subarray(this.ulawFrameBytes);
+        this.currentPlaybackOffsetBytes = sentBytes;
+        this.lastAssistantAudioAt = Date.now();
+        if (!firstChunkSent) {
+          firstChunkSent = true;
+          this.markTiming('final_audio_send_start', {
+            bytes: totalBytes,
+            streaming: true,
+          });
+          this.logTurnLatency('assistant_first_audio_streaming', turnId, {
+            ttsBufferedBytes: totalBytes,
+          });
+          if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
+            this.openingGreetingProtectionUntil =
+              this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
+          }
+        }
+        this.sendBridge({
+          event: 'media',
+          media: { payload: frame.toString('base64') },
+        });
+        sentBytes += frame.length;
+      }
+    }
+
+    if (pending.length > 0) {
+      const padded = Buffer.alloc(this.ulawFrameBytes, 0xff);
+      pending.copy(padded);
+      if (
+        !this.closed &&
+        token === this.playbackToken &&
+        this.isTurnStillActive(turnId)
+      ) {
+        this.currentPlaybackOffsetBytes = sentBytes;
+        this.lastAssistantAudioAt = Date.now();
+        if (!firstChunkSent) {
+          firstChunkSent = true;
+          this.markTiming('final_audio_send_start', {
+            bytes: totalBytes,
+            streaming: true,
+          });
+          this.logTurnLatency('assistant_first_audio_streaming', turnId, {
+            ttsBufferedBytes: totalBytes,
+          });
+        }
+        this.sendBridge({
+          event: 'media',
+          media: { payload: padded.toString('base64') },
+        });
+        sentBytes += padded.length;
+      }
+    }
+
+    this.currentPlaybackDurationMs =
+      Math.ceil(sentBytes / this.ulawFrameBytes) * this.ulawFrameMs;
+    this.currentPlaybackOffsetBytes = sentBytes;
+    this.assistantSpeaking = false;
+    this.activeResponse = false;
+    return {
+      audioBuffer: Buffer.concat(chunks, totalBytes),
+      streamed: firstChunkSent,
+    };
+  }
+
+  private logTurnLatency(
+    label: string,
+    turnId?: number,
+    extra: Record<string, unknown> = {},
+  ) {
+    const now = Date.now();
+    const parts = [
+      `label=${label}`,
+      `callId=${this.meta.callId}`,
+      `turnId=${turnId ?? this.activeTurnId}`,
+      this.lastSpeechStoppedAt
+        ? `sinceSpeechStopped=${now - this.lastSpeechStoppedAt}ms`
+        : '',
+      this.timings.agent_processing_start
+        ? `sinceAgentStart=${now - this.timings.agent_processing_start}ms`
+        : '',
+      this.timings.agent_reply_ready
+        ? `sinceAgentReplyReady=${now - this.timings.agent_reply_ready}ms`
+        : '',
+      ...Object.entries(extra).map(([key, value]) => `${key}=${String(value)}`),
+    ].filter(Boolean);
+    this.parentLogger.log(`[voice][latency] ${parts.join(' ')}`);
   }
 
   private streamUlawBuffer(buf: Buffer, token: number, turnId: number) {
@@ -1431,12 +1764,21 @@ class VoiceBridgeSession {
       }
 
       this.lastAssistantAudioAt = Date.now();
-      if (offset === 0 && this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
+      if (
+        offset === 0 &&
+        this.lastBotReplyText === RealtimeBridgeService.openingGreeting
+      ) {
         this.openingGreetingProtectionUntil =
           this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
       }
       if (offset === 0) {
-        this.markTiming('final_audio_send_start', { bytes: buf.length });
+        this.markTiming('final_audio_send_start', {
+          bytes: buf.length,
+          streaming: false,
+        });
+        this.logTurnLatency('assistant_first_audio_buffered', turnId, {
+          totalBytes: buf.length,
+        });
         if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
           this.parentLogger.log(
             `[voice] opening_greeting_audio_sent callId=${this.meta.callId} bytes=${buf.length}`,
@@ -1469,6 +1811,14 @@ class VoiceBridgeSession {
   private safeClose() {
     if (this.closed) return;
     this.closed = true;
+
+    if (this.pendingTranscriptTimer) {
+      clearTimeout(this.pendingTranscriptTimer);
+      this.pendingTranscriptTimer = null;
+    }
+    this.pendingTranscriptText = '';
+    this.pendingTranscriptState = null;
+    this.queuedTranscript = null;
 
     this.cancelAssistantAudio('close');
 
@@ -1604,6 +1954,44 @@ function normalizeTranscriptForAgent(
   return text;
 }
 
+function isCriticalVoiceState(state?: string | null) {
+  return (
+    state === 'WAIT_NAME' || state === 'WAIT_DATETIME' || state === 'WAIT_STAFF'
+  );
+}
+
+export function shouldBufferShortVoiceTranscript(
+  state: string | null | undefined,
+  transcript: string,
+) {
+  if (!isCriticalVoiceState(state)) return false;
+  const normalized = normalizeTurkishForTime(transcript);
+  if (!normalized) return false;
+  if (state === 'WAIT_NAME') return normalized.length <= 12;
+  if (state === 'WAIT_STAFF') return normalized.length <= 18;
+  if (state === 'WAIT_DATETIME') return normalized.length <= 20;
+  return false;
+}
+
+export function mergeVoiceFragments(
+  previous: string,
+  incoming: string,
+  state: string | null | undefined,
+) {
+  const prev = String(previous || '').trim();
+  const next = String(incoming || '').trim();
+  if (!prev) return next;
+  if (!next) return prev;
+  if (!isCriticalVoiceState(state)) return next;
+  const prevNorm = normalizeTurkishForTime(prev);
+  const nextNorm = normalizeTurkishForTime(next);
+  if (!prevNorm || !nextNorm || prevNorm === nextNorm) return next;
+  if (state === 'WAIT_NAME' || state === 'WAIT_STAFF')
+    return `${prev} ${next}`.trim();
+  if (state === 'WAIT_DATETIME') return `${prev} ${next}`.trim();
+  return next;
+}
+
 function normalizeTurkishForTime(s: string) {
   return String(s || '')
     .toLocaleLowerCase('tr-TR')
@@ -1716,10 +2104,7 @@ function stripRepeatedGreetingLead(text: string) {
   }
 
   return source
-    .replace(
-      /^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin)[,!\s:-]+/i,
-      '',
-    )
+    .replace(/^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin)[,!\s:-]+/i, '')
     .replace(/^size nasil yardimci olabilirim\??/i, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
@@ -1769,13 +2154,19 @@ function detectRecentIntent(
 ): RecentIntentContext['intent'] | null {
   const normalized = normalizeTurkishForTime(text);
   if (!normalized) return null;
-  if (/(randevu|rezervasyon|uygun saat|müsait|musait|yarin|yarın|bugun|bugün)/.test(normalized)) {
+  if (
+    /(randevu|rezervasyon|uygun saat|müsait|musait|yarin|yarın|bugun|bugün)/.test(
+      normalized,
+    )
+  ) {
     return 'booking';
   }
   if (/(personel|kimle|hangi uzman|hangi personel)/.test(normalized)) {
     return 'staff_preference';
   }
-  if (/(fiyat|ucret|ücret|bilgi|adres|saat kac|kaçta acik|açik)/.test(normalized)) {
+  if (
+    /(fiyat|ucret|ücret|bilgi|adres|saat kac|kaçta acik|açik)/.test(normalized)
+  ) {
     return 'info';
   }
   return 'general';
@@ -1928,7 +2319,9 @@ function formatDateForSpeech(dateText: string, now = new Date()) {
   if (diffDays === 1) return 'yarın';
   if (diffDays === -1) return 'dün';
   if (diffDays > 1 && diffDays <= 6) {
-    return weekdays[target.getUTCDay()] || `${day} ${months[month - 1]} ${year}`;
+    return (
+      weekdays[target.getUTCDay()] || `${day} ${months[month - 1]} ${year}`
+    );
   }
 
   return `${day} ${months[month - 1]} ${year}`;
@@ -1971,8 +2364,7 @@ function formatTimeForSpeech(timeText: string) {
   else if (hh24 >= 18 && hh24 < 22) prefix = 'akşam';
   else prefix = 'gece';
 
-  const spokenPrefix =
-    prefix === 'öğleden sonra' ? 'saat' : prefix;
+  const spokenPrefix = prefix === 'öğleden sonra' ? 'saat' : prefix;
 
   if (mm === 0) return `${spokenPrefix} ${base}`;
   if (mm === 15) return `${spokenPrefix} ${base} on beş`;
@@ -2056,7 +2448,9 @@ function humanizeBookingSummaryForSpeech(text: string) {
     : `${summaryParts.join(', ')} uygun görünüyor.`;
   const questionMatch = source.match(/[^.?!]*\?/g);
   const question = questionMatch?.length
-    ? humanizeConfirmationForSpeech(questionMatch[questionMatch.length - 1] || '')
+    ? humanizeConfirmationForSpeech(
+        questionMatch[questionMatch.length - 1] || '',
+      )
     : '';
 
   return `${summary}${!summary.endsWith('?') && question ? ` ${question}` : ''}`.trim();

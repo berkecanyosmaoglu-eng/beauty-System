@@ -2,6 +2,38 @@ import { BookingCoreService } from './booking-core.service';
 import { VoiceAgentService } from '../voice-agent.service';
 
 describe('BookingCoreService voice booking guards', () => {
+  it('asks for service on generic "Randevu almak istiyorum" request', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Randevu almak istiyorum',
+      channel: 'voice',
+    });
+
+    expect(reply).toMatch(/hangi hizmet/i);
+    expect(reply).not.toMatch(/bulamadim|bulamadım/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.state).toBe('WAIT_SERVICE');
+  });
+
+  it('asks for service on generic "Rezervasyon yapmak istiyorum" request', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Rezervasyon yapmak istiyorum',
+      channel: 'voice',
+    });
+
+    expect(reply).toMatch(/hangi hizmet/i);
+    expect(reply).not.toMatch(/bulamadim|bulamadım/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.state).toBe('WAIT_SERVICE');
+  });
+
   const tenantId = 'tenant-1';
   const from = '+905551112233';
 
@@ -16,10 +48,7 @@ describe('BookingCoreService voice booking guards', () => {
     { id: 'stf-1', name: 'Ayşe' },
     { id: 'stf-2', name: 'Fatma' },
     { id: 'stf-3', name: 'Esra' },
-<<<<<<< HEAD
     { id: 'stf-4', name: 'Elif Kaya', fullName: 'Elif Kaya' },
-=======
->>>>>>> origin/main
   ];
 
   function createPrismaMock() {
@@ -134,6 +163,27 @@ describe('BookingCoreService voice booking guards', () => {
     expect(reply).toContain('Pedikür');
     expect(reply).not.toContain('Protez Tırnak');
     expect(reply).toContain('Hangisi için randevu istersiniz?');
+  });
+
+  it('uses recent service context for price follow-up', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi almak istiyorum',
+      channel: 'voice',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Fiyatı ne kadar?',
+      channel: 'voice',
+    });
+
+    expect(reply).toMatch(/Protez Tırnak fiyatı: 1500₺/i);
+    expect(reply).toMatch(/Süre: 90 dk/i);
   });
 
   it('reuses recent service context for a follow-up booking request', async () => {
@@ -389,20 +439,12 @@ describe('BookingCoreService voice booking guards', () => {
     await service.replyText({
       tenantId,
       from,
-<<<<<<< HEAD
       text: 'Aylin Hanım',
-=======
-      text: 'Elif Hanım',
->>>>>>> origin/main
       channel: 'voice',
     });
 
     const session = (service as any).sessions.get(key);
-<<<<<<< HEAD
     expect(session.draft.customerName).toBe('Aylin');
-=======
-    expect(session.draft.customerName).toBe('Elif');
->>>>>>> origin/main
   });
 
   it('rejects non-name acknowledgements in WAIT_NAME', async () => {
@@ -460,7 +502,6 @@ describe('BookingCoreService voice booking guards', () => {
     const session = (service as any).sessions.get(key);
     expect(session.draft.customerName).toBe('Berkecan');
   });
-<<<<<<< HEAD
 
   it('resolves plain single-token staff reply in WAIT_STAFF without re-asking staff', async () => {
     const service = new BookingCoreService(createPrismaMock());
@@ -578,6 +619,4 @@ describe('BookingCoreService voice booking guards', () => {
     expect(session.draft.customerName).toBeUndefined();
     expect(staffReply).toMatch(/isim|ad soyad/i);
   });
-=======
->>>>>>> origin/main
 });
