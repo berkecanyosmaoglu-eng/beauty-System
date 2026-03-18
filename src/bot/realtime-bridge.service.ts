@@ -942,14 +942,14 @@ class VoiceBridgeSession {
     }> = [
       {
         key: 'greeting',
-        reply: RealtimeBridgeService.openingGreeting,
+        reply: 'Buyurun, dinliyorum.',
         patterns: [
           /^(alo|merhaba|selam|iyi gunler|iyi aksamlar|gunaydin)[.!? ]*$/,
         ],
       },
       {
         key: 'voice_check',
-        reply: 'Evet, sesiniz geliyor.',
+        reply: 'Evet, sizi duyuyorum.',
         patterns: [
           /^sesim geliyor mu[.!? ]*$/,
           /^beni duyuyor musunuz[.!? ]*$/,
@@ -1337,23 +1337,15 @@ function sanitizeReplyForVoice(text: string) {
 }
 
 function rewriteAgentReplyForVoice(replyText: string) {
-  let text = String(replyText || '').trim();
+  let text = sanitizeReplyForVoice(String(replyText || '').trim())
+    .replace(/yazar mısınız/gi, 'söyler misiniz')
+    .replace(/yazar misiniz/gi, 'söyler misiniz')
+    .replace(/\(E\/H\)/gi, '')
+    .replace(/\bE\/H\b/gi, '');
   const lower = text.toLocaleLowerCase('tr-TR');
 
-  text = text
-    .replace(/[\u{1F300}-\u{1FAFF}]/gu, '')
-    .replace(/\*\*/g, '')
-    .replace(/[_`#]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  text = text.replace(/yazar mısınız/gi, 'söyler misiniz');
-  text = text.replace(/yazar misiniz/gi, 'söyler misiniz');
-  text = text.replace(/\(E\/H\)/gi, '');
-  text = text.replace(/\bE\/H\b/gi, '');
-
   if (lower.startsWith('randevu özeti:')) {
-    return 'Randevu bilgileri doğruysa onaylıyor musunuz?';
+    return 'Bilgiler doğruysa onaylayayım mı?';
   }
 
   if (lower.includes('kiminle olsun') || lower.includes('hangi personeli')) {
@@ -1366,8 +1358,10 @@ function rewriteAgentReplyForVoice(replyText: string) {
     ].slice(0, 3);
 
     if (slots.length) {
-      const spoken = slots.map((m) => naturalTimeSpeech(m[2])).join(', ');
-      return `O saat dolu. En yakın uygun saatler ${spoken}. Başka bir saat de söyleyebilirsiniz.`;
+      const spoken = slots
+        .map((m) => formatDateTimeForSpeech(`${m[1]} ${m[2]}`))
+        .join(', ');
+      return `O saat dolu. En yakın uygun saatler ${spoken}. İsterseniz başka bir saat de söyleyebilirsiniz.`;
     }
 
     return 'O saat dolu. Yakın bir saat söyleyebilir misiniz?';
@@ -1379,7 +1373,9 @@ function rewriteAgentReplyForVoice(replyText: string) {
     lower.includes('kayıt:')
   ) {
     const m = text.match(/\b(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\b/);
-    if (m) return `Randevunuz onaylandı. ${m[1]} ${naturalTimeSpeech(m[2])}.`;
+    if (m) {
+      return `Randevunuz onaylandı. ${formatDateTimeForSpeech(`${m[1]} ${m[2]}`)}.`;
+    }
     return 'Randevunuz onaylandı.';
   }
 
@@ -1397,6 +1393,10 @@ function rewriteAgentReplyForVoice(replyText: string) {
     .replace(/\s*\/\s*/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+
+  text = humanizeBookingSummaryForSpeech(text);
+  text = humanizeConfirmationForSpeech(text);
+  text = formatDateTimeForSpeech(text);
 
   return text;
 }
@@ -1417,43 +1417,199 @@ function shortenReplyForPhone(text: string) {
     .map((part) => part.trim())
     .filter(Boolean);
 
-  if (sentenceParts.length > 1) {
-    const first = sentenceParts[0] || '';
-    const second = sentenceParts[1] || '';
-    const firstNorm = normalizeTurkishForTime(first);
-    const secondNorm = normalizeTurkishForTime(second);
-
-    const firstIsWeakLead =
-      /^(merhaba|selam|evet|tamam|peki|anladim|anladım|tabii|elbette)[!.? ]*$/.test(firstNorm) ||
-      /^(merhaba|selam)[,.! ]/.test(firstNorm) ||
-      /^(evet|tamam|peki)[,.! ]/.test(firstNorm);
-
-    const secondIsUseful =
-      second.includes('?') ||
-      secondNorm.includes('yardimci olabilir') ||
-      secondNorm.includes('hangi hizmet') ||
-      secondNorm.includes('hangi islem') ||
-      secondNorm.includes('hangi konuda') ||
-      secondNorm.includes('hangi personel') ||
-      secondNorm.includes('hangi gun') ||
-      secondNorm.includes('kacta') ||
-      secondNorm.includes('saat') ||
-      secondNorm.includes('randevu');
-
-    if (firstIsWeakLead && secondIsUseful) {
-      out = `${first} ${second}`.trim();
-    } else {
-      out = first || out;
-    }
+  if (sentenceParts.length > 2) {
+    out = sentenceParts.slice(0, 2).join(' ');
   }
 
-  if (out.length > 170) {
-    out = out.slice(0, 170).trim();
+  if (out.length > 220) {
+    const shortened = out.slice(0, 220);
+    const cutAt = Math.max(
+      shortened.lastIndexOf('. '),
+      shortened.lastIndexOf('? '),
+      shortened.lastIndexOf('! '),
+      shortened.lastIndexOf(', '),
+    );
+    out = (cutAt > 80 ? shortened.slice(0, cutAt + 1) : shortened).trim();
     out = out.replace(/[,:;\s]+$/g, '');
     if (!/[.!?]$/.test(out)) out += '.';
   }
 
   return out.replace(/\s{2,}/g, ' ').trim();
+}
+
+function formatDateForSpeech(dateText: string, now = new Date()) {
+  const match = String(dateText || '').match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (!match) return String(dateText || '').trim();
+
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = Number(match[3]);
+  const target = new Date(Date.UTC(year, month - 1, day));
+  if (Number.isNaN(target.getTime())) return String(dateText || '').trim();
+
+  const months = [
+    'Ocak',
+    'Şubat',
+    'Mart',
+    'Nisan',
+    'Mayıs',
+    'Haziran',
+    'Temmuz',
+    'Ağustos',
+    'Eylül',
+    'Ekim',
+    'Kasım',
+    'Aralık',
+  ];
+  const weekdays = [
+    'pazar',
+    'pazartesi',
+    'salı',
+    'çarşamba',
+    'perşembe',
+    'cuma',
+    'cumartesi',
+  ];
+
+  const todayUtc = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+  );
+  const targetUtc = Date.UTC(year, month - 1, day);
+  const diffDays = Math.round((targetUtc - todayUtc) / 86400000);
+
+  if (diffDays === 0) return 'bugün';
+  if (diffDays === 1) return 'yarın';
+  if (diffDays === -1) return 'dün';
+  if (diffDays > 1 && diffDays <= 6) {
+    return weekdays[target.getUTCDay()] || `${day} ${months[month - 1]} ${year}`;
+  }
+
+  return `${day} ${months[month - 1]} ${year}`;
+}
+
+function formatTimeForSpeech(timeText: string) {
+  const match = String(timeText || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return String(timeText || '').trim();
+
+  const hh24 = Number(match[1]);
+  const mm = Number(match[2]);
+  if (Number.isNaN(hh24) || Number.isNaN(mm)) {
+    return String(timeText || '').trim();
+  }
+
+  const hourWords = [
+    'sıfır',
+    'bir',
+    'iki',
+    'üç',
+    'dört',
+    'beş',
+    'altı',
+    'yedi',
+    'sekiz',
+    'dokuz',
+    'on',
+    'on bir',
+    'on iki',
+  ];
+
+  let hh12 = hh24 % 12;
+  if (hh12 === 0) hh12 = 12;
+
+  const base = hourWords[hh12] || String(hh12);
+  let prefix = 'saat';
+
+  if (hh24 >= 5 && hh24 < 12) prefix = 'sabah';
+  else if (hh24 >= 12 && hh24 < 18) prefix = 'öğleden sonra';
+  else if (hh24 >= 18 && hh24 < 22) prefix = 'akşam';
+  else prefix = 'gece';
+
+  if (mm === 0) return `${prefix} ${base}`;
+  if (mm === 15) return `${prefix} ${base} on beş`;
+  if (mm === 30) return `${prefix} ${base} buçuk`;
+  if (mm === 45) return `${prefix} ${base} kırk beş`;
+
+  return `${prefix} ${base} ${mm}`;
+}
+
+function formatDateTimeForSpeech(text: string, now = new Date()) {
+  let out = String(text || '');
+
+  out = out.replace(
+    /\b(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})\b/g,
+    (_match, datePart: string, timePart: string) =>
+      `${formatDateForSpeech(datePart, now)} ${formatTimeForSpeech(timePart)}`,
+  );
+
+  out = out.replace(/\b(\d{1,2}\.\d{1,2}\.\d{4})\b/g, (_match, datePart) =>
+    formatDateForSpeech(datePart, now),
+  );
+  out = out.replace(/\b(\d{1,2}:\d{2})\b/g, (_match, timePart) =>
+    formatTimeForSpeech(timePart),
+  );
+
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+function humanizeConfirmationForSpeech(text: string) {
+  return String(text || '')
+    .replace(
+      /Randevu bilgileri doğruysa onaylıyor musunuz\?/gi,
+      'Bilgiler doğruysa onaylayayım mı?',
+    )
+    .replace(
+      /Randevuyu onaylıyor musunuz\?\s*Evet veya hayır diyebilirsiniz\.?/gi,
+      'Bu şekilde oluşturalım mı?',
+    )
+    .replace(/Onaylıyor musunuz\?/gi, 'Uygunsa onaylayayım mı?')
+    .replace(/Doğru mu\?/gi, 'Bu şekilde oluşturalım mı?')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function humanizeBookingSummaryForSpeech(text: string) {
+  const source = String(text || '').trim();
+  const lower = source.toLocaleLowerCase('tr-TR');
+  const hasBookingSignal =
+    lower.includes('randevu özeti') ||
+    lower.includes('hizmet') ||
+    lower.includes('personel') ||
+    lower.includes('tarih') ||
+    lower.includes('saat') ||
+    lower.includes('isim');
+
+  if (!hasBookingSignal) {
+    return source;
+  }
+
+  const service = source.match(/hizmet\s*[:\-]\s*([^,.\n]+)/i)?.[1]?.trim();
+  const staff = source.match(/personel\s*[:\-]\s*([^,.\n]+)/i)?.[1]?.trim();
+  const customer = source.match(/isim\s*[:\-]\s*([^,.\n]+)/i)?.[1]?.trim();
+  const dateTime = source.match(/(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})/);
+
+  const summaryParts: string[] = [];
+  if (service) summaryParts.push(`${service} için`);
+  if (staff) summaryParts.push(`${staff}'la`);
+  if (dateTime) {
+    summaryParts.push(formatDateTimeForSpeech(`${dateTime[1]} ${dateTime[2]}`));
+  }
+  if (customer && !lower.includes('adınızı') && !lower.includes('isminizi')) {
+    summaryParts.push(`${customer} adına`);
+  }
+
+  if (!summaryParts.length) {
+    return source;
+  }
+
+  const summary = `${summaryParts.join(', ')} uygun görünüyor.`;
+  const questionMatch = source.match(/[^.?!]*\?/g);
+  const question = questionMatch?.length
+    ? humanizeConfirmationForSpeech(questionMatch[questionMatch.length - 1] || '')
+    : '';
+
+  return `${summary}${question ? ` ${question}` : ''}`.trim();
 }
 
 function naturalTimeSpeech(hhmm: string) {
