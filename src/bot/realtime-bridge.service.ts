@@ -867,14 +867,6 @@ class VoiceBridgeSession {
     source: 'streaming' | 'buffered' = 'buffered',
   ) {
     if (!chunk.length) return;
-
-    if (!this.ensureBridgeReady(`audio_chunk_${source}`)) {
-      this.parentLogger.warn(
-        `[voice] playback_skipped callId=${this.meta.callId} reason=bridge_not_ready source=${source} chunkSize=${chunk.length}`,
-      );
-      return;
-    }
-
     this.outboundAudioChunkCount += 1;
     this.outboundAudioByteCount += chunk.length;
 
@@ -892,7 +884,7 @@ class VoiceBridgeSession {
       }
     }
 
-    const sent = this.sendBridge({
+    this.sendBridge({
       event: 'media',
       media: { payload: chunk.toString('base64') },
     });
@@ -952,7 +944,7 @@ class VoiceBridgeSession {
       this.speechEnergyFrames += 1;
       if (this.debugVoice) {
         this.parentLogger.debug(
-          `[voice] speech_detected callId=${this.meta.callId} rms=${this.formatEnergy(rms)} threshold=${threshold} ambient=${this.formatEnergy(this.ambientNoiseRms)} frames=${this.speechEnergyFrames}`,
+          `[voice] speech_detected callId=${this.meta.callId} rms=${rms.toFixed(0)} threshold=${threshold} ambient=${this.ambientNoiseRms.toFixed(0)} frames=${this.speechEnergyFrames}`,
         );
       }
     } else {
@@ -1018,8 +1010,6 @@ class VoiceBridgeSession {
   }
 
   private maybeStartOpeningGreeting() {
-    this.ensureBridgeReady('opening_greeting_check');
-
     const canStart =
       !this.closed &&
       this.sessionReady &&
