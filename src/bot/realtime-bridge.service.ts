@@ -67,6 +67,8 @@ type VoiceTimingStage =
   | 'openai_connected'
   | 'session_created'
   | 'session_updated'
+  | 'tenant_context_prewarm_start'
+  | 'tenant_context_prewarm_done'
   | 'first_greeting_started'
   | 'speech_started'
   | 'speech_stopped'
@@ -113,6 +115,7 @@ export class RealtimeBridgeService {
       return;
     }
 
+    const startedAt = Date.now();
     this.logger.log('[voice] opening_greeting_prewarm_start');
     const promise = fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000`,
@@ -149,13 +152,13 @@ export class RealtimeBridgeService {
           audioBuffer,
         );
         this.logger.log(
-          `[voice] opening_greeting_prewarm_success bytes=${audioBuffer.length}`,
+          `[voice] opening_greeting_prewarm_success bytes=${audioBuffer.length} latencyMs=${Date.now() - startedAt}`,
         );
         return audioBuffer;
       })
       .catch((err: any) => {
         this.logger.warn(
-          `[voice] opening_greeting_prewarm_failed error=${err?.message || err}`,
+          `[voice] opening_greeting_prewarm_failed latencyMs=${Date.now() - startedAt} error=${err?.message || err}`,
         );
         return null;
       })
@@ -248,6 +251,7 @@ class VoiceBridgeSession {
   private recentIntentContext: RecentIntentContext | null = null;
   private bookingDraftSnapshot: BookingDraftSnapshot | null = null;
   private cachedServices: any[] | null = null;
+  private cachedStaff: any[] | null = null;
   private lastGreetingSuppressedAt = 0;
   private lastOpeningGreetingIgnoreLogAt = 0;
 
@@ -401,6 +405,7 @@ class VoiceBridgeSession {
       this.parentLogger.log(
         `[voice] bridge start callId=${this.meta.callId} tenantId=${this.meta.tenantId}`,
       );
+      void this.prewarmTenantVoiceContext();
       this.maybeStartOpeningGreeting();
       return;
     }
@@ -593,9 +598,8 @@ class VoiceBridgeSession {
     if (normalized.length <= 1) return true;
     if (this.ghostRegex.test(normalized)) return true;
 
-    const preservePartialBooking = this.isMeaningfulPartialBookingTranscript(
-      normalized,
-    );
+    const preservePartialBooking =
+      this.isMeaningfulPartialBookingTranscript(normalized);
     if (preservePartialBooking) {
       this.parentLogger.log(
         `[voice] partial_booking_transcript_preserved callId=${this.meta.callId} text="${normalized}"`,
@@ -607,7 +611,11 @@ class VoiceBridgeSession {
     const msSinceBargeIn = now - this.lastBargeInAt;
     const msSinceSpeechStopped = now - this.lastSpeechStoppedAt;
 
-    if (!preservePartialBooking && msSinceBargeIn < 180 && normalized.length < 18)
+    if (
+      !preservePartialBooking &&
+      msSinceBargeIn < 180 &&
+      normalized.length < 18
+    )
       return true;
     if (
       !preservePartialBooking &&
@@ -617,7 +625,11 @@ class VoiceBridgeSession {
     )
       return true;
 
-    if (!preservePartialBooking && msSinceAssistantAudio < 280 && normalized.length < 16) {
+    if (
+      !preservePartialBooking &&
+      msSinceAssistantAudio < 280 &&
+      normalized.length < 16
+    ) {
       return true;
     }
 
@@ -629,7 +641,10 @@ class VoiceBridgeSession {
     }
 
     const assistantEchoSimilarity = Math.max(
-      similarityScore(normalizedTranscript, normalizeVoiceComparisonText(this.lastBotReplyText)),
+      similarityScore(
+        normalizedTranscript,
+        normalizeVoiceComparisonText(this.lastBotReplyText),
+      ),
       similarityScore(
         normalizedTranscript,
         normalizeVoiceComparisonText(RealtimeBridgeService.openingGreeting),
@@ -671,9 +686,7 @@ class VoiceBridgeSession {
       this.lastBotReplyText === RealtimeBridgeService.openingGreeting &&
       now < this.openingGreetingProtectionUntil
     ) {
-      this.logOpeningGreetingIgnore(
-        this.openingGreetingProtectionUntil - now,
-      );
+      this.logOpeningGreetingIgnore(this.openingGreetingProtectionUntil - now);
       this.speechEnergyFrames = 0;
       return;
     }
@@ -712,7 +725,12 @@ class VoiceBridgeSession {
   }
 
   private maybeStartOpeningGreeting() {
-    if (!this.sessionReady || this.hasIntroducedSelf || this.greetingInFlight) {
+    if (
+      !this.sessionReady ||
+      !this.bridgeReady ||
+      this.hasIntroducedSelf ||
+      this.greetingInFlight
+    ) {
       return;
     }
 
@@ -731,6 +749,28 @@ class VoiceBridgeSession {
     void this.speakReply(openingGreeting).finally(() => {
       this.greetingInFlight = false;
     });
+  }
+
+  private async prewarmTenantVoiceContext() {
+    this.markTiming('tenant_context_prewarm_start');
+    const startedAt = Date.now();
+    try {
+      const svc: any = this.agentService as any;
+      if (typeof svc.prewarmVoiceContext === 'function') {
+        await svc.prewarmVoiceContext(this.meta.tenantId);
+      }
+      await Promise.all([
+        this.getServicesForVoiceContext(),
+        this.getStaffForVoiceContext(),
+      ]);
+      this.markTiming('tenant_context_prewarm_done', {
+        latencyMs: Date.now() - startedAt,
+      });
+    } catch (err: any) {
+      this.parentLogger.warn(
+        `[voice] tenant_context_prewarm_failed callId=${this.meta.callId} latencyMs=${Date.now() - startedAt} error=${err?.message || err}`,
+      );
+    }
   }
 
   private markTiming(
@@ -799,21 +839,40 @@ class VoiceBridgeSession {
     return patterns.some((pattern) => pattern.test(t));
   }
 
-  private async buildAgentInputWithVoiceContext(userText: string, turnId: number) {
+  private async buildAgentInputWithVoiceContext(
+    userText: string,
+    turnId: number,
+  ) {
     const explicitService = await this.detectServiceMention(userText);
     const explicitStaff = await this.detectStaffMention(userText);
     const hasBookingIntent = this.hasBookingIntentCue(userText);
     const hints: string[] = [];
 
-    if (hasBookingIntent && !explicitService && this.isRecentServiceContextStrong(turnId) && this.recentServiceContext) {
-      hints.push(`Az önce konuşulan hizmet: ${this.recentServiceContext.name}. Kullanıcı yeni hizmet belirtmediyse booking akışını bu hizmetle sürdür.`);
+    if (
+      hasBookingIntent &&
+      !explicitService &&
+      this.isRecentServiceContextStrong(turnId) &&
+      this.recentServiceContext
+    ) {
+      hints.push(
+        `Az önce konuşulan hizmet: ${this.recentServiceContext.name}. Kullanıcı yeni hizmet belirtmediyse booking akışını bu hizmetle sürdür.`,
+      );
       this.parentLogger.log(
         `[voice] recent_service_context_reused callId=${this.meta.callId} turnId=${turnId} service=${JSON.stringify(this.recentServiceContext.name)}`,
       );
     }
 
-    if (!explicitStaff && this.recentStaffContext && this.isRecentEntityContextStrong(this.recentStaffContext, turnId) && /(o olsun|onunla|kendisiyle|ayni kisi|aynı kişi|ayni personel|aynı personel)/i.test(userText)) {
-      hints.push(`Az önce konuşulan personel: ${this.recentStaffContext.name}. Kullanıcı başka bir personel söylemediyse staff tercihi olarak bunu kullan.`);
+    if (
+      !explicitStaff &&
+      this.recentStaffContext &&
+      this.isRecentEntityContextStrong(this.recentStaffContext, turnId) &&
+      /(o olsun|onunla|kendisiyle|ayni kisi|aynı kişi|ayni personel|aynı personel)/i.test(
+        userText,
+      )
+    ) {
+      hints.push(
+        `Az önce konuşulan personel: ${this.recentStaffContext.name}. Kullanıcı başka bir personel söylemediyse staff tercihi olarak bunu kullan.`,
+      );
     }
 
     if (this.bookingDraftSnapshot && hasBookingIntent) {
@@ -825,7 +884,9 @@ class VoiceBridgeSession {
         snap.state ? `state=${snap.state}` : '',
       ].filter(Boolean);
       if (parts.length) {
-        hints.push(`Mevcut booking taslağı: ${parts.join(', ')}. Alakasız kısa input gelirse akışı bozma, taslağı koru.`);
+        hints.push(
+          `Mevcut booking taslağı: ${parts.join(', ')}. Alakasız kısa input gelirse akışı bozma, taslağı koru.`,
+        );
       }
     }
 
@@ -845,7 +906,10 @@ class VoiceBridgeSession {
       : false;
   }
 
-  private isRecentEntityContextStrong(context: RecentEntityContext, turnId: number) {
+  private isRecentEntityContextStrong(
+    context: RecentEntityContext,
+    turnId: number,
+  ) {
     const withinTurns = turnId - context.turnId <= 6;
     const withinMs = Date.now() - context.timestamp <= 240000;
     return withinTurns && withinMs;
@@ -860,7 +924,9 @@ class VoiceBridgeSession {
 
   private hasBookingIntentCue(text: string) {
     const t = normalizeTurkishForTime(text);
-    return /(randevu|rezervasyon|gelebilir miyim|uygun musunuz|uygun mu|buna randevu|bunu yaptiralim|bunu yaptiralim|olur mu)/.test(t);
+    return /(randevu|rezervasyon|gelebilir miyim|uygun musunuz|uygun mu|buna randevu|bunu yaptiralim|bunu yaptiralim|olur mu)/.test(
+      t,
+    );
   }
 
   private async detectServiceMention(text: string) {
@@ -884,22 +950,39 @@ class VoiceBridgeSession {
   }
 
   private async detectStaffMention(text: string) {
+    const cachedStaff = await this.getStaffForVoiceContext();
+    const t = normalizeTurkishForTime(text);
+    const exactCached = cachedStaff.find((item: any) => {
+      const name = normalizeTurkishForTime(
+        String(item?.name || item?.fullName || ''),
+      );
+      return name && (t === name || t.includes(name) || name.includes(t));
+    });
+    if (exactCached) return exactCached;
+
     const bookingCore = (this.agentService as any)?.bookingCore as any;
     const listStaff = bookingCore?.safeListStaff;
     if (typeof listStaff !== 'function') return null;
     try {
-      const staff = await listStaff.call(bookingCore, this.meta.tenantId);
-      const t = normalizeTurkishForTime(text);
+      const staff = cachedStaff.length
+        ? cachedStaff
+        : await listStaff.call(bookingCore, this.meta.tenantId);
       const exact = staff.find((item: any) => {
-        const name = normalizeTurkishForTime(String(item?.name || ''));
+        const name = normalizeTurkishForTime(
+          String(item?.name || item?.fullName || ''),
+        );
         return name && (t === name || t.includes(name) || name.includes(t));
       });
       if (exact) return exact;
       const words = t.split(/\s+/).filter((word) => word.length >= 3);
-      return staff.find((item: any) => {
-        const name = normalizeTurkishForTime(String(item?.name || ''));
-        return words.some((word) => name.includes(word));
-      }) || null;
+      return (
+        staff.find((item: any) => {
+          const name = normalizeTurkishForTime(
+            String(item?.name || item?.fullName || ''),
+          );
+          return words.some((word) => name.includes(word));
+        }) || null
+      );
     } catch {
       return null;
     }
@@ -914,12 +997,25 @@ class VoiceBridgeSession {
     if (!session?.draft) return;
 
     this.bookingDraftSnapshot = {
-      serviceId: session.draft.serviceId ? String(session.draft.serviceId) : undefined,
-      serviceName: session.lastBookingContext?.serviceName || this.recentServiceContext?.name,
-      staffId: session.draft.staffId ? String(session.draft.staffId) : undefined,
-      staffName: session.lastBookingContext?.staffName || this.recentStaffContext?.name || session.draft.requestedStaffName,
-      customerName: session.draft.customerName ? String(session.draft.customerName) : undefined,
-      startAt: session.draft.startAt ? String(session.draft.startAt) : undefined,
+      serviceId: session.draft.serviceId
+        ? String(session.draft.serviceId)
+        : undefined,
+      serviceName:
+        session.lastBookingContext?.serviceName ||
+        this.recentServiceContext?.name,
+      staffId: session.draft.staffId
+        ? String(session.draft.staffId)
+        : undefined,
+      staffName:
+        session.lastBookingContext?.staffName ||
+        this.recentStaffContext?.name ||
+        session.draft.requestedStaffName,
+      customerName: session.draft.customerName
+        ? String(session.draft.customerName)
+        : undefined,
+      startAt: session.draft.startAt
+        ? String(session.draft.startAt)
+        : undefined,
       state: session.state ? String(session.state) : undefined,
       updatedAt: Date.now(),
     };
@@ -937,6 +1033,20 @@ class VoiceBridgeSession {
       this.cachedServices = [];
     }
     return this.cachedServices;
+  }
+
+  private async getStaffForVoiceContext() {
+    if (this.cachedStaff) return this.cachedStaff;
+    const bookingCore = (this.agentService as any)?.bookingCore as any;
+    const listStaff = bookingCore?.safeListStaff;
+    if (typeof listStaff !== 'function') return [];
+    try {
+      const staff = await listStaff.call(bookingCore, this.meta.tenantId);
+      this.cachedStaff = Array.isArray(staff) ? staff : [];
+    } catch {
+      this.cachedStaff = [];
+    }
+    return this.cachedStaff;
   }
 
   private captureRecentContextsFromText(
@@ -982,7 +1092,12 @@ class VoiceBridgeSession {
   ) {
     const intent = detectRecentIntent(text);
     if (!intent) return;
-    this.recentIntentContext = { intent, source, turnId, timestamp: Date.now() };
+    this.recentIntentContext = {
+      intent,
+      source,
+      turnId,
+      timestamp: Date.now(),
+    };
   }
 
   private cancelAssistantAudio(
@@ -1172,20 +1287,22 @@ class VoiceBridgeSession {
 
     try {
       const token = ++this.playbackToken;
-      const audioBuffer = await this.getOrCreateTtsAudio(clean);
+      const cachedAudio = this.getCachedTtsAudio(clean);
 
-      if (!this.isTurnStillActive(effectiveTurnId)) {
-        this.parentLogger.warn(
-          `[voice] stale_turn_discarded callId=${this.meta.callId} replyTurnId=${effectiveTurnId} activeTurnId=${this.activeTurnId} stage=tts_ready`,
+      if (cachedAudio) {
+        this.parentLogger.log(
+          `[voice] ElevenLabs cache_playback callId=${this.meta.callId} bytes=${cachedAudio.length}`,
         );
+        this.streamUlawBuffer(cachedAudio, token, effectiveTurnId);
         return;
       }
 
-      if (audioBuffer && token === this.playbackToken) {
-        this.parentLogger.log(
-          `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${audioBuffer.length}`,
-        );
-        this.streamUlawBuffer(audioBuffer, token, effectiveTurnId);
+      const streamResult = await this.streamGeneratedTtsAudio(
+        clean,
+        token,
+        effectiveTurnId,
+      );
+      if (streamResult?.streamed) {
         return;
       }
     } catch (err) {
@@ -1201,7 +1318,67 @@ class VoiceBridgeSession {
     );
   }
 
-  private async generateElevenLabsAudio(text: string): Promise<Buffer | null> {
+  private getCachedTtsAudio(text: string): Buffer | null {
+    const normalizedText = normalizeTtsCacheKey(text);
+    const isOpeningGreeting =
+      text === RealtimeBridgeService.openingGreeting ||
+      normalizedText ===
+        normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting);
+
+    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingAudio) {
+      this.parentLogger.log(
+        `[voice] opening_greeting_cache_hit callId=${this.meta.callId} bytes=${RealtimeBridgeService.openingGreetingAudio.length}`,
+      );
+      this.markTiming('tts_cache_hit', {
+        cache: 'opening_greeting',
+        textLength: text.length,
+      });
+      return RealtimeBridgeService.openingGreetingAudio;
+    }
+
+    const cached =
+      RealtimeBridgeService.shortReplyAudioCache.get(normalizedText);
+    if (cached) {
+      this.parentLogger.log(
+        `[voice] tts_cache_hit callId=${this.meta.callId} key=${JSON.stringify(normalizedText)} bytes=${cached.length}`,
+      );
+      this.markTiming('tts_cache_hit', {
+        cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
+        textLength: text.length,
+      });
+      return cached;
+    }
+
+    this.parentLogger.log(
+      `[voice] tts_cache_miss callId=${this.meta.callId} key=${JSON.stringify(normalizedText)}`,
+    );
+    this.markTiming('tts_cache_miss', {
+      cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
+      textLength: text.length,
+    });
+    return null;
+  }
+
+  private async streamGeneratedTtsAudio(
+    text: string,
+    token: number,
+    turnId: number,
+  ): Promise<{ streamed: boolean; bytes: number }> {
+    const normalizedText = normalizeTtsCacheKey(text);
+    const isOpeningGreeting =
+      text === RealtimeBridgeService.openingGreeting ||
+      normalizedText ===
+        normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting);
+
+    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingPromise) {
+      const audioBuffer = await RealtimeBridgeService.openingGreetingPromise;
+      if (audioBuffer && token === this.playbackToken) {
+        this.streamUlawBuffer(audioBuffer, token, turnId);
+        return { streamed: true, bytes: audioBuffer.length };
+      }
+      return { streamed: false, bytes: 0 };
+    }
+
     this.markTiming('elevenlabs_request_start', {
       textLength: text.length,
     });
@@ -1210,18 +1387,18 @@ class VoiceBridgeSession {
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
     if (!apiKey || !voiceId) {
       this.parentLogger.error('[voice] ElevenLabs API key or voice ID missing');
-      return null;
+      return { streamed: false, bytes: 0 };
     }
 
     const controller = new AbortController();
     this.currentTtsAbort = controller;
+    const startedAt = Date.now();
 
-    try {
+    const synthesizePromise = (async () => {
       const modelId =
         process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
-
       const response = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000`,
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000&optimize_streaming_latency=3`,
         {
           method: 'POST',
           headers: {
@@ -1245,34 +1422,136 @@ class VoiceBridgeSession {
       this.markTiming('elevenlabs_first_byte', {
         status: response.status,
         ok: response.ok,
+        latencyMs: Date.now() - startedAt,
       });
 
       if (!response.ok) {
         const bodyText = await response.text();
-        this.parentLogger.error(
-          `[voice] ElevenLabs TTS error: ${response.status} ${bodyText}`,
-        );
-        return null;
+        throw new Error(`ElevenLabs TTS error: ${response.status} ${bodyText}`);
       }
 
-      const arrayBuffer = await response.arrayBuffer();
-      const audioBuffer = Buffer.from(arrayBuffer);
-      this.markTiming('elevenlabs_success', { bytes: audioBuffer.length });
-      return audioBuffer;
+      if (!response.body) {
+        const arrayBuffer = await response.arrayBuffer();
+        return Buffer.from(arrayBuffer);
+      }
+
+      const reader = response.body.getReader();
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      let pending = Buffer.alloc(0);
+      let sentAnyAudio = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value?.length) continue;
+        const chunk = Buffer.from(value);
+        chunks.push(chunk);
+        bytes += chunk.length;
+        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+
+        while (pending.length >= this.ulawFrameBytes) {
+          if (
+            this.closed ||
+            token !== this.playbackToken ||
+            !this.isTurnStillActive(turnId) ||
+            !this.assistantSpeaking
+          ) {
+            return Buffer.concat(chunks);
+          }
+
+          const frame = pending.subarray(0, this.ulawFrameBytes);
+          pending = pending.subarray(this.ulawFrameBytes);
+          this.sendAudioFrame(frame, bytes, sentAnyAudio);
+          sentAnyAudio = true;
+        }
+      }
+
+      if (pending.length) {
+        const padded = Buffer.alloc(this.ulawFrameBytes, 0xff);
+        pending.copy(padded);
+        this.sendAudioFrame(padded, bytes, sentAnyAudio);
+      }
+
+      this.markTiming('elevenlabs_success', {
+        bytes,
+        streamed: true,
+      });
+
+      return Buffer.concat(chunks);
+    })();
+
+    if (isOpeningGreeting) {
+      RealtimeBridgeService.openingGreetingPromise = synthesizePromise
+        .then((audioBuffer) => {
+          RealtimeBridgeService.openingGreetingAudio = audioBuffer;
+          RealtimeBridgeService.shortReplyAudioCache.set(
+            normalizedText,
+            audioBuffer,
+          );
+          return audioBuffer;
+        })
+        .finally(() => {
+          RealtimeBridgeService.openingGreetingPromise = null;
+        });
+    }
+
+    try {
+      const audioBuffer = await synthesizePromise;
+      if (audioBuffer?.length) {
+        RealtimeBridgeService.shortReplyAudioCache.set(
+          normalizedText,
+          audioBuffer,
+        );
+        if (isOpeningGreeting) {
+          RealtimeBridgeService.openingGreetingAudio = audioBuffer;
+        }
+        this.parentLogger.log(
+          `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${audioBuffer.length} streamed=true`,
+        );
+        this.assistantSpeaking = false;
+        this.currentPlaybackDurationMs = 0;
+        this.currentPlaybackOffsetBytes = 0;
+        return { streamed: true, bytes: audioBuffer.length };
+      }
+      return { streamed: false, bytes: 0 };
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         this.parentLogger.warn(
           `[voice] ElevenLabs synthesis aborted callId=${this.meta.callId} reason=barge_in_or_cancel`,
         );
-        return null;
+        return { streamed: false, bytes: 0 };
       }
-      this.parentLogger.error(`[voice] ElevenLabs TTS error: ${err}`);
-      return null;
+      this.parentLogger.error(
+        `[voice] ElevenLabs TTS error callId=${this.meta.callId}: ${err?.message || err}`,
+      );
+      return { streamed: false, bytes: 0 };
     } finally {
       if (this.currentTtsAbort === controller) {
         this.currentTtsAbort = null;
       }
     }
+  }
+
+  private sendAudioFrame(
+    frame: Buffer,
+    totalBytes: number,
+    alreadySentAudio: boolean,
+  ) {
+    this.lastAssistantAudioAt = Date.now();
+    this.currentPlaybackOffsetBytes += frame.length;
+    if (!alreadySentAudio) {
+      if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
+        this.openingGreetingProtectionUntil =
+          this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
+      }
+      this.markTiming('final_audio_send_start', { bytes: totalBytes });
+    }
+
+    this.sendBridge({
+      event: 'media',
+      media: { payload: frame.toString('base64') },
+    });
   }
 
   private buildDeterministicShortReply(
@@ -1312,7 +1591,8 @@ class VoiceBridgeSession {
       },
       {
         key: 'services',
-        reply: 'Lazer epilasyon, cilt bakımı, protez tırnak, saç, kaş ve kirpik işlemlerimiz var. Hangisiyle ilgileniyorsunuz?',
+        reply:
+          'Lazer epilasyon, cilt bakımı, protez tırnak, saç, kaş ve kirpik işlemlerimiz var. Hangisiyle ilgileniyorsunuz?',
         patterns: [
           /^hangi hizmetler var[.!? ]*$/,
           /^hangi hizmetleriniz var[.!? ]*$/,
@@ -1329,75 +1609,6 @@ class VoiceBridgeSession {
     }
 
     return null;
-  }
-
-  private async getOrCreateTtsAudio(text: string): Promise<Buffer | null> {
-    const normalizedText = normalizeTtsCacheKey(text);
-    const isOpeningGreeting =
-      text === RealtimeBridgeService.openingGreeting ||
-      normalizedText === normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting);
-
-    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingAudio) {
-      this.parentLogger.log(
-        `[voice] opening_greeting_cache_hit callId=${this.meta.callId} bytes=${RealtimeBridgeService.openingGreetingAudio.length}` ,
-      );
-      this.markTiming('tts_cache_hit', {
-        cache: 'opening_greeting',
-        textLength: text.length,
-      });
-      return RealtimeBridgeService.openingGreetingAudio;
-    }
-
-    const cached = RealtimeBridgeService.shortReplyAudioCache.get(normalizedText);
-    if (cached) {
-      this.parentLogger.log(
-        `[voice] tts_cache_hit callId=${this.meta.callId} key=${JSON.stringify(normalizedText)} bytes=${cached.length}` ,
-      );
-      this.markTiming('tts_cache_hit', {
-        cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
-        textLength: text.length,
-      });
-      return cached;
-    }
-
-    if (isOpeningGreeting) {
-      this.parentLogger.log(
-        `[voice] opening_greeting_cache_miss callId=${this.meta.callId}` ,
-      );
-    } else {
-      this.parentLogger.log(
-        `[voice] tts_cache_miss callId=${this.meta.callId} key=${JSON.stringify(normalizedText)}` ,
-      );
-    }
-
-    this.markTiming('tts_cache_miss', {
-      cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
-      textLength: text.length,
-    });
-
-    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingPromise) {
-      return RealtimeBridgeService.openingGreetingPromise;
-    }
-
-    const synthesisPromise = this.generateElevenLabsAudio(text).then((audioBuffer) => {
-      if (audioBuffer) {
-        RealtimeBridgeService.shortReplyAudioCache.set(normalizedText, audioBuffer);
-        if (isOpeningGreeting) {
-          RealtimeBridgeService.openingGreetingAudio = audioBuffer;
-        }
-      }
-      return audioBuffer;
-    }).finally(() => {
-      if (isOpeningGreeting) {
-        RealtimeBridgeService.openingGreetingPromise = null;
-      }
-    });
-
-    if (isOpeningGreeting) {
-      RealtimeBridgeService.openingGreetingPromise = synthesisPromise;
-    }
-
-    return synthesisPromise;
   }
 
   private streamUlawBuffer(buf: Buffer, token: number, turnId: number) {
@@ -1431,7 +1642,10 @@ class VoiceBridgeSession {
       }
 
       this.lastAssistantAudioAt = Date.now();
-      if (offset === 0 && this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
+      if (
+        offset === 0 &&
+        this.lastBotReplyText === RealtimeBridgeService.openingGreeting
+      ) {
         this.openingGreetingProtectionUntil =
           this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
       }
@@ -1716,10 +1930,7 @@ function stripRepeatedGreetingLead(text: string) {
   }
 
   return source
-    .replace(
-      /^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin)[,!\s:-]+/i,
-      '',
-    )
+    .replace(/^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin)[,!\s:-]+/i, '')
     .replace(/^size nasil yardimci olabilirim\??/i, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
@@ -1769,13 +1980,19 @@ function detectRecentIntent(
 ): RecentIntentContext['intent'] | null {
   const normalized = normalizeTurkishForTime(text);
   if (!normalized) return null;
-  if (/(randevu|rezervasyon|uygun saat|müsait|musait|yarin|yarın|bugun|bugün)/.test(normalized)) {
+  if (
+    /(randevu|rezervasyon|uygun saat|müsait|musait|yarin|yarın|bugun|bugün)/.test(
+      normalized,
+    )
+  ) {
     return 'booking';
   }
   if (/(personel|kimle|hangi uzman|hangi personel)/.test(normalized)) {
     return 'staff_preference';
   }
-  if (/(fiyat|ucret|ücret|bilgi|adres|saat kac|kaçta acik|açik)/.test(normalized)) {
+  if (
+    /(fiyat|ucret|ücret|bilgi|adres|saat kac|kaçta acik|açik)/.test(normalized)
+  ) {
     return 'info';
   }
   return 'general';
@@ -1866,8 +2083,8 @@ function shortenReplyForPhone(text: string) {
     out = sentenceParts.slice(0, 2).join(' ');
   }
 
-  if (out.length > 220) {
-    const shortened = out.slice(0, 220);
+  if (out.length > 160) {
+    const shortened = out.slice(0, 160);
     const cutAt = Math.max(
       shortened.lastIndexOf('. '),
       shortened.lastIndexOf('? '),
@@ -1928,7 +2145,9 @@ function formatDateForSpeech(dateText: string, now = new Date()) {
   if (diffDays === 1) return 'yarın';
   if (diffDays === -1) return 'dün';
   if (diffDays > 1 && diffDays <= 6) {
-    return weekdays[target.getUTCDay()] || `${day} ${months[month - 1]} ${year}`;
+    return (
+      weekdays[target.getUTCDay()] || `${day} ${months[month - 1]} ${year}`
+    );
   }
 
   return `${day} ${months[month - 1]} ${year}`;
@@ -1971,8 +2190,7 @@ function formatTimeForSpeech(timeText: string) {
   else if (hh24 >= 18 && hh24 < 22) prefix = 'akşam';
   else prefix = 'gece';
 
-  const spokenPrefix =
-    prefix === 'öğleden sonra' ? 'saat' : prefix;
+  const spokenPrefix = prefix === 'öğleden sonra' ? 'saat' : prefix;
 
   if (mm === 0) return `${spokenPrefix} ${base}`;
   if (mm === 15) return `${spokenPrefix} ${base} on beş`;
@@ -2056,7 +2274,9 @@ function humanizeBookingSummaryForSpeech(text: string) {
     : `${summaryParts.join(', ')} uygun görünüyor.`;
   const questionMatch = source.match(/[^.?!]*\?/g);
   const question = questionMatch?.length
-    ? humanizeConfirmationForSpeech(questionMatch[questionMatch.length - 1] || '')
+    ? humanizeConfirmationForSpeech(
+        questionMatch[questionMatch.length - 1] || '',
+      )
     : '';
 
   return `${summary}${!summary.endsWith('?') && question ? ` ${question}` : ''}`.trim();

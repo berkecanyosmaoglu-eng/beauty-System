@@ -8,6 +8,10 @@ import { shapeVoiceAgentReply } from './shared/voice-response-policy';
 export class VoiceAgentService {
   constructor(private readonly bookingCore: BookingCoreService) {}
 
+  async prewarmVoiceContext(tenantId: string): Promise<void> {
+    await this.bookingCore.prewarmVoiceContext(tenantId);
+  }
+
   async replyText(payload: AgentReplyRequest): Promise<string> {
     const reply = await this.bookingCore.replyText(
       withAgentChannel(payload, 'voice'),

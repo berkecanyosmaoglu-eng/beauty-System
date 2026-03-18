@@ -14,6 +14,7 @@ const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours session expiry
 const SUGGESTION_TTL_MS = 20 * 60 * 1000; // suggestions live for 20 minutes
 const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000; // 10 minute idempotency window
 const MAX_LLM_OUTPUT_LENGTH = 600; // maximum characters allowed from LLM
+const VOICE_TENANT_CACHE_TTL_MS = 2 * 60 * 1000; // keep tenant voice lookups hot for active calls
 
 type BookingDraft = {
   tenantId: string;
@@ -206,6 +207,10 @@ export class BookingCoreService {
   private readonly openai = process.env.OPENAI_API_KEY
     ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
     : null;
+  private readonly tenantVoiceCache = new Map<
+    string,
+    { business: any | null; services: any[]; staff: any[]; cachedAt: number }
+  >();
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -346,6 +351,42 @@ export class BookingCoreService {
       ],
       seed || startAtIso + apptId,
     );
+  }
+
+  async prewarmVoiceContext(tenantId: string) {
+    await this.getTenantVoiceResources(tenantId, true);
+  }
+
+  private async getTenantVoiceResources(
+    tenantId: string,
+    forceRefresh = false,
+  ) {
+    const cached = this.tenantVoiceCache.get(tenantId);
+    if (
+      !forceRefresh &&
+      cached &&
+      Date.now() - cached.cachedAt < VOICE_TENANT_CACHE_TTL_MS
+    ) {
+      return cached;
+    }
+
+    const [business, services, staff] = await Promise.all([
+      (this.prisma as any).businessProfile
+        ?.findUnique({ where: { tenantId } })
+        .catch(() => null),
+      this.safeListServices(tenantId),
+      this.safeListStaff(tenantId),
+    ]);
+
+    const resources = {
+      business: business || null,
+      services: Array.isArray(services) ? services : [],
+      staff: Array.isArray(staff) ? staff : [],
+      cachedAt: Date.now(),
+    };
+
+    this.tenantVoiceCache.set(tenantId, resources);
+    return resources;
   }
 
   // =========================
@@ -611,11 +652,8 @@ export class BookingCoreService {
         return this.safeReply(session, reply);
       }
 
-      const business = await (this.prisma as any).businessProfile
-        ?.findUnique({ where: { tenantId } })
-        .catch(() => null);
-      const services = await this.safeListServices(tenantId);
-      const staff = await this.safeListStaff(tenantId);
+      const { business, services, staff } =
+        await this.getTenantVoiceResources(tenantId);
       const recentServiceMention = this.detectServiceFromMessage(raw, services);
       if (recentServiceMention?.id) {
         session.lastServiceId = String(recentServiceMention.id);
@@ -653,7 +691,8 @@ export class BookingCoreService {
         isVoice && this.hasStrongVoiceBookingIntent(raw, services);
       const globalIntent = voiceBookingIntentOverride
         ? 'NEW_BOOKING'
-        : contextualBookingFollowUp || preIntentContinuity.inferredBookingContinuation
+        : contextualBookingFollowUp ||
+            preIntentContinuity.inferredBookingContinuation
           ? 'NEW_BOOKING'
           : this.detectGlobalIntent(raw);
       const shouldExtractSlots =
@@ -1890,7 +1929,10 @@ export class BookingCoreService {
           raw,
           staffId: String(session.draft.staffId),
           staffName: String(
-            pickedStaff?.name || pickedStaff?.fullName || session.recentStaffName || '',
+            pickedStaff?.name ||
+              pickedStaff?.fullName ||
+              session.recentStaffName ||
+              '',
           ),
           state: session.state,
         });
@@ -1916,17 +1958,6 @@ export class BookingCoreService {
               seed: from + (session.draft.startAt || ''),
             })
           : `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
-<<<<<<< HEAD
-      }
-
-      if (session.state === WaState.WAIT_NAME && !session.draft.customerName) {
-        return await this.naturalAsk(session, 'name', {
-          services,
-          staff,
-          business: null,
-        });
-=======
->>>>>>> origin/main
       }
     }
 
@@ -2610,7 +2641,8 @@ ${staffNamesShort || 'YOK'}
       session.lastServiceName ||
       'randevu';
     const staffName =
-      staff.find((item: any) => String(item?.id) === String(draft.staffId))?.name ||
+      staff.find((item: any) => String(item?.id) === String(draft.staffId))
+        ?.name ||
       draft.requestedStaffName ||
       session.bookingDraftSnapshot?.staffName;
     const whenText = draft.startAt ? prettyIstanbul(draft.startAt) : null;
@@ -3766,7 +3798,7 @@ ${historyText}
       const fromSnapshot = session.bookingDraftSnapshot?.serviceId
         ? String(session.bookingDraftSnapshot.serviceId)
         : '';
-      const sourceId = fromSnapshot || (session.lastServiceId || '');
+      const sourceId = fromSnapshot || session.lastServiceId || '';
       if (sourceId) {
         const hit = services.find((item: any) => String(item?.id) === sourceId);
         if (hit?.id) {
@@ -3800,7 +3832,8 @@ ${historyText}
           resolution.usedDraftSnapshot =
             resolution.usedDraftSnapshot ||
             Boolean(session.bookingDraftSnapshot?.staffId);
-          if (phase === 'pre_intent') resolution.inferredBookingContinuation = true;
+          if (phase === 'pre_intent')
+            resolution.inferredBookingContinuation = true;
         }
       }
     }
@@ -4009,9 +4042,9 @@ ${historyText}
     if (!this.isShortContextualBookingReply(raw)) return false;
     return Boolean(
       session.lastServiceId ||
-        session.bookingDraftSnapshot?.serviceId ||
-        session.recentIntentContext === 'booking' ||
-        session.recentIntentContext === 'info',
+      session.bookingDraftSnapshot?.serviceId ||
+      session.recentIntentContext === 'booking' ||
+      session.recentIntentContext === 'info',
     );
   }
 
@@ -4275,7 +4308,6 @@ ${historyText}
     const { session, raw, staff, isVoice, source } = opts;
     if (session.draft.customerName) return session.draft.customerName;
 
-<<<<<<< HEAD
     const staffHit = this.detectStaffFromMessage(raw, staff);
     if (staffHit?.id && this.isStaffSelectionUtterance(raw)) {
       this.logAction('name_capture_skipped_due_to_staff_match', {
@@ -4290,8 +4322,6 @@ ${historyText}
       return null;
     }
 
-=======
->>>>>>> origin/main
     const candidate = isVoice
       ? extractVoiceCustomerName(raw)
       : extractName(raw);
@@ -4362,7 +4392,6 @@ ${historyText}
     return candidate;
   }
 
-<<<<<<< HEAD
   private isStaffSelectionUtterance(raw: string) {
     const cleaned = stripVoiceContextMetadata(raw);
     const t = normalizeTr(cleaned);
@@ -4383,8 +4412,6 @@ ${historyText}
     return tokens.length >= 1 && tokens.length <= 2;
   }
 
-=======
->>>>>>> origin/main
   private shouldCaptureRequestedStaffName(
     raw: string,
     maybeSpoken: string,
@@ -4476,9 +4503,9 @@ ${historyText}
 
     return Boolean(
       session.lastServiceId ||
-        session.bookingDraftSnapshot?.serviceId ||
-        session.recentIntentContext === 'booking' ||
-        session.recentIntentContext === 'info',
+      session.bookingDraftSnapshot?.serviceId ||
+      session.recentIntentContext === 'booking' ||
+      session.recentIntentContext === 'info',
     );
   }
 
