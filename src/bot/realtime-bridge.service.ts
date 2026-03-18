@@ -228,9 +228,9 @@ class VoiceBridgeSession {
   private lastObservedSpeechEnergy = 0;
   private ambientNoiseRms = 0;
   private readonly minSpeechEnergyThreshold = 220;
-  private readonly maxSpeechEnergyThreshold = 520;
-  private readonly speechEnergyThreshold = 300;
-  private readonly speechFramesForBargeIn = 4;
+  private readonly maxSpeechEnergyThreshold = 1200;
+  private readonly speechEnergyThreshold = 600;
+  private readonly speechFramesForBargeIn = 8;
   private readonly assistantGuardMs = 650;
   private readonly openingGreetingBargeInGuardMs = 900;
 
@@ -828,15 +828,13 @@ class VoiceBridgeSession {
   }
 
   private getAdaptiveSpeechThreshold() {
-    const ambientFloor = this.ambientNoiseRms
-      ? Math.round(this.ambientNoiseRms * 1.85 + 110)
+    const adaptive = this.ambientNoiseRms
+      ? Math.round(this.ambientNoiseRms * 3)
       : this.speechEnergyThreshold;
+    const threshold = Math.max(adaptive, 600);
     return Math.max(
       this.minSpeechEnergyThreshold,
-      Math.min(
-        this.maxSpeechEnergyThreshold,
-        Math.max(this.speechEnergyThreshold, ambientFloor),
-      ),
+      Math.min(this.maxSpeechEnergyThreshold, threshold),
     );
   }
 
@@ -931,82 +929,27 @@ class VoiceBridgeSession {
 
   private handlePossibleBargeIn(payloadB64: string) {
     const rms = pcmuBase64Rms(payloadB64);
-    const threshold = this.getAdaptiveSpeechThreshold();
     this.lastObservedSpeechEnergy = rms;
     this.updateAmbientNoise(rms);
 
-    if (!this.assistantSpeaking) {
-      this.openingGreetingProtectionUntil = 0;
-      this.assistantPlaybackProtectionUntil = 0;
+    if (this.assistantSpeaking || this.activeResponse) {
+      this.parentLogger.debug(
+        `[voice] barge_in_blocked_assistant_speaking callId=${this.meta.callId}`,
+      );
       this.speechEnergyFrames = 0;
       return;
     }
+
+    this.openingGreetingProtectionUntil = 0;
+    this.assistantPlaybackProtectionUntil = 0;
+    this.speechEnergyFrames = 0;
 
     const now = Date.now();
-    if (now - this.assistantStartedAt < this.assistantGuardMs) {
-      this.logBargeInSuppressed(
-        'playback_guard',
-        `elapsed=${now - this.assistantStartedAt}`,
+    if (now - this.lastAssistantAudioAt < 1500) {
+      this.parentLogger.debug(
+        `[voice] barge_in_blocked_cooldown callId=${this.meta.callId}`,
       );
-      this.speechEnergyFrames = 0;
-      return;
     }
-
-    const protectionRemaining = this.getAssistantProtectionMsRemaining();
-    if (protectionRemaining > 0) {
-      this.logBargeInSuppressed(
-        'inside_protection_window',
-        `protectionMsRemaining=${protectionRemaining}`,
-      );
-      this.speechEnergyFrames = 0;
-      return;
-    }
-
-    const echoWindowMs =
-      this.lastBotReplyText === RealtimeBridgeService.openingGreeting
-        ? 240
-        : 160;
-    if (rms >= threshold) {
-      this.speechEnergyFrames += 1;
-      if (this.debugVoice) {
-        this.parentLogger.debug(
-          `[voice] speech_detected callId=${this.meta.callId} rms=${rms.toFixed(0)} threshold=${threshold} ambient=${this.ambientNoiseRms.toFixed(0)} frames=${this.speechEnergyFrames}`,
-        );
-      }
-    } else {
-      if (rms > 0) {
-        this.logBargeInSuppressed(
-          'below_threshold',
-          `rms=${this.formatEnergy(rms)} threshold=${threshold} ambient=${this.formatEnergy(this.ambientNoiseRms)}`,
-        );
-      }
-      this.speechEnergyFrames = 0;
-      return;
-    }
-
-    if (this.speechEnergyFrames < this.speechFramesForBargeIn) {
-      this.logBargeInSuppressed(
-        'too_short',
-        `frames=${this.speechEnergyFrames}/${this.speechFramesForBargeIn} rms=${this.formatEnergy(rms)}`,
-      );
-      return;
-    }
-
-    if (now - this.lastAssistantAudioAt < echoWindowMs) {
-      this.logBargeInSuppressed(
-        'probable_echo',
-        `sinceAssistantAudio=${now - this.lastAssistantAudioAt} rms=${this.formatEnergy(rms)}`,
-      );
-      this.speechEnergyFrames = 0;
-      return;
-    }
-
-    this.parentLogger.warn(
-      `[voice] barge_in_triggered callId=${this.meta.callId} rms=${this.formatEnergy(rms)} threshold=${threshold} frames=${this.speechEnergyFrames}`,
-    );
-    this.lastBargeInAt = Date.now();
-    this.cancelAssistantAudio('barge_in');
-    this.speechEnergyFrames = 0;
   }
 
   private shouldPassInboundDuringAssistant(payloadB64: string) {
@@ -1413,6 +1356,17 @@ class VoiceBridgeSession {
   private cancelAssistantAudio(
     reason: 'barge_in' | 'new_reply' | 'close' = 'new_reply',
   ) {
+    if (
+      reason === 'barge_in' &&
+      this.assistantStartedAt &&
+      Date.now() - this.assistantStartedAt < 1200
+    ) {
+      this.parentLogger.debug(
+        `[voice] cancellation_blocked_recent_tts_start callId=${this.meta.callId} reason=${reason}`,
+      );
+      return;
+    }
+
     this.playbackToken += 1;
 
     if (this.playbackTimer) {
@@ -1483,6 +1437,7 @@ class VoiceBridgeSession {
     this.parentLogger.log(
       `[voice] playback_completed callId=${this.meta.callId} reason=${reason} durationMs=${this.currentPlaybackDurationMs} bytesSent=${this.outboundAudioByteCount} chunksSent=${this.outboundAudioChunkCount}`,
     );
+    this.lastAssistantAudioAt = Date.now();
     this.resetAssistantPlaybackState(reason);
   }
 
