@@ -302,6 +302,7 @@ class VoiceBridgeSession {
 
   start() {
     this.markTiming('websocket_connected');
+    this.ensureBridgeReady('session_start');
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -425,7 +426,7 @@ class VoiceBridgeSession {
     }
 
     if (msg.event === 'start') {
-      this.bridgeReady = true;
+      this.ensureBridgeReady('bridge_start');
       this.parentLogger.log(
         `[voice] bridge start callId=${this.meta.callId} tenantId=${this.meta.tenantId}`,
       );
@@ -537,7 +538,7 @@ class VoiceBridgeSession {
         if (this.assistantSpeaking) {
           this.logBargeInSuppressed(
             'playback_guard',
-            `event=speech_started speechFrames=${this.speechEnergyFrames} rms=${this.lastObservedSpeechEnergy.toFixed(0)}`,
+            `event=speech_started speechFrames=${this.speechEnergyFrames} rms=${this.formatEnergy(this.lastObservedSpeechEnergy)}`,
           );
         }
         return;
@@ -778,6 +779,28 @@ class VoiceBridgeSession {
     return false;
   }
 
+  private formatEnergy(value: number | null | undefined) {
+    return (value ?? 0).toFixed(0);
+  }
+
+  private ensureBridgeReady(reason: string) {
+    const writable = this.clientWs.readyState === WebSocket.OPEN;
+    if (writable && !this.bridgeReady) {
+      this.bridgeReady = true;
+      this.parentLogger.log(
+        `[voice] bridge_ready_changed callId=${this.meta.callId} bridgeReady=true reason=${reason}`,
+      );
+    }
+
+    if (!writable && this.debugVoice) {
+      this.parentLogger.debug(
+        `[voice] bridge_not_writable callId=${this.meta.callId} reason=${reason} readyState=${this.clientWs.readyState}`,
+      );
+    }
+
+    return writable;
+  }
+
   private getAdaptiveSpeechThreshold() {
     const ambientFloor = this.ambientNoiseRms
       ? Math.round(this.ambientNoiseRms * 1.85 + 110)
@@ -865,6 +888,19 @@ class VoiceBridgeSession {
       event: 'media',
       media: { payload: chunk.toString('base64') },
     });
+
+    if (!sent) {
+      this.parentLogger.warn(
+        `[voice] playback_skipped callId=${this.meta.callId} reason=bridge_send_failed source=${source} chunkSize=${chunk.length}`,
+      );
+      return;
+    }
+
+    if (this.debugVoice || this.outboundAudioChunkCount === 1) {
+      this.parentLogger.log(
+        `[voice] audio_chunk_written callId=${this.meta.callId} source=${source} size=${chunk.length} chunkIndex=${this.outboundAudioChunkCount}`,
+      );
+    }
   }
 
   private handlePossibleBargeIn(payloadB64: string) {
@@ -915,7 +951,7 @@ class VoiceBridgeSession {
       if (rms > 0) {
         this.logBargeInSuppressed(
           'below_threshold',
-          `rms=${rms.toFixed(0)} threshold=${threshold} ambient=${this.ambientNoiseRms.toFixed(0)}`,
+          `rms=${this.formatEnergy(rms)} threshold=${threshold} ambient=${this.formatEnergy(this.ambientNoiseRms)}`,
         );
       }
       this.speechEnergyFrames = 0;
@@ -925,7 +961,7 @@ class VoiceBridgeSession {
     if (this.speechEnergyFrames < this.speechFramesForBargeIn) {
       this.logBargeInSuppressed(
         'too_short',
-        `frames=${this.speechEnergyFrames}/${this.speechFramesForBargeIn} rms=${rms.toFixed(0)}`,
+        `frames=${this.speechEnergyFrames}/${this.speechFramesForBargeIn} rms=${this.formatEnergy(rms)}`,
       );
       return;
     }
@@ -933,14 +969,14 @@ class VoiceBridgeSession {
     if (now - this.lastAssistantAudioAt < echoWindowMs) {
       this.logBargeInSuppressed(
         'probable_echo',
-        `sinceAssistantAudio=${now - this.lastAssistantAudioAt} rms=${rms.toFixed(0)}`,
+        `sinceAssistantAudio=${now - this.lastAssistantAudioAt} rms=${this.formatEnergy(rms)}`,
       );
       this.speechEnergyFrames = 0;
       return;
     }
 
     this.parentLogger.warn(
-      `[voice] barge_in_triggered callId=${this.meta.callId} rms=${rms.toFixed(0)} threshold=${threshold} frames=${this.speechEnergyFrames}`,
+      `[voice] barge_in_triggered callId=${this.meta.callId} rms=${this.formatEnergy(rms)} threshold=${threshold} frames=${this.speechEnergyFrames}`,
     );
     this.lastBargeInAt = Date.now();
     this.cancelAssistantAudio('barge_in');
@@ -966,7 +1002,7 @@ class VoiceBridgeSession {
     ) {
       this.logBargeInSuppressed(
         'below_threshold',
-        `rms=${rms.toFixed(0)} threshold=${threshold} frames=${this.speechEnergyFrames}`,
+        `rms=${this.formatEnergy(rms)} threshold=${threshold} frames=${this.speechEnergyFrames}`,
       );
       return false;
     }
@@ -1567,6 +1603,13 @@ class VoiceBridgeSession {
       this.cancelAssistantAudio('new_reply');
     }
 
+    if (!this.ensureBridgeReady('speak_reply')) {
+      this.parentLogger.warn(
+        `[voice] playback_skipped callId=${this.meta.callId} reason=bridge_not_ready turnId=${effectiveTurnId}`,
+      );
+      return;
+    }
+
     this.lastCancellationReason = null;
 
     this.lastBotReplyText = clean;
@@ -2064,8 +2107,16 @@ class VoiceBridgeSession {
   }
 
   private sendBridge(obj: any) {
-    if (this.clientWs.readyState !== WebSocket.OPEN) return;
+    if (this.clientWs.readyState !== WebSocket.OPEN) {
+      this.parentLogger.warn(
+        `[voice] bridge_send_skipped callId=${this.meta.callId} readyState=${this.clientWs.readyState} event=${String(obj?.event || '-')}`,
+      );
+      return false;
+    }
+
+    this.ensureBridgeReady(`send_${String(obj?.event || 'unknown')}`);
     this.clientWs.send(JSON.stringify(obj));
+    return true;
   }
 
   private safeClose() {
