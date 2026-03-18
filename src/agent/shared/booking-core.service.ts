@@ -96,6 +96,19 @@ type SessionState = {
   lastAssistantReply?: string;
   lastTopic?: string;
   lastServiceId?: string;
+  lastServiceName?: string;
+  recentStaffId?: string;
+  recentStaffName?: string;
+  recentIntentContext?: 'booking' | 'info' | 'staff_preference' | 'general';
+  bookingDraftSnapshot?: {
+    serviceId?: string;
+    serviceName?: string;
+    staffId?: string;
+    staffName?: string;
+    customerName?: string;
+    startAt?: string;
+    updatedAt: number;
+  };
   repeatCount?: number;
 
   lastUserTextNorm?: string;
@@ -359,6 +372,16 @@ export class BookingCoreService {
     }
 
     this.recordHistory(session, 'user', raw);
+    if (looksLikeBookingIntent(raw)) session.recentIntentContext = 'booking';
+    else if (/personel|uzman|biri olsun|kim uygun|kim var/i.test(raw))
+      session.recentIntentContext = 'staff_preference';
+    else if (
+      looksLikePriceQuestion(msg) ||
+      looksLikeServiceListRequest(msg) ||
+      looksLikeAddressOrHours(msg)
+    )
+      session.recentIntentContext = 'info';
+    else session.recentIntentContext = 'general';
 
     // ====================================================
     // Follow-up memory: if the caller asks about the recent reservation, answer without starting a new booking flow
@@ -567,6 +590,21 @@ export class BookingCoreService {
         .catch(() => null);
       const services = await this.safeListServices(tenantId);
       const staff = await this.safeListStaff(tenantId);
+      const recentServiceMention = this.detectServiceFromMessage(raw, services);
+      if (recentServiceMention?.id) {
+        session.lastServiceId = String(recentServiceMention.id);
+        session.lastServiceName = recentServiceMention?.name
+          ? String(recentServiceMention.name)
+          : session.lastServiceName;
+      }
+      const recentStaffMention = this.detectStaffFromMessage(raw, staff);
+      if (recentStaffMention?.id) {
+        session.recentStaffId = String(recentStaffMention.id);
+        session.recentStaffName = recentStaffMention?.name
+          ? String(recentStaffMention.name)
+          : session.recentStaffName;
+      }
+      this.updateContinuityMemory(session, services, staff);
 
       if (isSimpleGreetingOnly(raw)) {
         return this.safeReply(
@@ -975,6 +1013,8 @@ export class BookingCoreService {
       if (globalIntent === 'NEW_BOOKING' || looksLikeBookingIntent(raw)) {
         const svc = this.detectServiceFromMessage(raw, services);
         if (svc?.id) session.draft.serviceId = String(svc.id);
+        if (svc?.name) session.lastServiceName = String(svc.name);
+        session.recentIntentContext = 'booking';
 
         if (!svc?.id && this.hasExplicitUnknownServiceRequest(raw, services)) {
           this.logAction('unknown_service_detected', {
@@ -1000,6 +1040,10 @@ export class BookingCoreService {
 
         if (!isNoPreferenceStaff(raw))
           this.tryAutofillStaff(session.draft, staff, raw);
+
+        if (!session.draft.serviceId && this.hasStrongCarryoverServiceCue(raw)) {
+          this.tryCarryRecentServiceContext(session, services);
+        }
 
         if (!session.draft.serviceId) {
           session.state = WaState.WAIT_SERVICE;
@@ -1155,7 +1199,6 @@ export class BookingCoreService {
       }
 
       session.lastTopic = 'general';
-      session.lastServiceId = undefined;
 
       let llmAnswer = await this.answerWithLLM({
         raw,
@@ -1753,12 +1796,15 @@ export class BookingCoreService {
           ? WaState.WAIT_CONFIRM
           : WaState.WAIT_NAME;
       } else if (!session.draft.staffId) {
-        // Caller provided a name that doesn't match our staff list. Treat as no preference and store it.
-        session.draft.staffId = String(staff[0].id);
-        session.draft.requestedStaffName = raw.trim();
-        session.state = session.editMode
-          ? WaState.WAIT_CONFIRM
-          : WaState.WAIT_NAME;
+        const maybeSpoken = extractLikelyStaffName(raw);
+        if (
+          maybeSpoken &&
+          this.shouldCaptureRequestedStaffName(raw, maybeSpoken, isVoice)
+        ) {
+          session.draft.requestedStaffName = maybeSpoken;
+          return this.askStaffMenu(session, staff);
+        }
+        return this.askStaffMenu(session, staff);
       } else {
         session.state = session.editMode
           ? WaState.WAIT_CONFIRM
@@ -3462,8 +3508,6 @@ ${historyText}
     s.pendingDateOnly = undefined;
     s.pendingSummary = undefined;
 
-    s.lastTopic = undefined;
-    s.lastServiceId = undefined;
     s.lastSuggestions = undefined;
     s.suggestedServiceId = undefined;
     s.suggestedServiceName = undefined;
@@ -3482,6 +3526,53 @@ ${historyText}
       s.lastCreatedAppointmentId = undefined;
       s.lastCreatedAt = undefined;
     }
+  }
+
+  private updateContinuityMemory(
+    session: SessionState,
+    services: any[],
+    staff: any[],
+  ) {
+    const draft = session.draft || ({} as BookingDraft);
+    const service = draft.serviceId
+      ? services.find((s: any) => String(s?.id) === String(draft.serviceId))
+      : null;
+    const staffHit = draft.staffId
+      ? staff.find((p: any) => String(p?.id) === String(draft.staffId))
+      : null;
+
+    if (draft.serviceId) session.lastServiceId = String(draft.serviceId);
+    if (service?.name) session.lastServiceName = String(service.name);
+    if (draft.staffId) session.recentStaffId = String(draft.staffId);
+    if (staffHit?.name) session.recentStaffName = String(staffHit.name);
+
+    session.bookingDraftSnapshot = {
+      serviceId: draft.serviceId ? String(draft.serviceId) : undefined,
+      serviceName:
+        service?.name != null
+          ? String(service.name)
+          : session.lastServiceName || undefined,
+      staffId: draft.staffId ? String(draft.staffId) : undefined,
+      staffName:
+        staffHit?.name != null
+          ? String(staffHit.name)
+          : draft.requestedStaffName || session.recentStaffName || undefined,
+      customerName: draft.customerName ? String(draft.customerName) : undefined,
+      startAt: draft.startAt ? String(draft.startAt) : undefined,
+      updatedAt: Date.now(),
+    };
+  }
+
+  private tryCarryRecentServiceContext(session: SessionState, services: any[]) {
+    if (session.draft.serviceId) return;
+    const recentServiceId = session.lastServiceId
+      ? String(session.lastServiceId)
+      : '';
+    if (!recentServiceId) return;
+    const hit = services.find((s: any) => String(s?.id) === recentServiceId);
+    if (!hit?.id) return;
+    session.draft.serviceId = String(hit.id);
+    if (hit?.name) session.lastServiceName = String(hit.name);
   }
 
   // =========================
@@ -3786,6 +3877,8 @@ ${historyText}
     ) {
       draft.customerName = maybeName;
     }
+
+    this.updateContinuityMemory(session, services, staff);
   }
 
   private tryAutofillStaff(
@@ -3794,22 +3887,25 @@ ${historyText}
     msg: string,
     opts?: { isVoice?: boolean },
   ) {
-    if (draft.staffId) return;
-    const t = normalizePersonName(msg);
-    const words = normalizePersonName(msg).split(/\s+/).filter(Boolean);
-
-    const hit =
-      staff.find(
-        (p: any) => normalizePersonName(String(p?.name || '')) === t,
-      ) ||
-      staff.find((p: any) => {
-        const name = normalizePersonName(String(p?.name || ''));
-        return words.some((w) => w.length >= 3 && name.includes(w));
-      });
+    const hit = this.detectStaffFromMessage(msg, staff);
 
     if (!hit?.id) return;
     if (opts?.isVoice && !this.isStrongVoiceStaffSignal(msg, hit)) return;
     draft.staffId = String(hit.id);
+    draft.requestedStaffName = undefined;
+  }
+
+  private detectStaffFromMessage(msg: string, staff: any[]) {
+    const t = normalizePersonName(msg);
+    const words = t.split(/\s+/).filter(Boolean);
+    return (
+      staff.find((p: any) => normalizePersonName(String(p?.name || '')) === t) ||
+      staff.find((p: any) => {
+        const name = normalizePersonName(String(p?.name || ''));
+        return words.some((w) => w.length >= 3 && name.includes(w));
+      }) ||
+      null
+    );
   }
 
   private mergePendingDateOnlyWithTime(
@@ -3884,14 +3980,28 @@ ${historyText}
     return false;
   }
 
+  private hasStrongCarryoverServiceCue(raw: string) {
+    const t = normalizeTr(raw);
+    if (!t) return false;
+    return (
+      /(randevu|rezervasyon)/.test(t) &&
+      /(almak|yaptir|yaptır|olustur|oluştur|ayarl|yarin|yarın|bugun|bugün|saat|musait|müsait|uygun)/.test(
+        t,
+      )
+    );
+  }
+
   private detectServiceFromMessage(raw: string, services: any[]) {
     if (!services || services.length === 0) return null;
     const t = normalizeTr(raw);
     if (!t) return null;
 
     const direct = services.find((s: any) => {
-      const name = normalizeTr(String(s?.name || ''));
-      return name && (t.includes(name) || name.includes(t));
+      const variants = [...buildServiceMatchVariants(String(s?.name || ''))];
+      return variants.some(
+        (name) =>
+          name && name.length >= 3 && (t.includes(name) || name.includes(t)),
+      );
     });
     if (direct) return direct;
 
@@ -3901,9 +4011,9 @@ ${historyText}
     let best: any = null;
     let bestScore = 0;
     for (const s of services) {
-      const name = normalizeTr(String(s?.name || ''));
-      if (!name) continue;
-      const svcWords = name.split(/\s+/).filter((w) => w.length >= 3);
+      const svcWords = [...buildServiceMatchVariants(String(s?.name || ''))]
+        .flatMap((name) => name.split(/\s+/))
+        .filter((w) => w.length >= 3);
       if (!svcWords.length) continue;
       const overlap = svcWords.filter((w) => userWords.includes(w)).length;
       const score = overlap / svcWords.length;
@@ -3913,7 +4023,7 @@ ${historyText}
       }
     }
 
-    if (bestScore >= 0.6) return best;
+    if (bestScore >= 0.45) return best;
     return null;
   }
 
@@ -4044,6 +4154,36 @@ function normalizePersonName(s: string) {
     .replace(/\s+/g, ' ')
     .trim();
   return t;
+}
+
+function buildServiceMatchVariants(name: string) {
+  const normalized = normalizeTr(name);
+  const variants = new Set<string>();
+  if (!normalized) return variants;
+
+  variants.add(normalized);
+  variants.add(
+    normalized
+      .replace(
+        /\b(epilasyon|bakimi|bakım|uygulamasi|uygulaması|islemi|işlemi)\b/g,
+        '',
+      )
+      .replace(/\s+/g, ' ')
+      .trim(),
+  );
+  variants.add(
+    normalized
+      .replace(/\b(protez|tirnak|tırnak)\b/g, '')
+      .replace(/\s+/g, ' ')
+      .trim(),
+  );
+
+  for (const part of normalized.split(/\s+/)) {
+    if (part.length >= 4) variants.add(part);
+  }
+
+  variants.delete('');
+  return variants;
 }
 
 function isNoPreferenceStaff(raw: string) {
@@ -4301,6 +4441,9 @@ function looksLikeProcedureQuestion(msg: string) {
   const t = normalizeTr(msg);
   return (
     t.includes('nasil') ||
+    t.includes('hakkinda bilgi') ||
+    t.includes('hakkında bilgi') ||
+    t.includes('bilgi almak istiyorum') ||
     t.includes('surec') ||
     t.includes('kac seans') ||
     t.includes('seans') ||

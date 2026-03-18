@@ -36,12 +36,30 @@ type OpenAiEvent = {
   [key: string]: any;
 };
 
-type RecentServiceContext = {
-  serviceName: string;
-  serviceId?: string;
+type RecentEntityContext = {
+  name: string;
+  id?: string;
   source: 'user' | 'assistant';
   turnId: number;
   timestamp: number;
+};
+
+type RecentIntentContext = {
+  intent: 'booking' | 'info' | 'staff_preference' | 'general';
+  source: 'user' | 'assistant';
+  turnId: number;
+  timestamp: number;
+};
+
+type BookingDraftSnapshot = {
+  serviceId?: string;
+  serviceName?: string;
+  staffId?: string;
+  staffName?: string;
+  customerName?: string;
+  startAt?: string;
+  state?: string;
+  updatedAt: number;
 };
 
 type VoiceTimingStage =
@@ -67,7 +85,7 @@ type VoiceTimingStage =
 export class RealtimeBridgeService {
   private readonly logger = new Logger(RealtimeBridgeService.name);
   static readonly openingGreeting =
-    'Merhaba, nasıl yardımcı olabilirim?';
+    'Merhaba, ben güzellik merkezimizin sesli yapay zeka asistanıyım. Size nasıl yardımcı olabilirim?';
   static openingGreetingAudio: Buffer | null = null;
   static openingGreetingPromise: Promise<Buffer | null> | null = null;
   static readonly shortReplyAudioCache = new Map<string, Buffer>();
@@ -224,7 +242,11 @@ class VoiceBridgeSession {
   private currentPlaybackDurationMs = 0;
   private currentPlaybackOffsetBytes = 0;
   private currentReplyTurnId = 0;
-  private recentServiceContext: RecentServiceContext | null = null;
+  private hasIntroducedSelf = false;
+  private recentServiceContext: RecentEntityContext | null = null;
+  private recentStaffContext: RecentEntityContext | null = null;
+  private recentIntentContext: RecentIntentContext | null = null;
+  private bookingDraftSnapshot: BookingDraftSnapshot | null = null;
   private cachedServices: any[] | null = null;
   private lastGreetingSuppressedAt = 0;
   private lastOpeningGreetingIgnoreLogAt = 0;
@@ -495,7 +517,7 @@ class VoiceBridgeSession {
         this.lastTranscriptNorm = norm;
         const turnId = ++this.turnSequence;
         this.activeTurnId = turnId;
-        this.captureRecentServiceContextFromText(transcript, turnId, 'user');
+        this.captureRecentContextsFromText(transcript, turnId, 'user');
         this.markTiming('transcript_normalized', {
           turnId,
           rawLength: rawTranscript.length,
@@ -565,6 +587,7 @@ class VoiceBridgeSession {
 
   private shouldDropTranscript(text: string) {
     const normalized = text.trim();
+    const normalizedTranscript = normalizeVoiceComparisonText(normalized);
 
     if (!normalized) return true;
     if (normalized.length <= 1) return true;
@@ -602,6 +625,24 @@ class VoiceBridgeSession {
       normalized.toLowerCase() === this.lastTranscriptText.toLowerCase() &&
       now - this.lastTranscriptAt < 1400
     ) {
+      return true;
+    }
+
+    const assistantEchoSimilarity = Math.max(
+      similarityScore(normalizedTranscript, normalizeVoiceComparisonText(this.lastBotReplyText)),
+      similarityScore(
+        normalizedTranscript,
+        normalizeVoiceComparisonText(RealtimeBridgeService.openingGreeting),
+      ),
+    );
+    if (
+      !preservePartialBooking &&
+      assistantEchoSimilarity >= 0.92 &&
+      normalizedTranscript.length >= 8
+    ) {
+      this.parentLogger.warn(
+        `[voice] assistant_echo_suppressed callId=${this.meta.callId} similarity=${assistantEchoSimilarity.toFixed(2)} text="${normalized}"`,
+      );
       return true;
     }
 
@@ -671,11 +712,12 @@ class VoiceBridgeSession {
   }
 
   private maybeStartOpeningGreeting() {
-    if (!this.sessionReady || this.greeted || this.greetingInFlight) {
+    if (!this.sessionReady || this.hasIntroducedSelf || this.greetingInFlight) {
       return;
     }
 
     this.greeted = true;
+    this.hasIntroducedSelf = true;
     this.greetingInFlight = true;
 
     const openingGreeting = RealtimeBridgeService.openingGreeting;
@@ -759,27 +801,60 @@ class VoiceBridgeSession {
 
   private async buildAgentInputWithVoiceContext(userText: string, turnId: number) {
     const explicitService = await this.detectServiceMention(userText);
+    const explicitStaff = await this.detectStaffMention(userText);
     const hasBookingIntent = this.hasBookingIntentCue(userText);
-    const shouldReuseRecentService =
-      hasBookingIntent && !explicitService && this.isRecentServiceContextStrong(turnId);
+    const hints: string[] = [];
 
-    if (!shouldReuseRecentService || !this.recentServiceContext) {
-      return userText;
+    if (hasBookingIntent && !explicitService && this.isRecentServiceContextStrong(turnId) && this.recentServiceContext) {
+      hints.push(`Az önce konuşulan hizmet: ${this.recentServiceContext.name}. Kullanıcı yeni hizmet belirtmediyse booking akışını bu hizmetle sürdür.`);
+      this.parentLogger.log(
+        `[voice] recent_service_context_reused callId=${this.meta.callId} turnId=${turnId} service=${JSON.stringify(this.recentServiceContext.name)}`,
+      );
     }
 
-    const serviceName = this.recentServiceContext.serviceName;
-    this.parentLogger.log(
-      `[voice] recent_service_context_reused callId=${this.meta.callId} turnId=${turnId} service=${JSON.stringify(serviceName)}`,
-    );
+    if (!explicitStaff && this.recentStaffContext && this.isRecentEntityContextStrong(this.recentStaffContext, turnId) && /(o olsun|onunla|kendisiyle|ayni kisi|aynı kişi|ayni personel|aynı personel)/i.test(userText)) {
+      hints.push(`Az önce konuşulan personel: ${this.recentStaffContext.name}. Kullanıcı başka bir personel söylemediyse staff tercihi olarak bunu kullan.`);
+    }
+
+    if (this.bookingDraftSnapshot && hasBookingIntent) {
+      const snap = this.bookingDraftSnapshot;
+      const parts = [
+        snap.serviceName ? `service=${snap.serviceName}` : '',
+        snap.staffName ? `staff=${snap.staffName}` : '',
+        snap.startAt ? `startAt=${snap.startAt}` : '',
+        snap.state ? `state=${snap.state}` : '',
+      ].filter(Boolean);
+      if (parts.length) {
+        hints.push(`Mevcut booking taslağı: ${parts.join(', ')}. Alakasız kısa input gelirse akışı bozma, taslağı koru.`);
+      }
+    }
+
+    if (this.recentIntentContext && this.isRecentIntentContextStrong(turnId)) {
+      hints.push(`Yakın intent bağlamı: ${this.recentIntentContext.intent}.`);
+    }
+
+    if (!hints.length) return userText;
     return `${userText}
 
-[voice_context: Az önce konuşulan hizmet: ${serviceName}. Kullanıcı yeni hizmet belirtmediyse booking akışını bu hizmetle sürdür.]`;
+[voice_context: ${hints.join(' ')}]`;
   }
 
   private isRecentServiceContextStrong(turnId: number) {
-    if (!this.recentServiceContext) return false;
-    const withinTurns = turnId - this.recentServiceContext.turnId <= 4;
-    const withinMs = Date.now() - this.recentServiceContext.timestamp <= 180000;
+    return this.recentServiceContext
+      ? this.isRecentEntityContextStrong(this.recentServiceContext, turnId)
+      : false;
+  }
+
+  private isRecentEntityContextStrong(context: RecentEntityContext, turnId: number) {
+    const withinTurns = turnId - context.turnId <= 6;
+    const withinMs = Date.now() - context.timestamp <= 240000;
+    return withinTurns && withinMs;
+  }
+
+  private isRecentIntentContextStrong(turnId: number) {
+    if (!this.recentIntentContext) return false;
+    const withinTurns = turnId - this.recentIntentContext.turnId <= 6;
+    const withinMs = Date.now() - this.recentIntentContext.timestamp <= 240000;
     return withinTurns && withinMs;
   }
 
@@ -808,6 +883,48 @@ class VoiceBridgeSession {
     );
   }
 
+  private async detectStaffMention(text: string) {
+    const bookingCore = (this.agentService as any)?.bookingCore as any;
+    const listStaff = bookingCore?.safeListStaff;
+    if (typeof listStaff !== 'function') return null;
+    try {
+      const staff = await listStaff.call(bookingCore, this.meta.tenantId);
+      const t = normalizeTurkishForTime(text);
+      const exact = staff.find((item: any) => {
+        const name = normalizeTurkishForTime(String(item?.name || ''));
+        return name && (t === name || t.includes(name) || name.includes(t));
+      });
+      if (exact) return exact;
+      const words = t.split(/\s+/).filter((word) => word.length >= 3);
+      return staff.find((item: any) => {
+        const name = normalizeTurkishForTime(String(item?.name || ''));
+        return words.some((word) => name.includes(word));
+      }) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private syncMemoryFromBookingSession(customerPhone: string) {
+    const bookingCore = (this.agentService as any)?.bookingCore as any;
+    const sessions = bookingCore?.sessions as Map<string, any> | undefined;
+    if (!sessions || typeof sessions.get !== 'function') return;
+    const key = `${this.meta.tenantId}:${customerPhone}`;
+    const session = sessions.get(key);
+    if (!session?.draft) return;
+
+    this.bookingDraftSnapshot = {
+      serviceId: session.draft.serviceId ? String(session.draft.serviceId) : undefined,
+      serviceName: session.lastBookingContext?.serviceName || this.recentServiceContext?.name,
+      staffId: session.draft.staffId ? String(session.draft.staffId) : undefined,
+      staffName: session.lastBookingContext?.staffName || this.recentStaffContext?.name || session.draft.requestedStaffName,
+      customerName: session.draft.customerName ? String(session.draft.customerName) : undefined,
+      startAt: session.draft.startAt ? String(session.draft.startAt) : undefined,
+      state: session.state ? String(session.state) : undefined,
+      updatedAt: Date.now(),
+    };
+  }
+
   private async getServicesForVoiceContext() {
     if (this.cachedServices) return this.cachedServices;
     const bookingCore = (this.agentService as any)?.bookingCore as any;
@@ -822,24 +939,50 @@ class VoiceBridgeSession {
     return this.cachedServices;
   }
 
-  private captureRecentServiceContextFromText(
+  private captureRecentContextsFromText(
     text: string,
     turnId: number,
     source: 'user' | 'assistant',
   ) {
+    this.captureRecentIntentContext(text, turnId, source);
+
     void this.detectServiceMention(text).then((service) => {
       if (!service?.name) return;
       this.recentServiceContext = {
-        serviceName: String(service.name),
-        serviceId: service?.id ? String(service.id) : undefined,
+        name: String(service.name),
+        id: service?.id ? String(service.id) : undefined,
         source,
         turnId,
         timestamp: Date.now(),
       };
       this.parentLogger.log(
-        `[voice] recent_service_context_set callId=${this.meta.callId} turnId=${turnId} source=${source} service=${JSON.stringify(this.recentServiceContext.serviceName)}`,
+        `[voice] recent_service_context_set callId=${this.meta.callId} turnId=${turnId} source=${source} service=${JSON.stringify(this.recentServiceContext.name)}`,
       );
     });
+
+    void this.detectStaffMention(text).then((staff) => {
+      if (!staff?.name) return;
+      this.recentStaffContext = {
+        name: String(staff.name),
+        id: staff?.id ? String(staff.id) : undefined,
+        source,
+        turnId,
+        timestamp: Date.now(),
+      };
+      this.parentLogger.log(
+        `[voice] recent_staff_context_set callId=${this.meta.callId} turnId=${turnId} source=${source} staff=${JSON.stringify(this.recentStaffContext.name)}`,
+      );
+    });
+  }
+
+  private captureRecentIntentContext(
+    text: string,
+    turnId: number,
+    source: 'user' | 'assistant',
+  ) {
+    const intent = detectRecentIntent(text);
+    if (!intent) return;
+    this.recentIntentContext = { intent, source, turnId, timestamp: Date.now() };
   }
 
   private cancelAssistantAudio(
@@ -961,6 +1104,7 @@ class VoiceBridgeSession {
       }
 
       const reply = extractReplyText(result);
+      this.syncMemoryFromBookingSession(customerPhone);
 
       this.parentLogger.log(
         `[voice] agent reply callId=${this.meta.callId} customerPhone=${customerPhone} reply="${reply}"`,
@@ -1012,7 +1156,7 @@ class VoiceBridgeSession {
 
     this.lastBotReplyText = clean;
     this.currentReplyTurnId = effectiveTurnId;
-    this.captureRecentServiceContextFromText(clean, effectiveTurnId, 'assistant');
+    this.captureRecentContextsFromText(clean, effectiveTurnId, 'assistant');
     this.assistantSpeaking = true;
     this.assistantStartedAt = Date.now();
 
@@ -1388,6 +1532,15 @@ function normalizeTranscriptForAgent(
     .replace(/\s+/g, ' ')
     .trim();
 
+  if (!isGreetingOnlyUtterance(text)) {
+    text = text
+      .replace(
+        /^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin)[,!\s:-]+/i,
+        '',
+      )
+      .trim();
+  }
+
   const lastBot = String(lastBotReplyText || '').toLocaleLowerCase('tr-TR');
 
   if (
@@ -1541,7 +1694,7 @@ function parseTurkishVoiceDateTime(text: string): string | null {
 }
 
 function sanitizeReplyForVoice(text: string) {
-  return String(text || '')
+  const sanitized = String(text || '')
     .replace(/\*\*/g, '')
     .replace(/[_`#]/g, '')
     .replace(/[\u{1F300}-\u{1FAFF}]/gu, '')
@@ -1549,6 +1702,83 @@ function sanitizeReplyForVoice(text: string) {
     .replace(/[“”]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+  return stripRepeatedGreetingLead(sanitized);
+}
+
+function stripRepeatedGreetingLead(text: string) {
+  const source = String(text || '').trim();
+  if (!source) return '';
+  if (
+    normalizeVoiceComparisonText(source) ===
+    normalizeVoiceComparisonText(RealtimeBridgeService.openingGreeting)
+  ) {
+    return source;
+  }
+
+  return source
+    .replace(
+      /^(merhaba|selam|iyi gunler|iyi aksamlar|gunaydin)[,!\s:-]+/i,
+      '',
+    )
+    .replace(/^size nasil yardimci olabilirim\??/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function isGreetingOnlyUtterance(text: string) {
+  const normalized = normalizeVoiceComparisonText(text);
+  return [
+    'merhaba',
+    'selam',
+    'alo',
+    'iyi gunler',
+    'iyi aksamlar',
+    'gunaydin',
+  ].includes(normalized);
+}
+
+function normalizeVoiceComparisonText(text: string) {
+  return String(text || '')
+    .toLocaleLowerCase('tr-TR')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9çğıöşü\s]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function similarityScore(a: string, b: string) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const aWords = new Set(a.split(/\s+/).filter(Boolean));
+  const bWords = new Set(b.split(/\s+/).filter(Boolean));
+  if (!aWords.size || !bWords.size) return 0;
+  let intersection = 0;
+  for (const word of aWords) {
+    if (bWords.has(word)) intersection += 1;
+  }
+  const union = new Set([...aWords, ...bWords]).size || 1;
+  const jaccard = intersection / union;
+  const lengthRatio =
+    Math.min(a.length, b.length) / Math.max(a.length, b.length);
+  return jaccard * 0.7 + lengthRatio * 0.3;
+}
+
+function detectRecentIntent(
+  text: string,
+): RecentIntentContext['intent'] | null {
+  const normalized = normalizeTurkishForTime(text);
+  if (!normalized) return null;
+  if (/(randevu|rezervasyon|uygun saat|müsait|musait|yarin|yarın|bugun|bugün)/.test(normalized)) {
+    return 'booking';
+  }
+  if (/(personel|kimle|hangi uzman|hangi personel)/.test(normalized)) {
+    return 'staff_preference';
+  }
+  if (/(fiyat|ucret|ücret|bilgi|adres|saat kac|kaçta acik|açik)/.test(normalized)) {
+    return 'info';
+  }
+  return 'general';
 }
 
 function rewriteAgentReplyForVoice(replyText: string) {
