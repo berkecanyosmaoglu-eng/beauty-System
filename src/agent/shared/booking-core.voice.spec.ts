@@ -15,6 +15,7 @@ describe('BookingCoreService voice booking guards', () => {
   const staff = [
     { id: 'stf-1', name: 'Ayşe' },
     { id: 'stf-2', name: 'Fatma' },
+    { id: 'stf-3', name: 'Esra' },
   ];
 
   function createPrismaMock() {
@@ -145,6 +146,108 @@ describe('BookingCoreService voice booking guards', () => {
       tenantId,
       from,
       text: 'Yarına rezervasyon yaptırabilir miyiz?',
+      channel: 'voice',
+    });
+
+    expect(reply).not.toMatch(/hangi hizmet/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.draft.serviceId).toBe('svc-5');
+  });
+
+  it('treats short follow-up booking requests like "yarına olsun" as continuity-driven booking', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi alabilir miyim?',
+      channel: 'voice',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Yarına olsun',
+      channel: 'voice',
+    });
+
+    expect(reply).not.toMatch(/hangi hizmet/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.draft.serviceId).toBe('svc-5');
+    expect(session.pendingDateOnly).toBe('2026-03-19');
+    expect(session.state).toBe('WAIT_STAFF');
+  });
+
+  it('resolves ellipsis like "bunu alayım" using recent service continuity', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi alabilir miyim?',
+      channel: 'voice',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Tamam bunu alayım',
+      channel: 'voice',
+    });
+
+    expect(reply).not.toMatch(/hangi hizmet/i);
+    const session = (service as any).sessions.get(`${tenantId}:${from}`);
+    expect(session.draft.serviceId).toBe('svc-5');
+    expect(session.state).toBe('WAIT_STAFF');
+  });
+
+  it('reuses recent staff context on "Esra Hanım olsun"', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+    const key = `${tenantId}:${from}`;
+
+    (service as any).sessions.set(key, {
+      state: 'IDLE',
+      draft: {
+        tenantId,
+        customerPhone: from,
+      },
+      updatedAt: Date.now(),
+      history: [],
+      lastServiceId: 'svc-5',
+      lastServiceName: 'Protez Tırnak',
+      recentStaffId: 'stf-3',
+      recentStaffName: 'Esra',
+      recentIntentContext: 'info',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Esra Hanım olsun',
+      channel: 'voice',
+    });
+
+    expect(reply).not.toMatch(/hangi hizmet/i);
+    const session = (service as any).sessions.get(key);
+    expect(session.draft.serviceId).toBe('svc-5');
+    expect(session.draft.staffId).toBe('stf-3');
+    expect(session.state).toBe('WAIT_NAME');
+  });
+
+  it('does not ask "hangi hizmet" again when continuity already resolved service', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    await service.replyText({
+      tenantId,
+      from,
+      text: 'Protez tırnak hakkında bilgi almak istiyorum',
+      channel: 'voice',
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'Tamam',
       channel: 'voice',
     });
 

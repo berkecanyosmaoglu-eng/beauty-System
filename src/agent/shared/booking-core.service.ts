@@ -170,6 +170,16 @@ type LearnedCustomerContext = {
   topServiceName?: string;
 };
 
+type ContinuityResolution = {
+  preservedIntent?: SessionState['recentIntentContext'];
+  inferredBookingContinuation: boolean;
+  usedRecentService: boolean;
+  usedRecentStaff: boolean;
+  usedAssistantSuggestion: boolean;
+  usedDraftSnapshot: boolean;
+  shortFollowUp: boolean;
+};
+
 type UpcomingAppt = {
   id: string;
   serviceId: string;
@@ -371,8 +381,23 @@ export class BookingCoreService {
       return this.safeReply(session, prev);
     }
 
+    if (isVoice && this.isLikelyAssistantEcho(session, raw)) {
+      this.logAction('assistant_echo_ignored', {
+        tenantId,
+        phone: from,
+        text: raw,
+      });
+      return '';
+    }
+
     this.recordHistory(session, 'user', raw);
-    if (looksLikeBookingIntent(raw)) session.recentIntentContext = 'booking';
+    const contextualBookingFollowUp = this.isContextualBookingFollowUp(
+      session,
+      raw,
+      isVoice,
+    );
+    if (looksLikeBookingIntent(raw) || contextualBookingFollowUp)
+      session.recentIntentContext = 'booking';
     else if (/personel|uzman|biri olsun|kim uygun|kim var/i.test(raw))
       session.recentIntentContext = 'staff_preference';
     else if (
@@ -381,7 +406,8 @@ export class BookingCoreService {
       looksLikeAddressOrHours(msg)
     )
       session.recentIntentContext = 'info';
-    else session.recentIntentContext = 'general';
+    else if (!this.shouldPreserveRecentIntentContext(session, raw))
+      session.recentIntentContext = 'general';
 
     // ====================================================
     // Follow-up memory: if the caller asks about the recent reservation, answer without starting a new booking flow
@@ -605,11 +631,21 @@ export class BookingCoreService {
           : session.recentStaffName;
       }
       this.updateContinuityMemory(session, services, staff);
+      const preIntentContinuity = this.resolveContinuityContext({
+        session,
+        raw,
+        services,
+        staff,
+        isVoice,
+        phase: 'pre_intent',
+      });
 
       if (isSimpleGreetingOnly(raw)) {
         return this.safeReply(
           session,
-          'Merhaba, hoş geldiniz. Nasıl yardımcı olayım?',
+          session.history.length <= 1
+            ? 'Merhaba, buyurun.'
+            : 'Buyurun, sizi dinliyorum.',
         );
       }
 
@@ -617,7 +653,9 @@ export class BookingCoreService {
         isVoice && this.hasStrongVoiceBookingIntent(raw, services);
       const globalIntent = voiceBookingIntentOverride
         ? 'NEW_BOOKING'
-        : this.detectGlobalIntent(raw);
+        : contextualBookingFollowUp || preIntentContinuity.inferredBookingContinuation
+          ? 'NEW_BOOKING'
+          : this.detectGlobalIntent(raw);
       const shouldExtractSlots =
         session.state !== WaState.IDLE ||
         globalIntent === 'NEW_BOOKING' ||
@@ -1010,7 +1048,11 @@ export class BookingCoreService {
       // =========================
       // Booking intent
       // =========================
-      if (globalIntent === 'NEW_BOOKING' || looksLikeBookingIntent(raw)) {
+      if (
+        globalIntent === 'NEW_BOOKING' ||
+        looksLikeBookingIntent(raw) ||
+        contextualBookingFollowUp
+      ) {
         const svc = this.detectServiceFromMessage(raw, services);
         if (svc?.id) session.draft.serviceId = String(svc.id);
         if (svc?.name) session.lastServiceName = String(svc.name);
@@ -1041,8 +1083,18 @@ export class BookingCoreService {
         if (!isNoPreferenceStaff(raw))
           this.tryAutofillStaff(session.draft, staff, raw);
 
-        if (!session.draft.serviceId && this.hasStrongCarryoverServiceCue(raw)) {
+        if (
+          !session.draft.serviceId &&
+          (this.hasStrongCarryoverServiceCue(raw) || contextualBookingFollowUp)
+        ) {
           this.tryCarryRecentServiceContext(session, services);
+        }
+
+        if (
+          !session.draft.staffId &&
+          this.shouldCarryRecentStaffContext(raw, session)
+        ) {
+          this.tryCarryRecentStaffContext(session, staff);
         }
 
         if (!session.draft.serviceId) {
@@ -1692,6 +1744,14 @@ export class BookingCoreService {
     }
 
     this.extractSlotsFromMessage({ session, raw, services, staff, isVoice });
+    this.resolveContinuityContext({
+      session,
+      raw,
+      services,
+      staff,
+      isVoice,
+      phase: 'pre_missing_slot',
+    });
     this.logAction('extracted_slots', {
       tenantId,
       phone: from,
@@ -1735,6 +1795,10 @@ export class BookingCoreService {
       session.draft.staffId = String(staff[0].id);
 
     if (session.state === WaState.WAIT_SERVICE) {
+      if (!session.draft.serviceId && this.isShortContextualBookingReply(raw)) {
+        this.tryCarryRecentServiceContext(session, services);
+      }
+
       // Voice flow must not ask/confirm previously suggested services.
       session.suggestedServiceId = undefined;
       session.suggestedServiceName = undefined;
@@ -1825,7 +1889,12 @@ export class BookingCoreService {
         }
         session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
         session.state = WaState.WAIT_CONFIRM;
-        return `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+        return isVoice
+          ? this.buildNaturalConfirmationPrompt(session, services, staff, {
+              editMode: true,
+              seed: from + (session.draft.startAt || ''),
+            })
+          : `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
       }
     }
 
@@ -1948,7 +2017,12 @@ export class BookingCoreService {
         ? `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`
         : pre.summary!;
       session.state = WaState.WAIT_CONFIRM;
-      return `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
+      return isVoice
+        ? this.buildNaturalConfirmationPrompt(session, services, staff, {
+            editMode: Boolean(session.editMode),
+            seed: from + (session.draft.startAt || ''),
+          })
+        : `${session.pendingSummary}\n${this.softYesNoHint(from + (session.draft.startAt || ''))}`;
     }
 
     if (session.state === WaState.WAIT_CONFIRM) {
@@ -2493,6 +2567,37 @@ ${staffNamesShort || 'YOK'}
     return opts.gentle
       ? 'Hangi hizmet için yardımcı olayım?'
       : 'Hangi hizmeti istersiniz?';
+  }
+
+  private buildNaturalConfirmationPrompt(
+    session: SessionState,
+    services: any[],
+    staff: any[],
+    opts?: { editMode?: boolean; seed?: string },
+  ) {
+    const draft = session.draft || ({} as BookingDraft);
+    const serviceName =
+      services.find((item: any) => String(item?.id) === String(draft.serviceId))
+        ?.name ||
+      session.bookingDraftSnapshot?.serviceName ||
+      session.lastServiceName ||
+      'randevu';
+    const staffName =
+      staff.find((item: any) => String(item?.id) === String(draft.staffId))?.name ||
+      draft.requestedStaffName ||
+      session.bookingDraftSnapshot?.staffName;
+    const whenText = draft.startAt ? prettyIstanbul(draft.startAt) : null;
+
+    const parts = [
+      opts?.editMode ? 'Tamam,' : 'Tamam,',
+      `${serviceName} için`,
+      whenText ? whenText : '',
+      staffName ? `${staffName} ile` : '',
+      opts?.editMode ? 'güncelliyorum.' : 'oluşturuyorum.',
+    ].filter(Boolean);
+
+    const summary = parts.join(' ').replace(/\s+/g, ' ').trim();
+    return `${summary} ${this.softYesNoHint(opts?.seed || draft.startAt)}`.trim();
   }
 
   // =========================
@@ -3575,6 +3680,145 @@ ${historyText}
     if (hit?.name) session.lastServiceName = String(hit.name);
   }
 
+  private tryCarryRecentStaffContext(session: SessionState, staff: any[]) {
+    if (session.draft.staffId) return;
+    const recentStaffId = session.recentStaffId
+      ? String(session.recentStaffId)
+      : '';
+    if (!recentStaffId) return;
+    const hit = staff.find((item: any) => String(item?.id) === recentStaffId);
+    if (!hit?.id) return;
+    session.draft.staffId = String(hit.id);
+    session.draft.requestedStaffName = undefined;
+    if (hit?.name) session.recentStaffName = String(hit.name);
+  }
+
+  private resolveContinuityContext(opts: {
+    session: SessionState;
+    raw: string;
+    services: any[];
+    staff: any[];
+    isVoice: boolean;
+    phase: 'pre_intent' | 'pre_missing_slot';
+  }): ContinuityResolution {
+    const { session, raw, services, staff, isVoice, phase } = opts;
+    const resolution: ContinuityResolution = {
+      inferredBookingContinuation: false,
+      usedRecentService: false,
+      usedRecentStaff: false,
+      usedAssistantSuggestion: false,
+      usedDraftSnapshot: false,
+      shortFollowUp: this.isShortContextualBookingReply(raw),
+    };
+
+    const draft = session.draft || ({} as BookingDraft);
+    const normalized = normalizeTr(raw);
+    const explicitService = this.detectServiceFromMessage(raw, services);
+    const explicitStaff = isNoPreferenceStaff(raw)
+      ? null
+      : this.detectStaffFromMessage(raw, staff);
+    const pickedSuggestion = this.pickFromSuggestions(session, raw);
+
+    if (pickedSuggestion?.type === 'staff' && pickedSuggestion.staffId) {
+      draft.staffId = pickedSuggestion.staffId;
+      draft.requestedStaffName = undefined;
+      resolution.usedAssistantSuggestion = true;
+    }
+    if (pickedSuggestion?.type === 'slot' && pickedSuggestion.startAt) {
+      draft.startAt = pickedSuggestion.startAt;
+      session.pendingStartAt = pickedSuggestion.startAt;
+      session.pendingDateOnly = undefined;
+      resolution.usedAssistantSuggestion = true;
+    }
+
+    if (
+      !draft.serviceId &&
+      !explicitService?.id &&
+      this.shouldUseContinuityService(session, raw, isVoice)
+    ) {
+      const fromSnapshot = session.bookingDraftSnapshot?.serviceId
+        ? String(session.bookingDraftSnapshot.serviceId)
+        : '';
+      const sourceId = fromSnapshot || (session.lastServiceId || '');
+      if (sourceId) {
+        const hit = services.find((item: any) => String(item?.id) === sourceId);
+        if (hit?.id) {
+          draft.serviceId = String(hit.id);
+          if (hit?.name) session.lastServiceName = String(hit.name);
+          resolution.usedRecentService = true;
+          resolution.usedDraftSnapshot = Boolean(fromSnapshot);
+          resolution.inferredBookingContinuation = true;
+        }
+      }
+    }
+
+    if (
+      !draft.staffId &&
+      !explicitStaff?.id &&
+      !isNoPreferenceStaff(raw) &&
+      this.shouldUseContinuityStaff(session, raw, isVoice)
+    ) {
+      const sourceId = session.bookingDraftSnapshot?.staffId
+        ? String(session.bookingDraftSnapshot.staffId)
+        : session.recentStaffId
+          ? String(session.recentStaffId)
+          : '';
+      if (sourceId) {
+        const hit = staff.find((item: any) => String(item?.id) === sourceId);
+        if (hit?.id) {
+          draft.staffId = String(hit.id);
+          draft.requestedStaffName = undefined;
+          if (hit?.name) session.recentStaffName = String(hit.name);
+          resolution.usedRecentStaff = true;
+          resolution.usedDraftSnapshot =
+            resolution.usedDraftSnapshot ||
+            Boolean(session.bookingDraftSnapshot?.staffId);
+          if (phase === 'pre_intent') resolution.inferredBookingContinuation = true;
+        }
+      }
+    }
+
+    if (
+      resolution.shortFollowUp &&
+      (resolution.usedRecentService ||
+        resolution.usedRecentStaff ||
+        Boolean(session.bookingDraftSnapshot?.serviceId) ||
+        session.recentIntentContext === 'booking' ||
+        session.recentIntentContext === 'info')
+    ) {
+      resolution.preservedIntent = 'booking';
+      resolution.inferredBookingContinuation = true;
+    } else if (
+      resolution.shortFollowUp &&
+      session.recentIntentContext &&
+      session.recentIntentContext !== 'general'
+    ) {
+      resolution.preservedIntent = session.recentIntentContext;
+    }
+
+    if (resolution.preservedIntent) {
+      session.recentIntentContext = resolution.preservedIntent;
+    } else if (!normalized) {
+      resolution.preservedIntent = session.recentIntentContext;
+    }
+
+    this.updateContinuityMemory(session, services, staff);
+    this.logAction('continuity_resolved', {
+      tenantId: draft.tenantId,
+      phone: draft.customerPhone,
+      phase,
+      raw,
+      preservedIntent: resolution.preservedIntent || null,
+      inferredBookingContinuation: resolution.inferredBookingContinuation,
+      usedRecentService: resolution.usedRecentService,
+      usedRecentStaff: resolution.usedRecentStaff,
+      usedAssistantSuggestion: resolution.usedAssistantSuggestion,
+      usedDraftSnapshot: resolution.usedDraftSnapshot,
+      state: session.state,
+    });
+    return resolution;
+  }
+
   // =========================
   // Memory helpers
   // =========================
@@ -3610,6 +3854,23 @@ ${historyText}
     }
     session.lastUserTextNorm = t;
     session.lastUserAt = now;
+    return false;
+  }
+
+  private isLikelyAssistantEcho(session: SessionState, raw: string) {
+    const userNorm = normalizeTr(raw);
+    const assistantNorm = normalizeTr(
+      session.lastAssistantReply || session.lastAssistantText || '',
+    );
+    if (!userNorm || !assistantNorm) return false;
+    if (userNorm.length < 8) return false;
+    if (userNorm === assistantNorm) return true;
+    if (
+      userNorm.length >= 12 &&
+      (assistantNorm.includes(userNorm) || userNorm.includes(assistantNorm))
+    ) {
+      return true;
+    }
     return false;
   }
 
@@ -3693,6 +3954,49 @@ ${historyText}
       recent.includes('yarin') ||
       recent.includes('bugun')
     );
+  }
+
+  private shouldPreserveRecentIntentContext(
+    session: SessionState,
+    raw: string,
+  ) {
+    const t = normalizeTr(raw);
+    if (!t) return true;
+    if (t.length > 24) return false;
+    if (
+      session.recentIntentContext === 'booking' &&
+      this.isShortContextualBookingReply(raw)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  private shouldUseContinuityService(
+    session: SessionState,
+    raw: string,
+    isVoice: boolean,
+  ) {
+    if (!isVoice) return false;
+    if (this.hasStrongCarryoverServiceCue(raw)) return true;
+    if (!this.isShortContextualBookingReply(raw)) return false;
+    return Boolean(
+      session.lastServiceId ||
+        session.bookingDraftSnapshot?.serviceId ||
+        session.recentIntentContext === 'booking' ||
+        session.recentIntentContext === 'info',
+    );
+  }
+
+  private shouldUseContinuityStaff(
+    session: SessionState,
+    raw: string,
+    isVoice: boolean,
+  ) {
+    if (!isVoice) return false;
+    if (!session.recentStaffId && !session.bookingDraftSnapshot?.staffId)
+      return false;
+    return this.shouldCarryRecentStaffContext(raw, session);
   }
 
   private detectGlobalIntent(raw: string): GlobalIntent {
@@ -3988,6 +4292,55 @@ ${historyText}
       /(almak|yaptir|yaptır|olustur|oluştur|ayarl|yarin|yarın|bugun|bugün|saat|musait|müsait|uygun)/.test(
         t,
       )
+    );
+  }
+
+  private isShortContextualBookingReply(raw: string) {
+    const t = normalizeTr(raw);
+    if (!t) return false;
+    if (t.length > 48) return false;
+
+    const cues = [
+      /\b(bunu|buna|böyle|boyle|onu|onu alalim|onu alalım)\b/,
+      /^\b(tamam|olur|evet)\b$/,
+      /\b(tamam|olur|evet)\b.*\b(alalim|alayim|alalım|alayım|olsun|uyar|uygun)\b/,
+      /\b(yarin|yarın|bugun|bugün|saat|ogle|öğle|sabah|aksam|akşam)\b/,
+      /\b(randevu|rezervasyon)\b.*\b(alalim|alayim|olsun|yapalim|yapalım|yaptiralim|yaptıralım)\b/,
+      /\b(alalim|alayim|olsun|yapalim|yapalım|ayarlayalim|ayarlayalım)\b/,
+    ];
+
+    return cues.some((pattern) => pattern.test(t));
+  }
+
+  private isContextualBookingFollowUp(
+    session: SessionState,
+    raw: string,
+    isVoice: boolean,
+  ) {
+    if (!isVoice) return false;
+    if (!this.isShortContextualBookingReply(raw)) return false;
+
+    return Boolean(
+      session.lastServiceId ||
+        session.bookingDraftSnapshot?.serviceId ||
+        session.recentIntentContext === 'booking' ||
+        session.recentIntentContext === 'info',
+    );
+  }
+
+  private shouldCarryRecentStaffContext(raw: string, session: SessionState) {
+    if (!session.recentStaffId) return false;
+    const t = normalizeTr(raw);
+    if (!t) return false;
+    if (
+      /(hanim|hanım|bey|personel|uzman)/.test(t) &&
+      !/(fark etmez|kim olursa|kim uygun|biri olsun)/.test(t)
+    ) {
+      return true;
+    }
+
+    return /(o olsun|onunla|kendisiyle|ayni kisi|aynı kişi|ayni personel|aynı personel)/.test(
+      t,
     );
   }
 
