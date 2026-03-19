@@ -1423,7 +1423,7 @@ class VoiceBridgeSession {
     turnId?: number,
   ): Promise<string> {
     const effectiveTurnId = turnId ?? this.activeTurnId;
-    // TEMP MVP: pass the normalized transcript directly to VoiceConversationService.
+    // TEMP MVP: pass the normalized transcript directly to the active voice agent path.
     const effectiveUserText = userText;
 
     this.markTiming('agent_processing_start', {
@@ -1451,25 +1451,9 @@ class VoiceBridgeSession {
     };
 
     try {
-      const svc: any = this.agentService as any;
-
-      let result: any = null;
-
-      if (typeof svc.handleIncomingMessage === 'function') {
-        result = await svc.handleIncomingMessage(payload);
-      } else if (typeof svc.processIncomingMessage === 'function') {
-        result = await svc.processIncomingMessage(payload);
-      } else if (typeof svc.processMessage === 'function') {
-        result = await svc.processMessage(payload);
-      } else if (typeof svc.replyText === 'function') {
-        result = await svc.replyText(payload);
-      } else {
-        throw new Error(
-          'VoiceAgentService üzerinde kullanılabilir bir public entrypoint bulunamadı',
-        );
-      }
-
-      const reply = extractReplyText(result);
+      const reply = String(
+        await this.agentService.replyText(payload),
+      ).trim();
 
       this.parentLogger.log(
         `[voice] agent reply callId=${this.meta.callId} customerPhone=${customerPhone} reply="${reply}"`,
@@ -2027,40 +2011,6 @@ class VoiceBridgeSession {
       }
     } catch {}
   }
-}
-
-function extractReplyText(result: any): string {
-  if (!result) return '';
-
-  if (typeof result === 'string') return result.trim();
-
-  const candidates = [
-    result.text,
-    result.reply,
-    result.message,
-    result.finalText,
-    result.replyText,
-    result.assistantText,
-    result.outputText,
-    result.content,
-  ];
-
-  for (const item of candidates) {
-    if (typeof item === 'string' && item.trim()) {
-      return item.trim();
-    }
-  }
-
-  if (Array.isArray(result.messages) && result.messages.length) {
-    const last = result.messages[result.messages.length - 1];
-    if (typeof last === 'string' && last.trim()) return last.trim();
-    if (typeof last?.text === 'string' && last.text.trim())
-      return last.text.trim();
-    if (typeof last?.content === 'string' && last.content.trim())
-      return last.content.trim();
-  }
-
-  return '';
 }
 
 export function normalizeTranscriptForAgent(
