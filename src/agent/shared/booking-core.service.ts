@@ -44,10 +44,11 @@ enum WaState {
   IDLE = 'IDLE',
 
   // booking
-  WAIT_SERVICE = 'WAIT_SERVICE',
-  WAIT_NAME = 'WAIT_NAME',
-  WAIT_DATETIME = 'WAIT_DATETIME',
-  WAIT_CONFIRM = 'WAIT_CONFIRM',
+  WAIT_SERVICE = 'BOOKING_INTENT_DETECTED',
+  WAIT_NAME = 'BOOKING_INTENT_DETECTED',
+  WAIT_DATETIME = 'AWAITING_DATETIME',
+  WAIT_CONFIRM = 'AWAITING_CONFIRMATION',
+  CONFIRMED = 'CONFIRMED',
 
   // edit (change/cancel)
   WAIT_APPT_PICK = 'WAIT_APPT_PICK',
@@ -342,8 +343,7 @@ export class BookingCoreService {
     apptId: string,
     seed?: string,
   ) {
-    const pretty = prettyIstanbul(startAtIso);
-    return `${pretty} için rezervasyonunuzu oluşturdum.\nRezervasyondan 2 saat önce telefonunuza bir hatırlatma mesajı gönderilecektir. Görüşmek üzere.`;
+    return 'Rezervasyonunuz oluşturuldu. Randevunuzdan 2 saat önce bir hatırlatma mesajı alacaksınız.';
   }
 
   private formatEditSuccess(startAtIso: string, apptId: string, seed?: string) {
@@ -659,13 +659,6 @@ export class BookingCoreService {
           ? String(recentServiceMention.name)
           : session.lastServiceName;
       }
-      const recentStaffMention = this.detectStaffFromMessage(raw, staff);
-      if (recentStaffMention?.id) {
-        session.recentStaffId = String(recentStaffMention.id);
-        session.recentStaffName = recentStaffMention?.name
-          ? String(recentStaffMention.name)
-          : session.recentStaffName;
-      }
       this.updateContinuityMemory(session, services, staff);
       const preIntentContinuity = this.resolveContinuityContext({
         session,
@@ -784,12 +777,6 @@ export class BookingCoreService {
         return this.safeReply(session, reply);
       }
 
-      if ((isYes(msg) || isNo(msg)) && session.state === WaState.IDLE) {
-        return this.safeReply(
-          session,
-          'Bu mesajı ne için yazdığını anlayamadım 🙂 Randevu, listeleme, değişiklik veya iptal yazabilirsin.',
-        );
-      }
 
       // =========================
       // ✅ Upcoming appointment inquiry (IDLE iken)
@@ -1121,20 +1108,12 @@ export class BookingCoreService {
         }
 
         if (!isNoPreferenceStaff(raw))
-          this.tryAutofillStaff(session.draft, staff, raw);
 
         if (
           !session.draft.serviceId &&
           (this.hasStrongCarryoverServiceCue(raw) || contextualBookingFollowUp)
         ) {
           this.tryCarryRecentServiceContext(session, services);
-        }
-
-        if (
-          !session.draft.staffId &&
-          this.shouldCarryRecentStaffContext(raw, session)
-        ) {
-          this.tryCarryRecentStaffContext(session, staff);
         }
 
         if (!session.draft.serviceId) {
@@ -1150,11 +1129,11 @@ export class BookingCoreService {
           );
         }
 
-        session.state = WaState.WAIT_NAME;
+        session.state = WaState.WAIT_DATETIME;
         this.saveSession(key, session);
         return this.safeReply(
           session,
-          await this.naturalAsk(session, 'name', { services, staff, business }),
+          await this.naturalAsk(session, 'datetime', { services, staff, business }),
         );
       }
 
@@ -1835,8 +1814,6 @@ export class BookingCoreService {
 
     if (!session.draft.serviceId && services.length === 1 && services[0]?.id)
       session.draft.serviceId = String(services[0].id);
-    if (!session.draft.staffId && staff.length === 1 && staff[0]?.id)
-      session.draft.staffId = String(staff[0].id);
 
     if (session.state === WaState.WAIT_SERVICE) {
       if (!session.draft.serviceId && this.isShortContextualBookingReply(raw)) {
@@ -1887,26 +1864,6 @@ export class BookingCoreService {
 
       if (!session.draft.serviceId)
         return await this.naturalAsk(session, 'service', {
-          services,
-          staff,
-          business: null,
-        });
-      session.state = WaState.WAIT_NAME;
-    }
-
-    if (session.state === WaState.WAIT_NAME) {
-      if (!session.draft.customerName) {
-        this.trySaveCustomerNameFromVoiceInput({
-          session,
-          raw,
-          staff,
-          isVoice,
-          source: 'wait_name',
-        });
-      }
-
-      if (!session.draft.customerName)
-        return await this.naturalAsk(session, 'name', {
           services,
           staff,
           business: null,
@@ -2136,7 +2093,9 @@ export class BookingCoreService {
         const newIso = upd.data.startAt;
         const apptId = upd.data.appointmentId;
 
-        session.lastBookingContext = {
+        session.state = WaState.CONFIRMED;
+
+      session.lastBookingContext = {
           startAtIso: newIso,
           serviceName: session.targetApptSnapshot?.serviceName,
           staffName: session.targetApptSnapshot?.staffName,
@@ -2187,7 +2146,7 @@ export class BookingCoreService {
       });
 
       if (!created.ok && created.code === 'NEED_NAME') {
-        session.state = WaState.WAIT_NAME;
+        session.state = WaState.WAIT_DATETIME;
         return await this.naturalAsk(session, 'name', {
           services,
           staff,
@@ -2234,6 +2193,8 @@ export class BookingCoreService {
       session.lastCreatedAt = Date.now();
 
       await this.learnFromSuccessfulBooking(tenantId, from, session.draft);
+
+      session.state = WaState.CONFIRMED;
 
       session.lastBookingContext = {
         startAtIso: created.data.startAt,
@@ -2539,22 +2500,16 @@ ${staffNamesShort || 'YOK'}
       session.bookingDraftSnapshot?.serviceName ||
       session.lastServiceName ||
       'randevu';
-    const staffName =
-      staff.find((item: any) => String(item?.id) === String(draft.staffId))
-        ?.name ||
-      draft.requestedStaffName ||
-      session.bookingDraftSnapshot?.staffName;
     const whenText = draft.startAt ? prettyIstanbul(draft.startAt) : null;
 
-    const parts = [
-      opts?.editMode ? 'Tamam,' : 'Tamam,',
-      `${serviceName} için`,
-      whenText ? whenText : '',
-      staffName ? `${staffName} ile` : '',
-      opts?.editMode ? 'güncelliyorum.' : 'oluşturuyorum.',
-    ].filter(Boolean);
+    const summary = opts?.editMode
+      ? ['Tamam,', `${serviceName} için`, whenText || '', 'güncelliyorum.']
+          .filter(Boolean)
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+      : 'Uygunluk durumunu kontrol ederek rezervasyonunuzu oluşturuyorum.';
 
-    const summary = parts.join(' ').replace(/\s+/g, ' ').trim();
     return `${summary} ${this.softYesNoHint(opts?.seed || draft.startAt)}`.trim();
   }
 
@@ -2961,9 +2916,7 @@ ${staffNamesShort || 'YOK'}
         : null;
 
       if (!serviceId || !startAt || !customerPhone) return { ok: false };
-      if (!customerName || customerName.trim().length < 2)
-        return { ok: false, code: 'NEED_NAME' };
-
+  
       if (!isWithinWorkingHoursIso(startAt)) {
         const suggestions = suggestWorkingHourAlternatives(startAt, 5).map(
           (s) => ({ startAt: s, endAt: s }),
@@ -2990,7 +2943,7 @@ ${staffNamesShort || 'YOK'}
         draft.staffId = resolvedStaff.staffId;
       }
 
-      const fullName = customerName.trim();
+      const fullName = (customerName || 'Misafir Müşteri').trim();
 
       const now = new Date();
       const customer = await (this.prisma as any).customers.upsert({
@@ -4102,8 +4055,6 @@ ${historyText}
         if (session.state !== WaState.IDLE) {
           if (session.state === WaState.WAIT_SERVICE)
             out = this.humanizeAsk('service');
-          else if (session.state === WaState.WAIT_NAME)
-            out = this.humanizeAsk('name');
           else if (session.state === WaState.WAIT_DATETIME)
             out = this.humanizeAsk('datetime');
           else out = 'Devam edelim 🙂';
@@ -4179,10 +4130,7 @@ ${historyText}
     raw: string,
     isVoice: boolean,
   ) {
-    if (!isVoice) return false;
-    if (!session.recentStaffId && !session.bookingDraftSnapshot?.staffId)
-      return false;
-    return this.shouldCarryRecentStaffContext(raw, session);
+    return false;
   }
 
   private resolveServiceForVoiceFollowUp(
@@ -4309,19 +4257,6 @@ ${historyText}
       session.suggestedServiceName = undefined;
     }
 
-    if (!isNoPreferenceStaff(raw)) {
-      this.tryAutofillStaff(draft, staff, raw, { isVoice });
-      if (!draft.staffId) {
-        const maybeSpoken = extractLikelyStaffName(raw);
-        if (
-          maybeSpoken &&
-          this.shouldCaptureRequestedStaffName(raw, maybeSpoken, isVoice)
-        ) {
-          draft.requestedStaffName = maybeSpoken;
-          if (staff?.[0]?.id) draft.staffId = String(staff[0].id);
-        }
-      }
-    }
 
     const parsed = parseDateTimeTR(raw);
     const tNorm = normalizeTr(raw);
@@ -4376,9 +4311,7 @@ ${historyText}
       }
     }
 
-    const canCaptureName =
-      session.state === WaState.WAIT_NAME ||
-      looksLikeExplicitNameStatement(raw);
+    const canCaptureName = looksLikeExplicitNameStatement(raw);
     if (!draft.customerName && canCaptureName) {
       this.trySaveCustomerNameFromVoiceInput({
         session,
@@ -4635,7 +4568,6 @@ ${historyText}
 
     const cues = [
       /\b(bunu|buna|böyle|boyle|onu|onu alalim|onu alalım)\b/,
-      /^\b(tamam|olur|evet)\b$/,
       /\b(tamam|olur|evet)\b.*\b(alalim|alayim|alalım|alayım|olsun|uyar|uygun)\b/,
       /\b(yarin|yarın|bugun|bugün|saat|ogle|öğle|sabah|aksam|akşam)\b/,
       /\b(randevu|rezervasyon)\b.*\b(alalim|alayim|olsun|yapalim|yapalım|yaptiralim|yaptıralım)\b/,
@@ -4735,7 +4667,6 @@ ${historyText}
     session: SessionState,
   ): 'service' | 'name' | 'datetime' | 'confirm' {
     if (!session.draft.serviceId) return 'service';
-    if (!session.draft.customerName) return 'name';
     if (!session.draft.startAt) return 'datetime';
     return 'confirm';
   }
@@ -4978,7 +4909,14 @@ function looksLikeBookingIntent(raw: string) {
   const t = normalizeTr(raw);
   if (t === 'randevu' || t === 'rezervasyon') return true;
   const hasRandevu = t.includes('randevu') || t.includes('rezervasyon');
-  if (!hasRandevu) return false;
+  const serviceLedBooking =
+    /(almak|istiyorum|istiyoruz|isterim|istiyoruz|olsun|ayarla|olustur|oluştur)/.test(
+      t,
+    ) &&
+    /(lazer|epilasyon|cilt|bakim|bakım|manikur|manikür|pedikur|pedikür|protez|tirnak|tırnak)/.test(
+      t,
+    );
+  if (!hasRandevu && !serviceLedBooking) return false;
   const verbs = [
     'olustur',
     'oluştur',
@@ -4989,12 +4927,13 @@ function looksLikeBookingIntent(raw: string) {
     'alin',
     'almak',
     'istiyorum',
+    'istiyoruz',
     'isterim',
     'rezervasyon yap',
     'randevu yap',
     'randevu al',
   ];
-  if (verbs.some((v) => t.includes(normalizeTr(v)))) return true;
+  if (serviceLedBooking || verbs.some((v) => t.includes(normalizeTr(v)))) return true;
   if (t.includes('yarin') || t.includes('bugun') || /\b\d{1,2}:\d{2}\b/.test(t))
     return true;
   return false;

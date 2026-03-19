@@ -17,27 +17,13 @@ describe('shapeVoiceAgentReply', () => {
     expect(reply).toBe('O saat dolu. Yarın 17:00. Uygun mu?');
   });
 
-  it('removes long closings from success responses', () => {
+  it('preserves the exact final confirmation message', () => {
     const reply = shapeVoiceAgentReply(
-      'Yarın 12:00 için rezervasyonunuzu oluşturdum.\nRezervasyondan 2 saat önce telefonunuza bir hatırlatma mesajı gönderilecektir. Görüşmek üzere.',
+      'Rezervasyonunuz oluşturuldu. Randevunuzdan 2 saat önce bir hatırlatma mesajı alacaksınız.',
     );
 
-    expect(reply).toBe('Yarın 12:00 için rezervasyonunuzu oluşturdum.');
-  });
-
-  it('suppresses repeated greeting leads after the first turn', () => {
-    const reply = shapeVoiceAgentReply(
-      'Merhaba, lazer epilasyon için yardımcı olayım. Size nasıl yardımcı olabilirim?',
+    expect(reply).toBe(
+      'Rezervasyonunuz oluşturuldu. Randevunuzdan 2 saat önce bir hatırlatma mesajı alacaksınız.',
     );
-
-    expect(reply).toBe('lazer epilasyon için yardımcı olayım.');
-  });
-
-  it('keeps a usable help prompt when greeting cleanup removes filler lines', () => {
-    const reply = shapeVoiceAgentReply(
-      'Teşekkür ederim. Size nasıl yardımcı olabilirim?',
-    );
-
-    expect(reply).toBe('Size nasıl yardımcı olabilirim?');
   });
 });

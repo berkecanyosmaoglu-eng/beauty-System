@@ -5,6 +5,10 @@ export function shapeVoiceAgentReply(reply: string): string {
 
   text = stripGreetingLead(text);
 
+  if (normalizeVoiceText(text) === normalizeVoiceText('Rezervasyonunuz oluşturuldu. Randevunuzdan 2 saat önce bir hatırlatma mesajı alacaksınız.')) {
+    return 'Rezervasyonunuz oluşturuldu. Randevunuzdan 2 saat önce bir hatırlatma mesajı alacaksınız.';
+  }
+
   text = text
     .replace(/[🙂😕✅👍✨😊😉🙏]/g, '')
     .replace(/\s+\n/g, '\n')
@@ -110,10 +114,6 @@ function cleanupLine(line: string): string {
     .replace(
       /Randevuyu onaylıyor musunuz\? Evet veya hayır diyebilirsiniz\.?/gi,
       'Onaylıyor musunuz?',
-    )
-    .replace(
-      /Rezervasyondan 2 saat önce telefonunuza bir hatırlatma mesajı gönderilecektir\.?/gi,
-      '',
     )
     .replace(/Başka bir şeyle yardımcı olabilir miyim\??/gi, '')
     .replace(/Rica ederim[,!]? her zaman buradayız\.?/gi, '')
