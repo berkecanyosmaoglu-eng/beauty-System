@@ -3,6 +3,26 @@ import { Injectable, Logger } from '@nestjs/common';
 import OpenAI from 'openai';
 import { PrismaService } from '../../prisma/prisma.service';
 import * as crypto from 'crypto';
+import { detectLegacyGlobalIntent } from './legacy-conversation-routing';
+import {
+  buildCustomerNameCommitPatch,
+  buildSuggestedServiceCleanupPatch,
+  extractNameCandidate as extractName,
+  detectServiceFromMessage,
+  detectStaffFromMessage as detectStaffFromMessageHelper,
+} from './agent-helpers';
+import {
+  buildDateTimeCommitPatch,
+  buildPendingDateOnlyPatch,
+  mergeDateOnlyWithExistingTime,
+  mergePendingDateOnlyWithTime as mergePendingDateOnlyWithTimeHelper,
+} from './booking-datetime-helpers';
+import {
+  formatBookingSuccess as formatBookingSuccessText,
+  formatEditSuccess as formatEditSuccessText,
+  humanizeAskTimeOnly as humanizeAskTimeOnlyText,
+  humanizeConfirmNeedEH as humanizeConfirmNeedEHText,
+} from './booking-presentation-policy';
 
 // -----------------------------------------------------------------------------
 // Global configuration constants
@@ -102,14 +122,10 @@ type SessionState = {
   lastServiceId?: string;
   lastServiceName?: string;
   recentStaffId?: string;
-  recentStaffName?: string;
-  recentIntentContext?: 'booking' | 'info' | 'staff_preference' | 'general';
+  recentIntentContext?: 'booking' | 'info';
   bookingDraftSnapshot?: {
     serviceId?: string;
-    serviceName?: string;
     staffId?: string;
-    staffName?: string;
-    customerName?: string;
     startAt?: string;
     updatedAt: number;
   };
@@ -227,6 +243,66 @@ export class BookingCoreService {
     }
   }
 
+  async listServicesForConversation(tenantId: string): Promise<any[]> {
+    return this.safeListServices(tenantId);
+  }
+
+  parseDateTimeForConversation(rawText: string): string | null {
+    const parsed = parseDateTimeTR(String(rawText || '').trim());
+    if (!parsed?.hasDate || !parsed?.hasTime) {
+      return null;
+    }
+    return toIstanbulIso(clampToFuture(parsed.dateUtc));
+  }
+
+  async createBookingFromConversation(input: {
+    tenantId: string;
+    customerPhone: string;
+    customerName: string;
+    serviceId: string;
+    startAt: string;
+    channel?: 'VOICE' | 'WHATSAPP';
+    callId?: string;
+    streamSid?: string;
+  }): Promise<
+    | { ok: true; appointmentId: string; startAt: string }
+    | {
+        ok: false;
+        code?: string;
+        suggestions?: Array<{ startAt: string; endAt: string }>;
+      }
+  > {
+    const draft: BookingDraft = {
+      tenantId: input.tenantId,
+      customerPhone: String(input.customerPhone || '').trim(),
+      customerName: String(input.customerName || '').trim() || null,
+      channel: input.channel || 'VOICE',
+      callSessionId:
+        input.channel === 'WHATSAPP'
+          ? undefined
+          : String(input.callId || input.streamSid || '').trim() || undefined,
+      serviceId: String(input.serviceId || '').trim(),
+      startAt: String(input.startAt || '').trim(),
+    };
+
+    const staffFallbackList = await this.safeListStaff(input.tenantId);
+    const created = await this.createAppointment({
+      tenantId: input.tenantId,
+      draft,
+      staffFallbackList,
+    });
+
+    if (!created.ok) {
+      return created;
+    }
+
+    return {
+      ok: true,
+      appointmentId: created.data.appointmentId,
+      startAt: created.data.startAt,
+    };
+  }
+
   /**
    * Structured logging helper. Emits JSON logs for key actions with context.
    * Logs include the action name and any additional contextual fields passed
@@ -316,26 +392,10 @@ export class BookingCoreService {
   }
 
   private humanizeAskTimeOnly(seed?: string) {
-    // When only the time is needed, ask succinctly.
-    return this.pickOne(
-      [
-        "Saat kaç olsun? Örneğin: '16:00'.",
-        "Kaçta ayarlayalım? Örneğin: '16:00'.",
-        "Saat alayım. Örneğin: '16:00'.",
-      ],
-      seed,
-    );
+    return humanizeAskTimeOnlyText(seed);
   }
   private humanizeConfirmNeedEH(seed?: string) {
-    // In voice calls, ask the customer to verbally confirm or decline. Keep it short and clear.
-    return this.pickOne(
-      [
-        'Onaylıyor musunuz?',
-        'Tamamsa evet deyin, istemezseniz hayır diyebilirsiniz.',
-        'Randevuyu onaylıyor musunuz? Evet veya hayır diyebilirsiniz.',
-      ],
-      seed,
-    );
+    return humanizeConfirmNeedEHText(seed);
   }
 
   private formatBookingSuccess(
@@ -343,18 +403,832 @@ export class BookingCoreService {
     apptId: string,
     seed?: string,
   ) {
-    return 'Rezervasyonunuz oluşturuldu. Randevunuzdan 2 saat önce bir hatırlatma mesajı alacaksınız.';
+    return formatBookingSuccessText();
   }
 
   private formatEditSuccess(startAtIso: string, apptId: string, seed?: string) {
-    return this.pickOne(
-      [
-        `Randevunuzu güncelledim. Yeni tarih: ${prettyIstanbul(startAtIso)}. Kayıt numarası: ${apptId}.`,
-        `Randevu güncellendi. Yeni tarih: ${prettyIstanbul(startAtIso)}. Kayıt numarası: ${apptId}.`,
-        `Randevu değiştirildi. Yeni tarih: ${prettyIstanbul(startAtIso)}. Kayıt numarası: ${apptId}.`,
-      ],
-      seed || startAtIso + apptId,
+    return formatEditSuccessText(prettyIstanbul(startAtIso), apptId, seed);
+  }
+
+  private runReplyPrelude(opts: {
+    session: SessionState;
+    tenantId: string;
+    from: string;
+    raw: string;
+    msg: string;
+    isVoice: boolean;
+    messageSessionId?: string;
+    callId?: string;
+    streamSid?: string;
+  }): {
+    shouldReturnEarly: boolean;
+    reply: string;
+    useSafeReply: boolean;
+    contextualBookingFollowUp: boolean;
+  } {
+    const {
+      session,
+      tenantId,
+      from,
+      raw,
+      msg,
+      isVoice,
+      messageSessionId,
+      callId,
+      streamSid,
+    } = opts;
+
+    session.draft.customerPhone = from;
+    session.draft.channel = isVoice ? 'VOICE' : 'WHATSAPP';
+    if (isVoice) {
+      session.draft.callSessionId = String(
+        callId || streamSid || session.draft.callSessionId || '',
+      ).trim();
+      session.draft.messageSessionId = undefined;
+    } else {
+      session.draft.messageSessionId = String(
+        messageSessionId || session.draft.messageSessionId || `${tenantId}:${from}`,
+      ).trim();
+      session.draft.callSessionId = undefined;
+    }
+
+    this.logAction('incoming', {
+      tenantId,
+      phone: from,
+      state: session.state,
+      text: raw,
+    });
+
+    if (this.isLikelyDuplicateInbound(session, raw)) {
+      return {
+        shouldReturnEarly: true,
+        reply: session.lastAssistantReply || session.lastAssistantText || 'Tamam 👍',
+        useSafeReply: true,
+        contextualBookingFollowUp: false,
+      };
+    }
+
+    if (isVoice && this.isLikelyAssistantEcho(session, raw)) {
+      this.logAction('assistant_echo_ignored', {
+        tenantId,
+        phone: from,
+        text: raw,
+      });
+      return {
+        shouldReturnEarly: true,
+        reply: '',
+        useSafeReply: false,
+        contextualBookingFollowUp: false,
+      };
+    }
+
+    this.recordHistory(session, 'user', raw);
+    const contextualBookingFollowUp = this.isContextualBookingFollowUp(
+      session,
+      raw,
+      isVoice,
     );
+
+    if (looksLikeBookingIntent(raw) || contextualBookingFollowUp)
+      session.recentIntentContext = 'booking';
+    else if (
+      looksLikePriceQuestion(msg) ||
+      looksLikeServiceListRequest(msg) ||
+      looksLikeAddressOrHours(msg)
+    )
+      session.recentIntentContext = 'info';
+    else if (!this.shouldPreserveRecentIntentContext(session, raw))
+      session.recentIntentContext = undefined;
+
+    return {
+      shouldReturnEarly: false,
+      reply: '',
+      useSafeReply: true,
+      contextualBookingFollowUp,
+    };
+  }
+
+  private async handleLegacyBookingEntry(opts: {
+    key: string;
+    session: SessionState;
+    tenantId: string;
+    from: string;
+    raw: string;
+    services: any[];
+    staff: any[];
+    business: any;
+    globalIntent: GlobalIntent;
+    contextualBookingFollowUp: boolean;
+  }): Promise<{ handled: boolean; reply: string }> {
+    const {
+      key,
+      session,
+      tenantId,
+      from,
+      raw,
+      services,
+      staff,
+      business,
+      globalIntent,
+      contextualBookingFollowUp,
+    } = opts;
+
+    if (
+      globalIntent !== 'NEW_BOOKING' &&
+      !looksLikeBookingIntent(raw) &&
+      !contextualBookingFollowUp
+    ) {
+      return { handled: false, reply: '' };
+    }
+
+    const svc = this.detectServiceFromMessage(raw, services);
+    if (svc?.id) session.draft.serviceId = String(svc.id);
+    if (svc?.name) session.lastServiceName = String(svc.name);
+    session.recentIntentContext = 'booking';
+
+    if (
+      !svc?.id &&
+      !this.isGenericBookingIntentWithoutService(raw, services) &&
+      this.hasExplicitUnknownServiceRequest(raw, services)
+    ) {
+      this.logAction('unknown_service_detected', {
+        tenantId,
+        phone: from,
+        raw,
+      });
+      return {
+        handled: true,
+        reply:
+          'Bu isimde bir hizmetimizi bulamadım. İsterseniz mevcut işlemlerimizden birini söyleyebilirsiniz.',
+      };
+    }
+
+    const parsed = parseDateTimeTR(raw);
+    if (parsed?.hasTime) {
+      session.pendingStartAt = toIstanbulIso(clampToFuture(parsed.dateUtc));
+      if (!session.draft.startAt && session.pendingStartAt)
+        session.draft.startAt = session.pendingStartAt;
+      session.pendingDateOnly = undefined;
+    } else if (parsed?.dateOnly) {
+      session.pendingDateOnly = parsed.dateOnly;
+    }
+
+    if (!isNoPreferenceStaff(raw))
+
+    if (
+      !session.draft.serviceId &&
+      (this.hasStrongCarryoverServiceCue(raw) || contextualBookingFollowUp)
+    ) {
+      this.tryCarryRecentServiceContext(session, services);
+    }
+
+    if (!session.draft.serviceId) {
+      session.state = WaState.WAIT_SERVICE;
+      this.saveSession(key, session);
+      return {
+        handled: true,
+        reply: await this.naturalAsk(session, 'service', {
+          services,
+          staff,
+          business,
+        }),
+      };
+    }
+
+    session.state = WaState.WAIT_DATETIME;
+    this.saveSession(key, session);
+    return {
+      handled: true,
+      reply: await this.naturalAsk(session, 'datetime', {
+        services,
+        staff,
+        business,
+      }),
+    };
+  }
+
+  private handleLegacyDeterministicInfoEntry(opts: {
+    session: SessionState;
+    raw: string;
+    msg: string;
+    services: any[];
+    business: any;
+    isVoice: boolean;
+  }): { handled: boolean; reply: string } {
+    const { session, raw, msg, services, business, isVoice } = opts;
+
+    if (looksLikePriceQuestion(msg)) {
+      const svc = this.resolveServiceForVoiceFollowUp(
+        session,
+        raw,
+        services,
+        isVoice,
+      );
+      if (svc) {
+        const name = String(svc.name || 'Hizmet');
+        const price = svc.price ?? null;
+        const dur = svc.duration ?? null;
+
+        const parts: string[] = [];
+        if (price != null) parts.push(`${name} fiyatı: ${price}₺`);
+        else
+          parts.push(`${name} için fiyat bilgisi henüz eklenmemiş görünüyor.`);
+        if (dur != null) parts.push(`Süre: ${dur} dk`);
+
+        const nudge = this.shouldNudgeBooking(session)
+          ? '\nİstersen “randevu oluştur” diyebilirsin, hemen ayarlayalım.'
+          : '';
+        return { handled: true, reply: parts.join(' • ') + nudge };
+      }
+      return {
+        handled: true,
+        reply: 'Hangi hizmetin fiyatını soruyorsun? (Örn: “Hizmet adı fiyatı”)',
+      };
+    }
+
+    if (looksLikeServiceListRequest(msg)) {
+      const list = servicesToTextShort(services, {
+        limit: isVoice ? 4 : 6,
+        compact: isVoice,
+      });
+      if (!list) {
+        return {
+          handled: true,
+          reply: 'Şu an hizmet listem görünmüyor 😕 Birazdan tekrar dener misin?',
+        };
+      }
+      return {
+        handled: true,
+        reply: isVoice
+          ? `Sunabildiğimiz işlemlerden bazıları: ${list}. Hangisi için randevu istersiniz?`
+          : `Hizmetlerimiz:\n${list}`,
+      };
+    }
+
+    if (looksLikeAddressOrHours(msg)) {
+      const addr =
+        business?.address || business?.fullAddress || business?.location || null;
+      const parts: string[] = [];
+      if (addr) parts.push(`📍 Adres: ${String(addr)}`);
+      parts.push(`⏰ Çalışma saatleri: Her gün 08:00 - 22:00`);
+      return { handled: true, reply: parts.join('\n') };
+    }
+
+    return { handled: false, reply: '' };
+  }
+
+  private async handleLegacyProcedureLlmEntry(opts: {
+    session: SessionState;
+    raw: string;
+    msg: string;
+    services: any[];
+    staff: any[];
+    business: any;
+    isVoice: boolean;
+    learnedCustomerSummary: string;
+  }): Promise<{ handled: boolean; reply: string }> {
+    const {
+      session,
+      raw,
+      msg,
+      services,
+      staff,
+      business,
+      isVoice,
+      learnedCustomerSummary,
+    } = opts;
+
+    if (!looksLikeProcedureQuestion(msg)) {
+      return { handled: false, reply: '' };
+    }
+
+    const svc = this.resolveServiceForVoiceFollowUp(
+      session,
+      raw,
+      services,
+      isVoice,
+    );
+    session.lastTopic = 'procedure';
+    session.lastServiceId = svc && svc.id ? String(svc.id) : undefined;
+
+    let out = await this.answerWithLLM({
+      raw,
+      business,
+      services,
+      staff,
+      history: this.getRecentHistory(session, 8),
+      mode: 'procedure',
+      focusService: svc
+        ? {
+            name: String(svc.name || ''),
+            duration: svc.duration,
+            price: svc.price,
+          }
+        : null,
+      learnedCustomerSummary,
+    });
+
+    if (!out) {
+      return {
+        handled: true,
+        reply: svc
+          ? this.procedureTemplateForService(
+              String(svc.name || ''),
+              svc.duration,
+              svc.price,
+            )
+          : 'Genel olarak süreç hizmetin türüne göre değişir. Hangi işlem veya hizmet için soruyorsun?',
+      };
+    }
+
+    if (
+      session.lastAssistantReply &&
+      normalizeTr(session.lastAssistantReply) === normalizeTr(out)
+    ) {
+      const alt = await this.answerWithLLM({
+        raw,
+        business,
+        services,
+        staff,
+        history: this.getRecentHistory(session, 8),
+        mode: 'procedure',
+        focusService: svc
+          ? {
+              name: String(svc.name || ''),
+              duration: svc.duration,
+              price: svc.price,
+            }
+          : null,
+        avoidRepeat: true,
+        learnedCustomerSummary,
+      });
+      if (
+        alt &&
+        normalizeTr(alt) !== normalizeTr(session.lastAssistantReply || '')
+      )
+        out = alt;
+      else
+        out = 'Tam olarak hangi hizmet veya konu hakkında bilgi almak istiyorsunuz?';
+    }
+
+    return { handled: true, reply: out };
+  }
+
+  private async handleLegacyGeneralLlmFallback(opts: {
+    session: SessionState;
+    raw: string;
+    services: any[];
+    staff: any[];
+    business: any;
+    learnedCustomerSummary: string;
+  }): Promise<string> {
+    const { session, raw, services, staff, business, learnedCustomerSummary } =
+      opts;
+
+    session.lastTopic = 'general';
+
+    let llmAnswer = await this.answerWithLLM({
+      raw,
+      business,
+      services,
+      staff,
+      history: this.getRecentHistory(session, 8),
+      mode: 'general',
+      focusService: null,
+      learnedCustomerSummary,
+    });
+
+    if (!llmAnswer) llmAnswer = '';
+
+    if (
+      llmAnswer &&
+      session.lastAssistantReply &&
+      normalizeTr(session.lastAssistantReply) === normalizeTr(llmAnswer)
+    ) {
+      const alt = await this.answerWithLLM({
+        raw,
+        business,
+        services,
+        staff,
+        history: this.getRecentHistory(session, 8),
+        mode: 'general',
+        focusService: null,
+        avoidRepeat: true,
+        learnedCustomerSummary,
+      });
+      llmAnswer =
+        alt && normalizeTr(alt) !== normalizeTr(session.lastAssistantReply || '')
+          ? alt
+          : 'Tam olarak ne öğrenmek istiyorsunuz?';
+    }
+
+    return llmAnswer || 'Anlayamadım 😕 İstersen ne yapmak istediğini kısaca söyle.';
+  }
+
+  private async handleLegacyAppointmentInfoFollowUp(opts: {
+    key: string;
+    session: SessionState;
+    tenantId: string;
+    from: string;
+    raw: string;
+  }): Promise<{ handled: boolean; reply: string }> {
+    const { key, session, tenantId, from, raw } = opts;
+    if (session.state !== WaState.WAIT_INFO_APPT_PICK) {
+      return { handled: false, reply: '' };
+    }
+
+    const list = await this.safeListUpcomingAppointmentsByPhone(tenantId, from, 9);
+    if (!list?.length) {
+      this.softResetSession(session, tenantId, from, {
+        keepIdempotency: true,
+      });
+      this.saveSession(key, session);
+      return { handled: true, reply: 'Şu an görünen bir randevun yok 🙂' };
+    }
+
+    const tHepsi2 = normalizeTr(raw);
+    if (
+      (tHepsi2.includes('hepsi') ||
+        tHepsi2.includes('hepsini') ||
+        tHepsi2.includes('tum') ||
+        tHepsi2.includes('tumu') ||
+        tHepsi2.includes('tümünü')) &&
+      list.length
+    ) {
+      session.editMode = 'CANCEL';
+      session.cancelAllIds = list.map((a) => String(a.id));
+      session.pendingSummary = `Toplam ${list.length} randevunuz var. Hepsini iptal etmek istediğinize emin misiniz?`;
+      session.state = WaState.WAIT_CONFIRM;
+      this.saveSession(key, session);
+      return {
+        handled: true,
+        reply: `${session.pendingSummary}\n${this.softYesNoHint(from + 'all')}`,
+      };
+    }
+
+    const parsedInfo = parseDateTimeTR(raw);
+    if (parsedInfo?.hasDate && !parsedInfo.hasTime) {
+      const dateOnly = parsedInfo.dateOnly;
+      if (dateOnly) {
+        const hits = list.filter((a) => this.isSameTrDate(a.startAtIso, dateOnly));
+        if (hits.length === 1) {
+          const a = hits[0];
+          this.softResetSession(session, tenantId, from, {
+            keepIdempotency: true,
+          });
+          this.saveSession(key, session);
+          return {
+            handled: true,
+            reply:
+              `Randevun şurada görünüyor:\n` +
+              `• ${prettyIstanbul(a.startAtIso)}` +
+              (a.serviceName ? ` • ${a.serviceName}` : '') +
+              (a.staffName ? ` • ${a.staffName}` : ''),
+          };
+        }
+      }
+    }
+
+    const picked = this.pickFromSuggestions(session, raw);
+    let apptId = picked?.type === 'appt' ? picked.apptId : '';
+    if (!apptId) {
+      const ord = extractOrdinal1to9(raw);
+      if (ord != null) {
+        const idx = Math.max(0, Math.min(8, ord - 1));
+        apptId = list[idx]?.id ? String(list[idx].id) : '';
+      }
+    }
+
+    const chosen = list.find((a) => String(a.id) === String(apptId)) || null;
+    if (!chosen) {
+      session.lastSuggestions = {
+        type: 'appt',
+        items: list.slice(0, 9).map((a) => ({
+          label: `${prettyIstanbul(a.startAtIso)}${a.serviceName ? ` • ${a.serviceName}` : ''}${a.staffName ? ` • ${a.staffName}` : ''}`,
+          value: String(a.id),
+        })),
+        ts: Date.now(),
+      };
+      const lines = session.lastSuggestions.items
+        .map((it, i) => `${i + 1}) ${it.label}`)
+        .join('\n');
+      this.saveSession(key, session);
+      return {
+        handled: true,
+        reply: `Şu randevularını görüyorum:\n${lines}\n\nHangisi? 1-9 söylemen yeterli 🙂`,
+      };
+    }
+
+    this.softResetSession(session, tenantId, from, {
+      keepIdempotency: true,
+    });
+    this.saveSession(key, session);
+    return {
+      handled: true,
+      reply:
+        `Randevun şurada görünüyor:\n` +
+        `• ${prettyIstanbul(chosen.startAtIso)}` +
+        (chosen.serviceName ? ` • ${chosen.serviceName}` : '') +
+        (chosen.staffName ? ` • ${chosen.staffName}` : ''),
+    };
+  }
+
+  private async handleLegacyUpcomingAppointmentEntry(opts: {
+    key: string;
+    session: SessionState;
+    tenantId: string;
+    from: string;
+    raw: string;
+    globalIntent: GlobalIntent;
+    voiceBookingIntentOverride: boolean;
+  }): Promise<{ handled: boolean; reply: string }> {
+    const {
+      key,
+      session,
+      tenantId,
+      from,
+      raw,
+      globalIntent,
+      voiceBookingIntentOverride,
+    } = opts;
+
+    if (
+      !(
+        (!voiceBookingIntentOverride && looksLikeUpcomingQuery(raw)) ||
+        globalIntent === 'LIST_APPOINTMENTS' ||
+        globalIntent === 'MY_APPOINTMENT_TIME'
+      )
+    ) {
+      return { handled: false, reply: '' };
+    }
+
+    const list = await this.safeListUpcomingAppointmentsByPhone(tenantId, from, 6);
+    if (!list?.length) {
+      return { handled: true, reply: 'Şu an görünen bir randevun yok 🙂' };
+    }
+
+    if (list.length === 1) {
+      const a = list[0];
+      return {
+        handled: true,
+        reply:
+          `Randevun şurada görünüyor:\n` +
+          `• ${prettyIstanbul(a.startAtIso)}` +
+          (a.serviceName ? ` • ${a.serviceName}` : '') +
+          (a.staffName ? ` • ${a.staffName}` : ''),
+      };
+    }
+
+    session.state = WaState.WAIT_INFO_APPT_PICK;
+    session.lastSuggestions = {
+      type: 'appt',
+      items: list.slice(0, 9).map((a) => ({
+        label: `${prettyIstanbul(a.startAtIso)}${a.serviceName ? ` • ${a.serviceName}` : ''}${a.staffName ? ` • ${a.staffName}` : ''}`,
+        value: String(a.id),
+      })),
+      ts: Date.now(),
+    };
+    this.saveSession(key, session);
+
+    const lines = session.lastSuggestions.items
+      .map((it, i) => `${i + 1}) ${it.label}`)
+      .join('\n');
+    return {
+      handled: true,
+      reply: `Randevuların:\n${lines}\n\nHangisiyle ilgiliydi? 1-9 söyleyebilir ya da “yarın/bugün” diyebilirsin 🙂`,
+    };
+  }
+
+  private async handleLegacyEditOrCancelEntry(opts: {
+    key: string;
+    session: SessionState;
+    tenantId: string;
+    from: string;
+    raw: string;
+    globalIntent: GlobalIntent;
+    voiceBookingIntentOverride: boolean;
+  }): Promise<{ handled: boolean; reply: string }> {
+    const {
+      key,
+      session,
+      tenantId,
+      from,
+      raw,
+      globalIntent,
+      voiceBookingIntentOverride,
+    } = opts;
+
+    const explicitEditIntent =
+      !voiceBookingIntentOverride &&
+      (globalIntent === 'CANCEL_BOOKING' ||
+        globalIntent === 'RESCHEDULE_BOOKING' ||
+        looksLikeCancelIntent(raw) ||
+        looksLikeRescheduleIntent(raw) ||
+        looksLikeGenericEditIntent(raw));
+    const explicitNewBookingIntent = looksLikeBookingIntent(raw) && !explicitEditIntent;
+    if (!explicitEditIntent || explicitNewBookingIntent) {
+      return { handled: false, reply: '' };
+    }
+
+    const list = await this.safeListUpcomingAppointmentsByPhone(tenantId, from, 6);
+    if (!list?.length) {
+      return { handled: true, reply: 'Görünen bir randevunuz yok 🙂' };
+    }
+
+    if (list.length === 1) {
+      const a = list[0];
+
+      session.targetAppointmentId = String(a.id);
+      session.targetApptSnapshot = {
+        serviceId: String(a.serviceId),
+        staffId: String(a.staffId),
+        startAtIso: String(a.startAtIso),
+        serviceName: a.serviceName,
+        staffName: a.staffName,
+      };
+      session.editBaseStartAtIso = String(a.startAtIso);
+      session.draft.serviceId = String(a.serviceId);
+      session.draft.staffId = String(a.staffId);
+      session.draft.startAt = String(a.startAtIso);
+
+      if (looksLikeCancelIntent(raw)) {
+        session.editMode = 'CANCEL';
+        session.pendingSummary = this.buildEditCancelSummary(
+          session.targetApptSnapshot,
+        );
+        session.state = WaState.WAIT_CONFIRM;
+        this.saveSession(key, session);
+        return {
+          handled: true,
+          reply: `${session.pendingSummary}\n${this.softYesNoHint(from + session.targetAppointmentId)}`,
+        };
+      }
+
+      const tNorm = normalizeTr(raw);
+      const onlyTime = parseTimeBest(tNorm);
+      const parsed = parseDateTimeTR(raw);
+
+      if (onlyTime && !hasExplicitDateMarker(tNorm)) {
+        const baseIso = session.editBaseStartAtIso || String(a.startAtIso);
+        const iso = buildIsoWithSameDate(baseIso, onlyTime.hh, onlyTime.mm);
+        if (iso) {
+          session.editMode = 'RESCHEDULE';
+          session.draft.startAt = iso;
+
+          const pre = await this.precheckAndPrepareConfirm({
+            tenantId,
+            draft: session.draft,
+            ignoreAppointmentId: session.targetAppointmentId,
+          });
+
+          if (!pre.ok) {
+            session.draft.startAt = String(a.startAtIso);
+            session.state = WaState.WAIT_DATETIME;
+            this.saveSession(key, session);
+            return {
+              handled: true,
+              reply: 'O saati ayarlayamadım 😕 Başka bir saat söyler misin?',
+            };
+          }
+
+          session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
+          session.state = WaState.WAIT_CONFIRM;
+          this.saveSession(key, session);
+          return {
+            handled: true,
+            reply: `${session.pendingSummary}\n${this.softYesNoHint(from + iso)}`,
+          };
+        }
+      }
+
+      if (parsed?.hasTime) {
+        const iso = toIstanbulIso(clampToFuture(parsed.dateUtc));
+        session.editMode = 'RESCHEDULE';
+        session.draft.startAt = iso;
+
+        const pre = await this.precheckAndPrepareConfirm({
+          tenantId,
+          draft: session.draft,
+          ignoreAppointmentId: session.targetAppointmentId,
+        });
+
+        if (!pre.ok) {
+          session.draft.startAt = String(a.startAtIso);
+          session.state = WaState.WAIT_DATETIME;
+          this.saveSession(key, session);
+          return {
+            handled: true,
+            reply: 'O zamanı ayarlayamadım 😕 Başka bir tarih/saat söyler misin?',
+          };
+        }
+
+        session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
+        session.state = WaState.WAIT_CONFIRM;
+        this.saveSession(key, session);
+        return {
+          handled: true,
+          reply: `${session.pendingSummary}\n${this.softYesNoHint(from + iso)}`,
+        };
+      }
+
+      if (parsed?.dateOnly) {
+        session.editMode = 'RESCHEDULE';
+        session.pendingDateOnly = parsed.dateOnly;
+        session.state = WaState.WAIT_DATETIME;
+        this.saveSession(key, session);
+        return {
+          handled: true,
+          reply: this.humanizeAskTimeOnly(raw),
+        };
+      }
+
+      session.state = WaState.WAIT_EDIT_ACTION;
+      this.saveSession(key, session);
+      return {
+        handled: true,
+        reply: this.askEditActionMenu(session, a),
+      };
+    }
+
+    const tInline = normalizeTr(raw);
+    const mPick = tInline.match(/^\s*([1-9])\s*[\.\)\-:]?/);
+    const parsedInline = parseDateTimeTR(raw);
+    const onlyTimeInline = parseTimeBest(tInline);
+
+    if (mPick && (parsedInline?.hasTime || onlyTimeInline)) {
+      const idx = Math.max(0, Math.min(8, Number(mPick[1]) - 1));
+      const chosen = list[idx];
+
+      if (chosen) {
+        session.targetAppointmentId = String(chosen.id);
+        session.targetApptSnapshot = {
+          serviceId: String(chosen.serviceId),
+          staffId: String(chosen.staffId),
+          startAtIso: String(chosen.startAtIso),
+          serviceName: chosen.serviceName,
+          staffName: chosen.staffName,
+        };
+        session.editBaseStartAtIso = String(chosen.startAtIso);
+        session.draft.serviceId = String(chosen.serviceId);
+        session.draft.staffId = String(chosen.staffId);
+
+        if (looksLikeCancelIntent(raw)) {
+          session.editMode = 'CANCEL';
+          session.pendingSummary = this.buildEditCancelSummary(
+            session.targetApptSnapshot,
+          );
+          session.state = WaState.WAIT_CONFIRM;
+          return {
+            handled: true,
+            reply: `${session.pendingSummary}\n${this.softYesNoHint(from + session.targetAppointmentId)}`,
+          };
+        }
+
+        let iso: string | null = null;
+        if (onlyTimeInline && !hasExplicitDateMarker(tInline)) {
+          const baseIso = session.editBaseStartAtIso || String(chosen.startAtIso);
+          iso = buildIsoWithSameDate(baseIso, onlyTimeInline.hh, onlyTimeInline.mm);
+        } else if (parsedInline?.hasTime) {
+          iso = toIstanbulIso(clampToFuture(parsedInline.dateUtc));
+        }
+
+        if (iso) {
+          session.editMode = 'RESCHEDULE';
+          session.draft.startAt = iso;
+
+          const pre = await this.precheckAndPrepareConfirm({
+            tenantId,
+            draft: session.draft,
+            ignoreAppointmentId: session.targetAppointmentId,
+          });
+
+          if (!pre.ok) {
+            session.draft.startAt = String(chosen.startAtIso);
+            session.state = WaState.WAIT_DATETIME;
+            this.saveSession(key, session);
+            return {
+              handled: true,
+              reply: 'O saat dolu gibi 😕 Başka bir saat söyler misin?',
+            };
+          }
+
+          session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
+          session.state = WaState.WAIT_CONFIRM;
+          this.saveSession(key, session);
+          return {
+            handled: true,
+            reply: `${session.pendingSummary}\n${this.softYesNoHint(from + iso)}`,
+          };
+        }
+      }
+    }
+
+    session.state = WaState.WAIT_APPT_PICK;
+    this.saveSession(key, session);
+    return {
+      handled: true,
+      reply: this.askAppointmentPickMenu(session, list),
+    };
   }
 
   // =========================
@@ -378,63 +1252,23 @@ export class BookingCoreService {
       String(opts.channel || opts.source || '').toLowerCase() === 'voice';
     const key = `${tenantId}:${from}`;
     const session = this.getOrInitSession(key, tenantId, from);
-    session.draft.customerPhone = from;
-    session.draft.channel = isVoice ? 'VOICE' : 'WHATSAPP';
-    if (isVoice) {
-      session.draft.callSessionId = String(
-        opts.callId || opts.streamSid || session.draft.callSessionId || '',
-      ).trim();
-      session.draft.messageSessionId = undefined;
-    } else {
-      session.draft.messageSessionId = String(
-        opts.messageSessionId ||
-          session.draft.messageSessionId ||
-          `${tenantId}:${from}`,
-      ).trim();
-      session.draft.callSessionId = undefined;
-    }
-
-    // log incoming user message for observability
-    this.logAction('incoming', {
-      tenantId,
-      phone: from,
-      state: session.state,
-      text: raw,
-    });
-
-    if (this.isLikelyDuplicateInbound(session, raw)) {
-      const prev =
-        session.lastAssistantReply || session.lastAssistantText || 'Tamam 👍';
-      return this.safeReply(session, prev);
-    }
-
-    if (isVoice && this.isLikelyAssistantEcho(session, raw)) {
-      this.logAction('assistant_echo_ignored', {
-        tenantId,
-        phone: from,
-        text: raw,
-      });
-      return '';
-    }
-
-    this.recordHistory(session, 'user', raw);
-    const contextualBookingFollowUp = this.isContextualBookingFollowUp(
+    const prelude = this.runReplyPrelude({
       session,
+      tenantId,
+      from,
       raw,
+      msg,
       isVoice,
-    );
-    if (looksLikeBookingIntent(raw) || contextualBookingFollowUp)
-      session.recentIntentContext = 'booking';
-    else if (/personel|uzman|biri olsun|kim uygun|kim var/i.test(raw))
-      session.recentIntentContext = 'staff_preference';
-    else if (
-      looksLikePriceQuestion(msg) ||
-      looksLikeServiceListRequest(msg) ||
-      looksLikeAddressOrHours(msg)
-    )
-      session.recentIntentContext = 'info';
-    else if (!this.shouldPreserveRecentIntentContext(session, raw))
-      session.recentIntentContext = 'general';
+      messageSessionId: opts.messageSessionId,
+      callId: opts.callId,
+      streamSid: opts.streamSid,
+    });
+    if (prelude.shouldReturnEarly) {
+      return prelude.useSafeReply
+        ? this.safeReply(session, prelude.reply)
+        : prelude.reply;
+    }
+    const { contextualBookingFollowUp } = prelude;
 
     // ====================================================
     // Follow-up memory: if the caller asks about the recent reservation, answer without starting a new booking flow
@@ -502,117 +1336,16 @@ export class BookingCoreService {
     }
 
     try {
-      // =========================
-      // ✅ Follow-up: user asked appointment info, we are waiting a pick or a date hint
-      // =========================
-      if (session.state === WaState.WAIT_INFO_APPT_PICK) {
-        const list = await this.safeListUpcomingAppointmentsByPhone(
+      const legacyAppointmentInfoFollowUp =
+        await this.handleLegacyAppointmentInfoFollowUp({
+          key,
+          session,
           tenantId,
           from,
-          9,
-        );
-        if (!list?.length) {
-          this.softResetSession(session, tenantId, from, {
-            keepIdempotency: true,
-          });
-          this.saveSession(key, session);
-          return this.safeReply(session, 'Şu an görünen bir randevun yok 🙂');
-        }
-
-        // If user wants to cancel all appointments ("hepsi", "hepsini", "tum", "tumu", "tümünü")
-        const tHepsi2 = normalizeTr(raw);
-        if (
-          (tHepsi2.includes('hepsi') ||
-            tHepsi2.includes('hepsini') ||
-            tHepsi2.includes('tum') ||
-            tHepsi2.includes('tumu') ||
-            tHepsi2.includes('tümünü')) &&
-          list &&
-          list.length
-        ) {
-          // switch to cancel mode for all appointments
-          session.editMode = 'CANCEL';
-          session.cancelAllIds = list.map((a) => String(a.id));
-          session.pendingSummary = `Toplam ${list.length} randevunuz var. Hepsini iptal etmek istediğinize emin misiniz?`;
-          session.state = WaState.WAIT_CONFIRM;
-          // Do not set targetAppointmentId for bulk cancel
-          this.saveSession(key, session);
-          return this.safeReply(
-            session,
-            `${session.pendingSummary}\n${this.softYesNoHint(from + 'all')}`,
-          );
-        }
-
-        // If user answered with a date hint like "yarın/bugün/01.03"
-        const parsedInfo = parseDateTimeTR(raw);
-        if (parsedInfo?.hasDate && !parsedInfo.hasTime) {
-          const dateOnly = parsedInfo.dateOnly; // YYYY-MM-DD
-          if (dateOnly) {
-            const hits = list.filter((a) =>
-              this.isSameTrDate(a.startAtIso, dateOnly),
-            );
-            if (hits.length === 1) {
-              const a = hits[0];
-              this.softResetSession(session, tenantId, from, {
-                keepIdempotency: true,
-              });
-              this.saveSession(key, session);
-              const line =
-                `Randevun şurada görünüyor:\n` +
-                `• ${prettyIstanbul(a.startAtIso)}` +
-                (a.serviceName ? ` • ${a.serviceName}` : '') +
-                (a.staffName ? ` • ${a.staffName}` : '');
-              return this.safeReply(session, line);
-            }
-          }
-        }
-
-        // Or pick by menu number / suggestion
-        const picked = this.pickFromSuggestions(session, raw);
-        let apptId = picked?.type === 'appt' ? picked.apptId : '';
-
-        if (!apptId) {
-          // try ordinal "2. randevu" style
-          const ord = extractOrdinal1to9(raw);
-          if (ord != null) {
-            const idx = Math.max(0, Math.min(8, ord - 1));
-            apptId = list[idx]?.id ? String(list[idx].id) : '';
-          }
-        }
-
-        const chosen =
-          list.find((a) => String(a.id) === String(apptId)) || null;
-        if (!chosen) {
-          // re-ask
-          session.lastSuggestions = {
-            type: 'appt',
-            items: list.slice(0, 9).map((a) => ({
-              label: `${prettyIstanbul(a.startAtIso)}${a.serviceName ? ` • ${a.serviceName}` : ''}${a.staffName ? ` • ${a.staffName}` : ''}`,
-              value: String(a.id),
-            })),
-            ts: Date.now(),
-          };
-          const lines = session.lastSuggestions.items
-            .map((it, i) => `${i + 1}) ${it.label}`)
-            .join('\n');
-          this.saveSession(key, session);
-          return this.safeReply(
-            session,
-            `Şu randevularını görüyorum:\n${lines}\n\nHangisi? 1-9 söylemen yeterli 🙂`,
-          );
-        }
-
-        this.softResetSession(session, tenantId, from, {
-          keepIdempotency: true,
+          raw,
         });
-        this.saveSession(key, session);
-
-        const line =
-          `Randevun şurada görünüyor:\n` +
-          `• ${prettyIstanbul(chosen.startAtIso)}` +
-          (chosen.serviceName ? ` • ${chosen.serviceName}` : '') +
-          (chosen.staffName ? ` • ${chosen.staffName}` : '');
-        return this.safeReply(session, line);
+      if (legacyAppointmentInfoFollowUp.handled) {
+        return this.safeReply(session, legacyAppointmentInfoFollowUp.reply);
       }
 
       if (isCancel(msg)) {
@@ -685,7 +1418,7 @@ export class BookingCoreService {
         : contextualBookingFollowUp ||
             preIntentContinuity.inferredBookingContinuation
           ? 'NEW_BOOKING'
-          : this.detectGlobalIntent(raw);
+          : detectLegacyGlobalIntent(raw);
       const shouldExtractSlots =
         session.state !== WaState.IDLE ||
         globalIntent === 'NEW_BOOKING' ||
@@ -778,54 +1511,18 @@ export class BookingCoreService {
       }
 
 
-      // =========================
-      // ✅ Upcoming appointment inquiry (IDLE iken)
-      // =========================
-      if (
-        (!voiceBookingIntentOverride && looksLikeUpcomingQuery(raw)) ||
-        globalIntent === 'LIST_APPOINTMENTS' ||
-        globalIntent === 'MY_APPOINTMENT_TIME'
-      ) {
-        const list = await this.safeListUpcomingAppointmentsByPhone(
+      const legacyUpcomingAppointmentEntry =
+        await this.handleLegacyUpcomingAppointmentEntry({
+          key,
+          session,
           tenantId,
           from,
-          6,
-        );
-
-        if (!list?.length) {
-          return this.safeReply(session, 'Şu an görünen bir randevun yok 🙂');
-        }
-
-        if (list.length === 1) {
-          const a = list[0];
-          const line =
-            `Randevun şurada görünüyor:\n` +
-            `• ${prettyIstanbul(a.startAtIso)}` +
-            (a.serviceName ? ` • ${a.serviceName}` : '') +
-            (a.staffName ? ` • ${a.staffName}` : '');
-
-          return this.safeReply(session, line);
-        }
-
-        // ✅ if multiple: move to WAIT_INFO_APPT_PICK so follow-ups like "yarınaydı" won't fall into LLM
-        session.state = WaState.WAIT_INFO_APPT_PICK;
-        session.lastSuggestions = {
-          type: 'appt',
-          items: list.slice(0, 9).map((a) => ({
-            label: `${prettyIstanbul(a.startAtIso)}${a.serviceName ? ` • ${a.serviceName}` : ''}${a.staffName ? ` • ${a.staffName}` : ''}`,
-            value: String(a.id),
-          })),
-          ts: Date.now(),
-        };
-        this.saveSession(key, session);
-
-        const lines = session.lastSuggestions.items
-          .map((it, i) => `${i + 1}) ${it.label}`)
-          .join('\n');
-        return this.safeReply(
-          session,
-          `Randevuların:\n${lines}\n\nHangisiyle ilgiliydi? 1-9 söyleyebilir ya da “yarın/bugün” diyebilirsin 🙂`,
-        );
+          raw,
+          globalIntent,
+          voiceBookingIntentOverride,
+        });
+      if (legacyUpcomingAppointmentEntry.handled) {
+        return this.safeReply(session, legacyUpcomingAppointmentEntry.reply);
       }
 
       // =========================
@@ -833,488 +1530,77 @@ export class BookingCoreService {
       // Kullanıcı açıkça iptal/değiştir niyeti belirtmediği sürece edit akışına girmeyiz.
       // Yeni randevu isteği (booking intent) her zaman önceliklidir.
       // =========================
-      const explicitEditIntent =
-        !voiceBookingIntentOverride &&
-        (globalIntent === 'CANCEL_BOOKING' ||
-          globalIntent === 'RESCHEDULE_BOOKING' ||
-          looksLikeCancelIntent(raw) ||
-          looksLikeRescheduleIntent(raw) ||
-          looksLikeGenericEditIntent(raw));
-      const explicitNewBookingIntent =
-        looksLikeBookingIntent(raw) && !explicitEditIntent;
-      if (explicitEditIntent && !explicitNewBookingIntent) {
-        const list = await this.safeListUpcomingAppointmentsByPhone(
-          tenantId,
-          from,
-          6,
-        );
-        if (!list?.length)
-          return this.safeReply(session, 'Görünen bir randevunuz yok 🙂');
-
-        // Tek randevu varsa: direkt hedefi set et
-        if (list.length === 1) {
-          const a = list[0];
-
-          session.targetAppointmentId = String(a.id);
-          session.targetApptSnapshot = {
-            serviceId: String(a.serviceId),
-            staffId: String(a.staffId),
-            startAtIso: String(a.startAtIso),
-            serviceName: a.serviceName,
-            staffName: a.staffName,
-          };
-          // set base date for time-only edits
-          session.editBaseStartAtIso = String(a.startAtIso);
-
-          // draft'ı mevcut randevudan doldur (edit yapacağız)
-          session.draft.serviceId = String(a.serviceId);
-          session.draft.staffId = String(a.staffId);
-          session.draft.startAt = String(a.startAtIso);
-
-          // 1) Kullanıcı direkt iptal dediyse -> direkt onay
-          if (looksLikeCancelIntent(raw)) {
-            session.editMode = 'CANCEL';
-            session.pendingSummary = this.buildEditCancelSummary(
-              session.targetApptSnapshot,
-            );
-            session.state = WaState.WAIT_CONFIRM;
-            this.saveSession(key, session);
-            return this.safeReply(
-              session,
-              `${session.pendingSummary}\n${this.softYesNoHint(from + session.targetAppointmentId)}`,
-            );
-          }
-
-          // 2) Kullanıcı direkt yeni saat/tarih yazdıysa -> direkt onay akışına al
-          const tNorm = normalizeTr(raw);
-          const onlyTime = parseTimeBest(tNorm);
-          const parsed = parseDateTimeTR(raw);
-
-          // “saat 11:00” gibi (tarih yoksa): aynı gün kalsın
-          if (onlyTime && !hasExplicitDateMarker(tNorm)) {
-            const baseIso = session.editBaseStartAtIso || String(a.startAtIso);
-            const iso = buildIsoWithSameDate(baseIso, onlyTime.hh, onlyTime.mm);
-            if (iso) {
-              session.editMode = 'RESCHEDULE';
-              session.draft.startAt = iso;
-
-              const pre = await this.precheckAndPrepareConfirm({
-                tenantId,
-                draft: session.draft,
-                ignoreAppointmentId: session.targetAppointmentId,
-              });
-
-              if (!pre.ok) {
-                session.draft.startAt = String(a.startAtIso);
-                session.state = WaState.WAIT_DATETIME;
-                this.saveSession(key, session);
-                return this.safeReply(
-                  session,
-                  'O saati ayarlayamadım 😕 Başka bir saat söyler misin?',
-                );
-              }
-
-              session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
-              session.state = WaState.WAIT_CONFIRM;
-              this.saveSession(key, session);
-              return this.safeReply(
-                session,
-                `${session.pendingSummary}\n${this.softYesNoHint(from + iso)}`,
-              );
-            }
-          }
-
-          // parsed içinde tarih+saat varsa
-          if (parsed?.hasTime) {
-            const iso = toIstanbulIso(clampToFuture(parsed.dateUtc));
-            session.editMode = 'RESCHEDULE';
-            session.draft.startAt = iso;
-
-            const pre = await this.precheckAndPrepareConfirm({
-              tenantId,
-              draft: session.draft,
-              ignoreAppointmentId: session.targetAppointmentId,
-            });
-
-            if (!pre.ok) {
-              session.draft.startAt = String(a.startAtIso);
-              session.state = WaState.WAIT_DATETIME;
-              this.saveSession(key, session);
-              return this.safeReply(
-                session,
-                'O zamanı ayarlayamadım 😕 Başka bir tarih/saat söyler misin?',
-              );
-            }
-
-            session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
-            session.state = WaState.WAIT_CONFIRM;
-            this.saveSession(key, session);
-            return this.safeReply(
-              session,
-              `${session.pendingSummary}\n${this.softYesNoHint(from + iso)}`,
-            );
-          }
-
-          // sadece tarih geldiyse -> saat sor
-          if (parsed?.dateOnly) {
-            session.editMode = 'RESCHEDULE';
-            session.pendingDateOnly = parsed.dateOnly;
-            session.state = WaState.WAIT_DATETIME;
-            this.saveSession(key, session);
-            return this.safeReply(session, this.humanizeAskTimeOnly(raw));
-          }
-
-          // 3) Net değilse menü sor
-          session.state = WaState.WAIT_EDIT_ACTION;
-          this.saveSession(key, session);
-          return this.safeReply(session, this.askEditActionMenu(session, a));
-        }
-
-        // ✅ IDLE iken: "2. randevuyu 13:00 yap" gibi tek mesajda hem seçim hem saat varsa menüyü atla
-        const tInline = normalizeTr(raw);
-        const mPick = tInline.match(/^\s*([1-9])\s*[\.\)\-:]?/); // "1." "2)" "3-" gibi
-        const parsedInline = parseDateTimeTR(raw);
-        const onlyTimeInline = parseTimeBest(tInline);
-
-        if (mPick && (parsedInline?.hasTime || onlyTimeInline)) {
-          const idx = Math.max(0, Math.min(8, Number(mPick[1]) - 1));
-          const chosen = list[idx];
-
-          if (chosen) {
-            // hedef randevu snapshot
-            session.targetAppointmentId = String(chosen.id);
-            session.targetApptSnapshot = {
-              serviceId: String(chosen.serviceId),
-              staffId: String(chosen.staffId),
-              startAtIso: String(chosen.startAtIso),
-              serviceName: chosen.serviceName,
-              staffName: chosen.staffName,
-            };
-            // set base date for time-only edits
-            session.editBaseStartAtIso = String(chosen.startAtIso);
-
-            // draft'ı randevudan doldur
-            session.draft.serviceId = String(chosen.serviceId);
-            session.draft.staffId = String(chosen.staffId);
-
-            // iptal dediyse direkt iptal onayı
-            if (looksLikeCancelIntent(raw)) {
-              session.editMode = 'CANCEL';
-              session.pendingSummary = this.buildEditCancelSummary(
-                session.targetApptSnapshot,
-              );
-              session.state = WaState.WAIT_CONFIRM;
-              this.saveSession(key, session);
-              return this.safeReply(
-                session,
-                `${session.pendingSummary}\n${this.softYesNoHint(from + session.targetAppointmentId)}`,
-              );
-            }
-
-            // saat/tarih değişikliği
-            let iso: string | null = null;
-
-            // sadece saat verdiyse mevcut tarihle birleştir
-            if (onlyTimeInline && !hasExplicitDateMarker(tInline)) {
-              const baseIso =
-                session.editBaseStartAtIso || String(chosen.startAtIso);
-              iso = buildIsoWithSameDate(
-                baseIso,
-                onlyTimeInline.hh,
-                onlyTimeInline.mm,
-              );
-            } else if (parsedInline?.hasTime) {
-              iso = toIstanbulIso(clampToFuture(parsedInline.dateUtc));
-            }
-
-            if (iso) {
-              session.editMode = 'RESCHEDULE';
-              session.draft.startAt = iso;
-
-              const pre = await this.precheckAndPrepareConfirm({
-                tenantId,
-                draft: session.draft,
-                ignoreAppointmentId: session.targetAppointmentId,
-              });
-
-              if (!pre.ok) {
-                // doluysa tekrar saat sor
-                session.draft.startAt = String(chosen.startAtIso);
-                session.state = WaState.WAIT_DATETIME;
-                this.saveSession(key, session);
-                return this.safeReply(
-                  session,
-                  'O saat dolu gibi 😕 Başka bir saat söyler misin?',
-                );
-              }
-
-              session.pendingSummary = `Değişiklik özeti:\n${pre.summary.replace(/^Randevu özeti:\n?/, '')}`;
-              session.state = WaState.WAIT_CONFIRM;
-              this.saveSession(key, session);
-              return this.safeReply(
-                session,
-                `${session.pendingSummary}\n${this.softYesNoHint(from + iso)}`,
-              );
-            }
-          }
-        }
-
-        // Birden fazla randevu -> seçtir
-        session.state = WaState.WAIT_APPT_PICK;
-        this.saveSession(key, session);
-        return this.safeReply(
-          session,
-          this.askAppointmentPickMenu(session, list),
-        );
+      const legacyEditOrCancelEntry = await this.handleLegacyEditOrCancelEntry({
+        key,
+        session,
+        tenantId,
+        from,
+        raw,
+        globalIntent,
+        voiceBookingIntentOverride,
+      });
+      if (legacyEditOrCancelEntry.handled) {
+        return this.safeReply(session, legacyEditOrCancelEntry.reply);
       }
 
       // =========================
       // Booking intent
       // =========================
-      if (
-        globalIntent === 'NEW_BOOKING' ||
-        looksLikeBookingIntent(raw) ||
-        contextualBookingFollowUp
-      ) {
-        const svc = this.detectServiceFromMessage(raw, services);
-        if (svc?.id) session.draft.serviceId = String(svc.id);
-        if (svc?.name) session.lastServiceName = String(svc.name);
-        session.recentIntentContext = 'booking';
-
-        if (
-          !svc?.id &&
-          !this.isGenericBookingIntentWithoutService(raw, services) &&
-          this.hasExplicitUnknownServiceRequest(raw, services)
-        ) {
-          this.logAction('unknown_service_detected', {
-            tenantId,
-            phone: from,
-            raw,
-          });
-          return this.safeReply(
-            session,
-            'Bu isimde bir hizmetimizi bulamadım. İsterseniz mevcut işlemlerimizden birini söyleyebilirsiniz.',
-          );
-        }
-
-        const parsed = parseDateTimeTR(raw);
-        if (parsed?.hasTime) {
-          session.pendingStartAt = toIstanbulIso(clampToFuture(parsed.dateUtc));
-          if (!session.draft.startAt && session.pendingStartAt)
-            session.draft.startAt = session.pendingStartAt;
-          session.pendingDateOnly = undefined;
-        } else if (parsed?.dateOnly) {
-          session.pendingDateOnly = parsed.dateOnly;
-        }
-
-        if (!isNoPreferenceStaff(raw))
-
-        if (
-          !session.draft.serviceId &&
-          (this.hasStrongCarryoverServiceCue(raw) || contextualBookingFollowUp)
-        ) {
-          this.tryCarryRecentServiceContext(session, services);
-        }
-
-        if (!session.draft.serviceId) {
-          session.state = WaState.WAIT_SERVICE;
-          this.saveSession(key, session);
-          return this.safeReply(
-            session,
-            await this.naturalAsk(session, 'service', {
-              services,
-              staff,
-              business,
-            }),
-          );
-        }
-
-        session.state = WaState.WAIT_DATETIME;
-        this.saveSession(key, session);
-        return this.safeReply(
-          session,
-          await this.naturalAsk(session, 'datetime', { services, staff, business }),
-        );
+      const legacyBookingEntry = await this.handleLegacyBookingEntry({
+        key,
+        session,
+        tenantId,
+        from,
+        raw,
+        services,
+        staff,
+        business,
+        globalIntent,
+        contextualBookingFollowUp,
+      });
+      if (legacyBookingEntry.handled) {
+        return this.safeReply(session, legacyBookingEntry.reply);
       }
 
       // =========================
       // info flows
       // =========================
-      if (looksLikePriceQuestion(msg)) {
-        const svc = this.resolveServiceForVoiceFollowUp(
-          session,
-          raw,
-          services,
-          isVoice,
-        );
-        if (svc) {
-          const name = String(svc.name || 'Hizmet');
-          const price = svc.price ?? null;
-          const dur = svc.duration ?? null;
-
-          const parts: string[] = [];
-          if (price != null) parts.push(`${name} fiyatı: ${price}₺`);
-          else
-            parts.push(
-              `${name} için fiyat bilgisi henüz eklenmemiş görünüyor.`,
-            );
-          if (dur != null) parts.push(`Süre: ${dur} dk`);
-
-          const nudge = this.shouldNudgeBooking(session)
-            ? '\nİstersen “randevu oluştur” diyebilirsin, hemen ayarlayalım.'
-            : '';
-          return this.safeReply(session, parts.join(' • ') + nudge);
-        }
-        return this.safeReply(
-          session,
-          'Hangi hizmetin fiyatını soruyorsun? (Örn: “Hizmet adı fiyatı”)',
-        );
-      }
-
-      if (looksLikeServiceListRequest(msg)) {
-        const list = servicesToTextShort(services, {
-          limit: isVoice ? 4 : 6,
-          compact: isVoice,
-        });
-        if (!list)
-          return this.safeReply(
-            session,
-            'Şu an hizmet listem görünmüyor 😕 Birazdan tekrar dener misin?',
-          );
-        return this.safeReply(
-          session,
-          isVoice
-            ? `Sunabildiğimiz işlemlerden bazıları: ${list}. Hangisi için randevu istersiniz?`
-            : `Hizmetlerimiz:\n${list}`,
-        );
-      }
-
-      if (looksLikeAddressOrHours(msg)) {
-        const addr =
-          business?.address ||
-          business?.fullAddress ||
-          business?.location ||
-          null;
-        const parts: string[] = [];
-        if (addr) parts.push(`📍 Adres: ${String(addr)}`);
-        parts.push(`⏰ Çalışma saatleri: Her gün 08:00 - 22:00`);
-        return this.safeReply(session, parts.join('\n'));
-      }
-
-      if (looksLikeProcedureQuestion(msg)) {
-        const svc = this.resolveServiceForVoiceFollowUp(
-          session,
-          raw,
-          services,
-          isVoice,
-        );
-        session.lastTopic = 'procedure';
-        session.lastServiceId = svc && svc.id ? String(svc.id) : undefined;
-
-        let out = await this.answerWithLLM({
-          raw,
-          business,
-          services,
-          staff,
-          history: this.getRecentHistory(session, 8),
-          mode: 'procedure',
-          focusService: svc
-            ? {
-                name: String(svc.name || ''),
-                duration: svc.duration,
-                price: svc.price,
-              }
-            : null,
-          learnedCustomerSummary: learned?.summary || '',
-        });
-
-        if (!out) {
-          const base = svc
-            ? this.procedureTemplateForService(
-                String(svc.name || ''),
-                svc.duration,
-                svc.price,
-              )
-            : 'Genel olarak süreç hizmetin türüne göre değişir. Hangi işlem veya hizmet için soruyorsun?';
-          return this.safeReply(session, base);
-        }
-
-        if (
-          session.lastAssistantReply &&
-          normalizeTr(session.lastAssistantReply) === normalizeTr(out)
-        ) {
-          const alt = await this.answerWithLLM({
-            raw,
-            business,
-            services,
-            staff,
-            history: this.getRecentHistory(session, 8),
-            mode: 'procedure',
-            focusService: svc
-              ? {
-                  name: String(svc.name || ''),
-                  duration: svc.duration,
-                  price: svc.price,
-                }
-              : null,
-            avoidRepeat: true,
-            learnedCustomerSummary: learned?.summary || '',
-          });
-          if (
-            alt &&
-            normalizeTr(alt) !== normalizeTr(session.lastAssistantReply || '')
-          )
-            out = alt;
-          else
-            out =
-              'Tam olarak hangi hizmet veya konu hakkında bilgi almak istiyorsunuz?';
-        }
-
-        return this.safeReply(session, out);
-      }
-
-      session.lastTopic = 'general';
-
-      let llmAnswer = await this.answerWithLLM({
+      const legacyDeterministicInfo = this.handleLegacyDeterministicInfoEntry({
+        session,
         raw,
+        msg,
+        services,
         business,
+        isVoice,
+      });
+      if (legacyDeterministicInfo.handled) {
+        return this.safeReply(session, legacyDeterministicInfo.reply);
+      }
+
+      const legacyProcedureInfo = await this.handleLegacyProcedureLlmEntry({
+        session,
+        raw,
+        msg,
         services,
         staff,
-        history: this.getRecentHistory(session, 8),
-        mode: 'general',
-        focusService: null,
+        business,
+        isVoice,
         learnedCustomerSummary: learned?.summary || '',
       });
-
-      if (!llmAnswer) llmAnswer = '';
-
-      if (
-        llmAnswer &&
-        session.lastAssistantReply &&
-        normalizeTr(session.lastAssistantReply) === normalizeTr(llmAnswer)
-      ) {
-        const alt = await this.answerWithLLM({
-          raw,
-          business,
-          services,
-          staff,
-          history: this.getRecentHistory(session, 8),
-          mode: 'general',
-          focusService: null,
-          avoidRepeat: true,
-          learnedCustomerSummary: learned?.summary || '',
-        });
-        llmAnswer =
-          alt &&
-          normalizeTr(alt) !== normalizeTr(session.lastAssistantReply || '')
-            ? alt
-            : 'Tam olarak ne öğrenmek istiyorsunuz?';
+      if (legacyProcedureInfo.handled) {
+        return this.safeReply(session, legacyProcedureInfo.reply);
       }
 
       return this.safeReply(
         session,
-        llmAnswer ||
-          'Anlayamadım 😕 İstersen ne yapmak istediğini kısaca söyle.',
+        await this.handleLegacyGeneralLlmFallback({
+          session,
+          raw,
+          services,
+          staff,
+          business,
+          learnedCustomerSummary: learned?.summary || '',
+        }),
       );
     } catch (e: any) {
       this.logger.error(`[AgentService.replyText] ${e?.message || e}`);
@@ -2221,6 +2507,16 @@ export class BookingCoreService {
       return successMsg;
     }
 
+    const nextMissingSlot = this.getNextMissingSlot(session);
+    if (nextMissingSlot === 'datetime') {
+      session.state = WaState.WAIT_DATETIME;
+      return await this.naturalAsk(session, 'datetime', {
+        services,
+        staff,
+        business: null,
+      });
+    }
+
     session.state = WaState.WAIT_SERVICE;
     return await this.naturalAsk(session, 'service', {
       services,
@@ -2497,7 +2793,6 @@ ${staffNamesShort || 'YOK'}
     const serviceName =
       services.find((item: any) => String(item?.id) === String(draft.serviceId))
         ?.name ||
-      session.bookingDraftSnapshot?.serviceName ||
       session.lastServiceName ||
       'randevu';
     const whenText = draft.startAt ? prettyIstanbul(draft.startAt) : null;
@@ -3780,34 +4075,17 @@ ${historyText}
 
   private updateContinuityMemory(
     session: SessionState,
-    services: any[],
-    staff: any[],
+    _services: any[],
+    _staff: any[],
   ) {
     const draft = session.draft || ({} as BookingDraft);
-    const service = draft.serviceId
-      ? services.find((s: any) => String(s?.id) === String(draft.serviceId))
-      : null;
-    const staffHit = draft.staffId
-      ? staff.find((p: any) => String(p?.id) === String(draft.staffId))
-      : null;
 
     if (draft.serviceId) session.lastServiceId = String(draft.serviceId);
-    if (service?.name) session.lastServiceName = String(service.name);
     if (draft.staffId) session.recentStaffId = String(draft.staffId);
-    if (staffHit?.name) session.recentStaffName = String(staffHit.name);
 
     session.bookingDraftSnapshot = {
       serviceId: draft.serviceId ? String(draft.serviceId) : undefined,
-      serviceName:
-        service?.name != null
-          ? String(service.name)
-          : session.lastServiceName || undefined,
       staffId: draft.staffId ? String(draft.staffId) : undefined,
-      staffName:
-        staffHit?.name != null
-          ? String(staffHit.name)
-          : draft.requestedStaffName || session.recentStaffName || undefined,
-      customerName: draft.customerName ? String(draft.customerName) : undefined,
       startAt: draft.startAt ? String(draft.startAt) : undefined,
       updatedAt: Date.now(),
     };
@@ -3822,7 +4100,6 @@ ${historyText}
     const hit = services.find((s: any) => String(s?.id) === recentServiceId);
     if (!hit?.id) return;
     session.draft.serviceId = String(hit.id);
-    if (hit?.name) session.lastServiceName = String(hit.name);
   }
 
   private tryCarryRecentStaffContext(session: SessionState, staff: any[]) {
@@ -3835,7 +4112,6 @@ ${historyText}
     if (!hit?.id) return;
     session.draft.staffId = String(hit.id);
     session.draft.requestedStaffName = undefined;
-    if (hit?.name) session.recentStaffName = String(hit.name);
   }
 
   private resolveContinuityContext(opts: {
@@ -3884,7 +4160,6 @@ ${historyText}
         const hit = services.find((item: any) => String(item?.id) === sourceId);
         if (hit?.id) {
           draft.serviceId = String(hit.id);
-          if (hit?.name) session.lastServiceName = String(hit.name);
           resolution.usedRecentService = true;
           resolution.usedDraftSnapshot = Boolean(fromSnapshot);
           resolution.inferredBookingContinuation = true;
@@ -3908,7 +4183,6 @@ ${historyText}
         if (hit?.id) {
           draft.staffId = String(hit.id);
           draft.requestedStaffName = undefined;
-          if (hit?.name) session.recentStaffName = String(hit.name);
           resolution.usedRecentStaff = true;
           resolution.usedDraftSnapshot =
             resolution.usedDraftSnapshot ||
@@ -3929,11 +4203,7 @@ ${historyText}
     ) {
       resolution.preservedIntent = 'booking';
       resolution.inferredBookingContinuation = true;
-    } else if (
-      resolution.shortFollowUp &&
-      session.recentIntentContext &&
-      session.recentIntentContext !== 'general'
-    ) {
+    } else if (resolution.shortFollowUp && session.recentIntentContext) {
       resolution.preservedIntent = session.recentIntentContext;
     }
 
@@ -4159,27 +4429,6 @@ ${historyText}
     return isGenericBookingIntentPhrase(raw);
   }
 
-  private detectGlobalIntent(raw: string): GlobalIntent {
-    const t = normalizeTr(raw);
-    if (!t) return 'UNKNOWN';
-
-    if (looksLikeCancelIntent(raw)) return 'CANCEL_BOOKING';
-    if (looksLikeRescheduleIntent(raw) || looksLikeGenericEditIntent(raw))
-      return 'RESCHEDULE_BOOKING';
-    if (looksLikeUpcomingQuery(raw)) return 'LIST_APPOINTMENTS';
-    if (looksLikeBookingIntent(raw)) return 'NEW_BOOKING';
-
-    if (
-      looksLikeProcedureQuestion(raw) ||
-      looksLikePriceQuestion(raw) ||
-      looksLikeServiceListRequest(raw) ||
-      looksLikeAddressOrHours(raw)
-    ) {
-      return 'FAQ_GENERAL';
-    }
-
-    return 'UNKNOWN';
-  }
   // =========================
   // Matching
   // =========================
@@ -4253,8 +4502,11 @@ ${historyText}
       /\b(hayir|hayır)\b/.test(normalizeTr(raw)) &&
       /\b(degil|değil)\b/.test(normalizeTr(raw));
     if (hasCorrection) {
-      session.suggestedServiceId = undefined;
-      session.suggestedServiceName = undefined;
+      const suggestedServiceCleanupPatch = buildSuggestedServiceCleanupPatch();
+      session.suggestedServiceId =
+        suggestedServiceCleanupPatch.nextSuggestedServiceId;
+      session.suggestedServiceName =
+        suggestedServiceCleanupPatch.nextSuggestedServiceName;
     }
 
 
@@ -4287,27 +4539,38 @@ ${historyText}
           if (merged) nextIso = merged;
         }
       }
-      draft.startAt = nextIso;
-      session.pendingStartAt = draft.startAt;
-      session.pendingDateOnly = undefined;
+      const dateTimeCommitPatch = buildDateTimeCommitPatch(nextIso);
+      draft.startAt = dateTimeCommitPatch.nextStartAt;
+      session.pendingStartAt = dateTimeCommitPatch.nextPendingStartAt;
+      if (dateTimeCommitPatch.clearPendingDateOnly) {
+        session.pendingDateOnly = undefined;
+      }
     } else if (parsed?.dateOnly) {
       // Keep existing time when caller only updates date ("yarın", "perşembe").
       let mergedWithExistingTime = false;
       if (draft.startAt) {
-        const [yy, mm, dd] = parsed.dateOnly.split('-').map(Number);
-        const prev = getTrPartsFromIso(draft.startAt);
-        if (prev) {
-          const mergedUtc = new Date(
-            Date.UTC(yy, mm - 1, dd, prev.hh - 3, prev.mm, 0, 0),
-          );
-          draft.startAt = toIstanbulIso(clampToFuture(mergedUtc));
-          session.pendingStartAt = draft.startAt;
-          session.pendingDateOnly = undefined;
+        const mergedIso = mergeDateOnlyWithExistingTime(
+          parsed.dateOnly,
+          draft.startAt,
+          {
+            getTrPartsFromIso,
+            clampToFuture,
+            toIstanbulIso,
+          },
+        );
+        if (mergedIso) {
+          const dateTimeCommitPatch = buildDateTimeCommitPatch(mergedIso);
+          draft.startAt = dateTimeCommitPatch.nextStartAt;
+          session.pendingStartAt = dateTimeCommitPatch.nextPendingStartAt;
+          if (dateTimeCommitPatch.clearPendingDateOnly) {
+            session.pendingDateOnly = undefined;
+          }
           mergedWithExistingTime = true;
         }
       }
       if (!mergedWithExistingTime) {
-        session.pendingDateOnly = parsed.dateOnly;
+        const pendingDateOnlyPatch = buildPendingDateOnlyPatch(parsed.dateOnly);
+        session.pendingDateOnly = pendingDateOnlyPatch.nextPendingDateOnly;
       }
     }
 
@@ -4340,38 +4603,18 @@ ${historyText}
   }
 
   private detectStaffFromMessage(msg: string, staff: any[]) {
-    const t = normalizePersonName(msg);
-    const words = t.split(/\s+/).filter(Boolean);
-    const staffNames = (p: any) =>
-      [
-        normalizePersonName(String(p?.name || '')),
-        normalizePersonName(String(p?.fullName || '')),
-      ].filter(Boolean);
-    return (
-      staff.find((p: any) => staffNames(p).some((name) => name === t)) ||
-      staff.find((p: any) => {
-        const names = staffNames(p);
-        return names.some((name) =>
-          words.some((w) => w.length >= 3 && name.includes(w)),
-        );
-      }) ||
-      null
-    );
+    return detectStaffFromMessageHelper(msg, staff);
   }
 
   private mergePendingDateOnlyWithTime(
     pendingDateOnly: string | undefined,
     rawNorm: string,
   ): string | null {
-    if (!pendingDateOnly) return null;
-    const onlyTime = parseTimeBest(rawNorm);
-    if (!onlyTime) return null;
-
-    const [yy, mm, dd] = pendingDateOnly.split('-').map(Number);
-    const dUtc = new Date(
-      Date.UTC(yy, mm - 1, dd, onlyTime.hh - 3, onlyTime.mm, 0, 0),
-    );
-    return toIstanbulIso(clampToFuture(dUtc));
+    return mergePendingDateOnlyWithTimeHelper(pendingDateOnly, rawNorm, {
+      parseTimeBest,
+      clampToFuture,
+      toIstanbulIso,
+    });
   }
 
   private shouldCaptureCustomerName(
@@ -4465,7 +4708,8 @@ ${historyText}
       return null;
     }
 
-    session.draft.customerName = candidate;
+    const customerNameCommitPatch = buildCustomerNameCommitPatch(candidate);
+    session.draft.customerName = customerNameCommitPatch.nextCustomerName;
     this.logAction('customer_name_saved', {
       tenantId: session.draft.tenantId,
       phone: session.draft.customerPhone,
@@ -4610,39 +4854,7 @@ ${historyText}
   }
 
   private detectServiceFromMessage(raw: string, services: any[]) {
-    if (!services || services.length === 0) return null;
-    const t = normalizeTr(raw);
-    if (!t) return null;
-
-    const direct = services.find((s: any) => {
-      const variants = [...buildServiceMatchVariants(String(s?.name || ''))];
-      return variants.some(
-        (name) =>
-          name && name.length >= 3 && (t.includes(name) || name.includes(t)),
-      );
-    });
-    if (direct) return direct;
-
-    const userWords = t.split(/\s+/).filter((w) => w.length >= 3);
-    if (!userWords.length) return null;
-
-    let best: any = null;
-    let bestScore = 0;
-    for (const s of services) {
-      const svcWords = [...buildServiceMatchVariants(String(s?.name || ''))]
-        .flatMap((name) => name.split(/\s+/))
-        .filter((w) => w.length >= 3);
-      if (!svcWords.length) continue;
-      const overlap = svcWords.filter((w) => userWords.includes(w)).length;
-      const score = overlap / svcWords.length;
-      if (overlap >= 1 && score > bestScore) {
-        best = s;
-        bestScore = score;
-      }
-    }
-
-    if (bestScore >= 0.45) return best;
-    return null;
+    return detectServiceFromMessage(raw, services);
   }
 
   private hasExplicitUnknownServiceRequest(raw: string, services: any[]) {
@@ -4770,36 +4982,6 @@ function normalizePersonName(s: string) {
     .replace(/\s+/g, ' ')
     .trim();
   return t;
-}
-
-function buildServiceMatchVariants(name: string) {
-  const normalized = normalizeTr(name);
-  const variants = new Set<string>();
-  if (!normalized) return variants;
-
-  variants.add(normalized);
-  variants.add(
-    normalized
-      .replace(
-        /\b(epilasyon|bakimi|bakım|uygulamasi|uygulaması|islemi|işlemi)\b/g,
-        '',
-      )
-      .replace(/\s+/g, ' ')
-      .trim(),
-  );
-  variants.add(
-    normalized
-      .replace(/\b(protez|tirnak|tırnak)\b/g, '')
-      .replace(/\s+/g, ' ')
-      .trim(),
-  );
-
-  for (const part of normalized.split(/\s+/)) {
-    if (part.length >= 4) variants.add(part);
-  }
-
-  variants.delete('');
-  return variants;
 }
 
 function isNoPreferenceStaff(raw: string) {
@@ -5184,52 +5366,6 @@ function looksLikeExplicitNameStatement(raw: string) {
     t.startsWith('isim ') ||
     t.startsWith('ismim ')
   );
-}
-
-function extractName(raw: string) {
-  const s = stripVoiceContextMetadata(raw);
-  if (!s) return null;
-  if (s.length < 2) return null;
-  if (/^\+?\d[\d\s-]+$/.test(s)) return null;
-
-  const t = normalizeTr(s);
-  const banned = [
-    'fark etmez',
-    'farketmez',
-    'siz secin',
-    'siz seçin',
-    'herhangi',
-    'kim olursa',
-    'istemiyorum',
-    'vazgectim',
-    'vazgec',
-    'merhaba',
-    'selam',
-    'slm',
-    'sa',
-    'hey',
-    'günaydın',
-    'iyi akşamlar',
-    'iyi aksamlar',
-    'iyi geceler',
-    'nasilsin',
-    'naber',
-    'iptal',
-    'tamam',
-    'onayla',
-    'onayliyorum',
-    'evet',
-    'hayir',
-    'hayır',
-  ];
-  if (banned.some((b) => t === normalizeTr(b) || t.includes(normalizeTr(b))))
-    return null;
-
-  const m = s.match(/^(ben\s+)?([a-zA-ZÇĞİÖŞÜçğıöşü\s]{2,})$/);
-  if (!m) return null;
-  const name = m[2].trim();
-  if (name.length < 2) return null;
-  return name;
 }
 
 function extractVoiceCustomerName(rawText: string): string | null {

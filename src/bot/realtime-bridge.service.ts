@@ -233,6 +233,7 @@ class VoiceBridgeSession {
   private readonly speechFramesForBargeIn = 8;
   private readonly assistantGuardMs = 650;
   private readonly openingGreetingBargeInGuardMs = 900;
+  private readonly minPlaybackBargeInMs = 1000;
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
@@ -903,9 +904,17 @@ class VoiceBridgeSession {
     this.updateAmbientNoise(rms);
 
     if (this.assistantSpeaking) {
-      this.cancelAssistantAudio('barge_in');
-      this.resetAssistantPlaybackState('force_barge_in');
-      this.lastBargeInAt = Date.now();
+      const now = Date.now();
+      const playbackElapsedMs = this.assistantStartedAt
+        ? now - this.assistantStartedAt
+        : 0;
+      const protectionRemaining = this.getAssistantProtectionMsRemaining();
+      // TEMP: Disable barge-in cancellation entirely until voice playback is stable.
+      this.logBargeInSuppressed(
+        'temp_disabled',
+        `playbackElapsedMs=${playbackElapsedMs} protectionMsRemaining=${protectionRemaining} rms=${this.formatEnergy(rms)}`,
+      );
+      return;
     }
 
     this.openingGreetingProtectionUntil = 0;
@@ -1403,48 +1412,13 @@ class VoiceBridgeSession {
     turnId?: number,
   ): Promise<string> {
     const effectiveTurnId = turnId ?? this.activeTurnId;
-    const effectiveUserText = await this.buildAgentInputWithVoiceContext(
-      userText,
-      effectiveTurnId,
-    );
+    // TEMP MVP: pass the normalized transcript directly to VoiceConversationService.
+    const effectiveUserText = userText;
 
     this.markTiming('agent_processing_start', {
       turnId: effectiveTurnId,
       inputLength: effectiveUserText.length,
     });
-
-    const deterministicReply = this.buildDeterministicShortReply(userText);
-    if (deterministicReply) {
-      if (
-        this.greeted &&
-        (deterministicReply.key === 'greeting' ||
-          deterministicReply.key === 'voice_check') &&
-        Date.now() - this.lastGreetingSuppressedAt > 1200
-      ) {
-        this.lastGreetingSuppressedAt = Date.now();
-        this.parentLogger.log(
-          `[voice] greeting_repeat_suppressed callId=${this.meta.callId} key=${deterministicReply.key}`,
-        );
-      }
-      this.parentLogger.log(
-        `[voice] deterministic_bypass_triggered callId=${this.meta.callId} key=${JSON.stringify(deterministicReply.key)} text="${deterministicReply.reply}"`,
-      );
-      this.markTiming('deterministic_bypass', {
-        turnId,
-        key: deterministicReply.key,
-        replyLength: deterministicReply.reply.length,
-      });
-      this.markTiming('agent_reply_ready', {
-        turnId,
-        source: 'deterministic_bypass',
-        replyLength: deterministicReply.reply.length,
-      });
-      this.logTurnLatency('agent_reply_ready', turnId, {
-        source: 'deterministic_bypass',
-        replyLength: deterministicReply.reply.length,
-      });
-      return deterministicReply.reply;
-    }
 
     const customerPhone = normalizePhone(
       this.meta.from ||
@@ -1485,7 +1459,6 @@ class VoiceBridgeSession {
       }
 
       const reply = extractReplyText(result);
-      this.syncMemoryFromBookingSession(customerPhone);
 
       this.parentLogger.log(
         `[voice] agent reply callId=${this.meta.callId} customerPhone=${customerPhone} reply="${reply}"`,
@@ -1518,23 +1491,8 @@ class VoiceBridgeSession {
   }
 
   private async speakReply(replyText: string, turnId?: number) {
-    const openingGreeting = RealtimeBridgeService.openingGreeting;
-    const rewritten = rewriteAgentReplyForVoice(replyText);
-    const spoken =
-      rewritten === openingGreeting
-        ? openingGreeting
-        : shortenReplyForPhone(rewritten);
-    if (rewritten !== replyText) {
-      this.parentLogger.log(
-        `[voice] rewrite_shortened callId=${this.meta.callId} stage=rewrite replyBefore=${JSON.stringify(replyText)} replyAfter=${JSON.stringify(rewritten)}`,
-      );
-    }
-    if (spoken !== rewritten) {
-      this.parentLogger.log(
-        `[voice] rewrite_shortened callId=${this.meta.callId} stage=phone replyBefore=${JSON.stringify(rewritten)} replyAfter=${JSON.stringify(spoken)}`,
-      );
-    }
-    const clean = sanitizeReplyForVoice(spoken);
+    // TEMP MVP: send the agent reply to TTS with only minimal sanitization.
+    const clean = sanitizeReplyForVoice(replyText);
     const effectiveTurnId = turnId ?? this.activeTurnId;
     if (!clean) {
       this.parentLogger.warn(
@@ -1733,39 +1691,6 @@ class VoiceBridgeSession {
         this.currentTtsAbort = null;
       }
     }
-  }
-
-  private buildDeterministicShortReply(
-    userText: string,
-  ): { key: string; reply: string } | null {
-    const t = normalizeTurkishForTime(userText);
-    if (!t) return null;
-
-    const deterministicReplies: Array<{
-      key: string;
-      reply: string;
-      patterns: RegExp[];
-    }> = [
-      {
-        key: 'voice_check',
-        reply: 'Evet, sizi duyuyorum.',
-        patterns: [
-          /^sesim geliyor mu[.!? ]*$/,
-          /^beni duyuyor musunuz[.!? ]*$/,
-          /^sesim duyuluyor mu[.!? ]*$/,
-          /^ses geliyor mu[.!? ]*$/,
-          /^beni duyabiliyor musunuz[.!? ]*$/,
-        ],
-      },
-    ];
-
-    for (const item of deterministicReplies) {
-      if (item.patterns.some((pattern) => pattern.test(t))) {
-        return { key: item.key, reply: item.reply };
-      }
-    }
-
-    return null;
   }
 
   private async getOrCreateTtsAudio(
@@ -2411,67 +2336,6 @@ function detectRecentIntent(
     return 'info';
   }
   return 'general';
-}
-
-export function rewriteAgentReplyForVoice(replyText: string) {
-  let text = sanitizeReplyForVoice(String(replyText || '').trim())
-    .replace(/yazar mısınız/gi, 'söyler misiniz')
-    .replace(/yazar misiniz/gi, 'söyler misiniz')
-    .replace(/\(E\/H\)/gi, '')
-    .replace(/\bE\/H\b/gi, '');
-  const lower = text.toLocaleLowerCase('tr-TR');
-
-  if (lower.startsWith('randevu özeti:')) {
-    return 'Bilgiler doğruysa onaylayayım mı?';
-  }
-
-  if (lower.includes('o saat dolu') || lower.includes('şunlar uygun')) {
-    const slots = [
-      ...text.matchAll(/\b(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\b/g),
-    ].slice(0, 3);
-
-    if (slots.length) {
-      const spoken = slots
-        .map((m) => formatDateTimeForSpeech(`${m[1]} ${m[2]}`))
-        .join(', ');
-      return `O saat dolu. En yakın uygun saatler ${spoken}. İsterseniz başka bir saat de söyleyebilirsiniz.`;
-    }
-
-    return 'O saat dolu. Yakın bir saat söyleyebilir misiniz?';
-  }
-
-  if (
-    lower.includes('randevu tamam') ||
-    lower.includes('randevunuz oluşturuldu') ||
-    lower.includes('kayıt:')
-  ) {
-    const m = text.match(/\b(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\b/);
-    if (m) {
-      return `Tamamdır, randevunuzu ${formatDateTimeForSpeech(`${m[1]} ${m[2]}`)} için oluşturdum.`;
-    }
-    return 'Tamamdır, randevunuzu oluşturdum.';
-  }
-
-  if (
-    lower.includes('randevu oluştururken bir şey ters gitti') ||
-    lower.includes('başka bir saat dener misin') ||
-    lower.includes('bir hata oldu')
-  ) {
-    return 'Randevu oluşturulamadı. Başka bir saat deneyelim.';
-  }
-
-  text = text
-    .replace(/[•]/g, ' ')
-    .replace(/[()]/g, ' ')
-    .replace(/\s*\/\s*/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  text = humanizeBookingSummaryForSpeech(text);
-  text = humanizeConfirmationForSpeech(text);
-  text = formatDateTimeForSpeech(text);
-
-  return text;
 }
 
 export function shortenReplyForPhone(text: string) {
