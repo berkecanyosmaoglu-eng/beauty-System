@@ -1,29 +1,27 @@
 import { Module } from '@nestjs/common';
 import { PrismaModule } from '../prisma/prisma.module';
-import { BookingCoreService } from './shared/booking-core.service';
 import { ChatAgentService } from './chat-agent.service';
 import { VoiceAgentService } from './voice-agent.service';
-import { AgentService } from './agent.service';
-import { VoiceConversationService } from './voice/voice-conversation.service';
-import { ChatConversationService } from './chat/chat-conversation.service';
+import { BookingModule } from '../booking/booking.module';
+import { KnowledgeService } from '../knowledge/knowledge.service';
+import { ChatbotBrainService } from '../chatbot/chatbot-brain.service';
+import { JarvisBrainService } from '../jarvis/jarvis-brain.service';
 
 @Module({
-  imports: [PrismaModule],
+  imports: [PrismaModule, BookingModule],
   providers: [
-    BookingCoreService,
-    VoiceConversationService,
-    ChatConversationService,
+    KnowledgeService,
+    ChatbotBrainService,
+    JarvisBrainService,
     ChatAgentService,
     VoiceAgentService,
-    AgentService,
   ],
   exports: [
-    BookingCoreService,
-    VoiceConversationService,
-    ChatConversationService,
+    KnowledgeService,
+    ChatbotBrainService,
+    JarvisBrainService,
     ChatAgentService,
     VoiceAgentService,
-    AgentService,
   ],
 })
 export class AgentModule {}

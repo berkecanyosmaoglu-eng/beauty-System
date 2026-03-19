@@ -1,13 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { AgentReplyRequest } from './shared/agent-types';
-import { ChatConversationService } from './chat/chat-conversation.service';
+import { ChatbotBrainService } from '../chatbot/chatbot-brain.service';
 
 @Injectable()
 export class ChatAgentService {
-  constructor(private readonly chatConversation: ChatConversationService) {}
+  constructor(private readonly chatbotBrain: ChatbotBrainService) {}
 
   replyText(payload: AgentReplyRequest): Promise<string> {
-    return this.chatConversation.handleTurn(payload);
+    return this.chatbotBrain.reply(payload);
   }
 
   handleIncomingMessage(payload: AgentReplyRequest): Promise<string> {
