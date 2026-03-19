@@ -1,21 +1,20 @@
 import { Injectable } from '@nestjs/common';
-import { BookingCoreService } from './shared/booking-core.service';
 import { AgentReplyRequest } from './shared/agent-types';
-import { withAgentChannel } from './shared/agent-helpers';
 import { shapeVoiceAgentReply } from './shared/voice-response-policy';
+import { VoiceConversationService } from './voice/voice-conversation.service';
 
 @Injectable()
 export class VoiceAgentService {
-  constructor(private readonly bookingCore: BookingCoreService) {}
+  constructor(
+    private readonly voiceConversation: VoiceConversationService,
+  ) {}
 
   async prewarmVoiceContext(tenantId: string): Promise<void> {
-    await this.bookingCore.prewarmVoiceContext(tenantId);
+    await this.voiceConversation.prewarmVoiceContext(tenantId);
   }
 
   async replyText(payload: AgentReplyRequest): Promise<string> {
-    const reply = await this.bookingCore.replyText(
-      withAgentChannel(payload, 'voice'),
-    );
+    const reply = await this.voiceConversation.handleTurn(payload);
     return shapeVoiceAgentReply(reply);
   }
 
