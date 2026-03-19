@@ -20,6 +20,9 @@ type BookingDraft = {
   tenantId: string;
   customerPhone: string;
   customerName?: string | null;
+  channel?: 'VOICE' | 'WHATSAPP';
+  messageSessionId?: string;
+  callSessionId?: string;
 
   serviceId?: string;
   staffId?: string;
@@ -363,6 +366,9 @@ export class BookingCoreService {
     text: string;
     channel?: string;
     source?: string;
+    messageSessionId?: string;
+    callId?: string;
+    streamSid?: string;
   }): Promise<string> {
     const { tenantId, from } = opts;
     const raw = (opts.text ?? '').trim();
@@ -372,6 +378,21 @@ export class BookingCoreService {
       String(opts.channel || opts.source || '').toLowerCase() === 'voice';
     const key = `${tenantId}:${from}`;
     const session = this.getOrInitSession(key, tenantId, from);
+    session.draft.customerPhone = from;
+    session.draft.channel = isVoice ? 'VOICE' : 'WHATSAPP';
+    if (isVoice) {
+      session.draft.callSessionId = String(
+        opts.callId || opts.streamSid || session.draft.callSessionId || '',
+      ).trim();
+      session.draft.messageSessionId = undefined;
+    } else {
+      session.draft.messageSessionId = String(
+        opts.messageSessionId ||
+          session.draft.messageSessionId ||
+          `${tenantId}:${from}`,
+      ).trim();
+      session.draft.callSessionId = undefined;
+    }
 
     // log incoming user message for observability
     this.logAction('incoming', {
@@ -2821,6 +2842,101 @@ ${staffNamesShort || 'YOK'}
   // =========================
   // CREATE
   // =========================
+  private buildMessageConversationId(draft: BookingDraft) {
+    return String(
+      draft.messageSessionId ||
+        `${draft.tenantId}:${draft.customerPhone || 'unknown-customer'}`,
+    ).trim();
+  }
+
+  private buildMessageSessionId(conversationId: string) {
+    const hash = crypto
+      .createHash('sha256')
+      .update(conversationId)
+      .digest('hex');
+    return `msg_${hash}`;
+  }
+
+  private async ensureAppointmentSessionLinks(args: {
+    tenantId: string;
+    customerId: string;
+    customerPhone: string;
+    draft: BookingDraft;
+  }) {
+    const now = new Date();
+
+    if (args.draft.channel === 'VOICE') {
+      const callSessionId = String(args.draft.callSessionId || '').trim();
+      if (!callSessionId) {
+        return {
+          channel: 'VOICE' as const,
+          messageSessionId: null,
+          callSessionId: null,
+        };
+      }
+
+      const callSession =
+        await (this.prisma as any).call_sessions.upsert({
+          where: { id: callSessionId },
+          update: {
+            customerId: args.customerId,
+            from: args.customerPhone,
+            updatedAt: now,
+          } as any,
+          create: {
+            id: callSessionId,
+            tenantId: args.tenantId,
+            customerId: args.customerId,
+            callSid: callSessionId,
+            from: args.customerPhone,
+            status: 'completed',
+            createdAt: now,
+            updatedAt: now,
+          } as any,
+          select: { id: true },
+        });
+
+      return {
+        channel: 'VOICE' as const,
+        messageSessionId: null,
+        callSessionId: String(callSession.id),
+      };
+    }
+
+    const conversationId = this.buildMessageConversationId(args.draft);
+    const messageSessionId = this.buildMessageSessionId(conversationId);
+
+    const messageSession =
+      await (this.prisma as any).message_sessions.upsert({
+        where: { conversationId },
+        update: {
+          customerId: args.customerId,
+          channel: 'WHATSAPP',
+          isActive: true,
+          lastMessageAt: now,
+          updatedAt: now,
+        } as any,
+        create: {
+          id: messageSessionId,
+          tenantId: args.tenantId,
+          customerId: args.customerId,
+          channel: 'WHATSAPP',
+          conversationId,
+          isActive: true,
+          lastMessageAt: now,
+          createdAt: now,
+          updatedAt: now,
+        } as any,
+        select: { id: true },
+      });
+
+    return {
+      channel: 'WHATSAPP' as const,
+      messageSessionId: String(messageSession.id),
+      callSessionId: null,
+    };
+  }
+
   private async createAppointment(opts: {
     tenantId: string;
     draft: BookingDraft;
@@ -2895,6 +3011,7 @@ ${staffNamesShort || 'YOK'}
         } as any,
         select: { id: true } as any,
       });
+      const customerId = String(customer.id);
 
       const durationMinutes = Number(service.duration) || 30;
       const endIso = toIstanbulIso(
@@ -2933,17 +3050,26 @@ ${staffNamesShort || 'YOK'}
         return { ok: false, code: 'SLOT_TAKEN', suggestions };
       }
 
+      const sessionLinks = await this.ensureAppointmentSessionLinks({
+        tenantId,
+        customerId,
+        customerPhone,
+        draft,
+      });
+
       const appt = await (this.prisma as any).appointments.create({
         data: {
           tenantId,
-          customerId: String(customer.id),
+          customerId,
           serviceId: String(service.id),
           staffId,
           date: dateAtUtcMidnight,
           time: timeHHMM,
           endTime: endTimeHHMM,
           status: 'PENDING',
-          channel: 'WHATSAPP',
+          channel: sessionLinks.channel,
+          messageSessionId: sessionLinks.messageSessionId,
+          callSessionId: sessionLinks.callSessionId,
           updatedAt: new Date(),
         } as any,
         select: { id: true },
@@ -3075,10 +3201,14 @@ ${staffNamesShort || 'YOK'}
           select: {
             id: true,
             tenantId: true,
+            customerId: true,
             serviceId: true,
             staffId: true,
             date: true,
             time: true,
+            channel: true,
+            messageSessionId: true,
+            callSessionId: true,
           },
         })
         .catch(() => null);
@@ -3156,6 +3286,20 @@ ${staffNamesShort || 'YOK'}
         return { ok: false, code: 'SLOT_TAKEN', suggestions };
       }
 
+      const sessionLinks = await this.ensureAppointmentSessionLinks({
+        tenantId,
+        customerId: String(current.customerId),
+        customerPhone: String(draft.customerPhone || ''),
+        draft: {
+          ...draft,
+          channel: draft.channel || (current.callSessionId ? 'VOICE' : 'WHATSAPP'),
+          messageSessionId:
+            draft.messageSessionId || String(current.messageSessionId || ''),
+          callSessionId:
+            draft.callSessionId || String(current.callSessionId || ''),
+        },
+      });
+
       await (this.prisma as any).appointments.update({
         where: { id: String(appointmentId) },
         data: {
@@ -3164,6 +3308,9 @@ ${staffNamesShort || 'YOK'}
           date: dateAtUtcMidnight,
           time: timeHHMM,
           endTime: endTimeHHMM,
+          channel: sessionLinks.channel,
+          messageSessionId: sessionLinks.messageSessionId,
+          callSessionId: sessionLinks.callSessionId,
           updatedAt: new Date(),
         } as any,
       });

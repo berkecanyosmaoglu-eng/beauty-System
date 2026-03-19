@@ -8,6 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
 import { UpdateAppointmentDto } from './dto/update-appointment.dto';
 import { NotificationsService } from '../notifications/notifications.service';
+import { SessionChannel } from '@prisma/client';
 
 type NextAvailableInput = {
   tenantId: string;
@@ -162,6 +163,30 @@ export class AppointmentsService {
     }
 
     return null;
+  }
+
+  private normalizeAppointmentChannelFields(input: {
+    channel?: SessionChannel | string | null;
+    messageSessionId?: string | null;
+    callSessionId?: string | null;
+  }) {
+    const messageSessionId = String(input.messageSessionId || '').trim() || null;
+    const callSessionId = String(input.callSessionId || '').trim() || null;
+    const rawChannel = String(input.channel || '').trim().toUpperCase();
+
+    let channel: SessionChannel | null = null;
+
+    if (callSessionId) channel = 'VOICE';
+    else if (messageSessionId) channel = 'WHATSAPP';
+    else if (rawChannel === 'VOICE' || rawChannel === 'WHATSAPP') {
+      channel = rawChannel as SessionChannel;
+    }
+
+    return {
+      channel,
+      messageSessionId: channel === 'VOICE' ? null : messageSessionId,
+      callSessionId: channel === 'WHATSAPP' ? null : callSessionId,
+    };
   }
 
   private async buildSlotParts(startInput: Date | string, serviceId: string) {
@@ -339,6 +364,12 @@ export class AppointmentsService {
       throw new ConflictException(suggest);
     }
 
+    const channelData = this.normalizeAppointmentChannelFields({
+      channel: (dto as any).channel,
+      messageSessionId: (dto as any).messageSessionId,
+      callSessionId: (dto as any).callSessionId,
+    });
+
     const created = await this.prisma.appointments.create({
       data: {
         tenantId: dto.tenantId,
@@ -349,6 +380,9 @@ export class AppointmentsService {
         time: slot.time,
         endTime: slot.endTime,
         status: ((dto as any).status ?? 'scheduled') as any,
+        channel: channelData.channel,
+        messageSessionId: channelData.messageSessionId,
+        callSessionId: channelData.callSessionId,
       } as any,
       include: {
         customers: true,
@@ -491,6 +525,18 @@ export class AppointmentsService {
       }
     }
 
+    const channelData = this.normalizeAppointmentChannelFields({
+      channel: (dto as any).channel ?? existing.channel,
+      messageSessionId:
+        (dto as any).messageSessionId !== undefined
+          ? (dto as any).messageSessionId
+          : existing.messageSessionId,
+      callSessionId:
+        (dto as any).callSessionId !== undefined
+          ? (dto as any).callSessionId
+          : existing.callSessionId,
+    });
+
     return this.prisma.appointments.update({
       where: { id },
       data: {
@@ -501,6 +547,9 @@ export class AppointmentsService {
         date: nextDate,
         time: nextTime,
         endTime: nextEndTime,
+        channel: channelData.channel,
+        messageSessionId: channelData.messageSessionId,
+        callSessionId: channelData.callSessionId,
         ...((dto as any).status !== undefined
           ? { status: (dto as any).status }
           : {}),
