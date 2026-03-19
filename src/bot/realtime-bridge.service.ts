@@ -1423,10 +1423,8 @@ class VoiceBridgeSession {
     turnId?: number,
   ): Promise<string> {
     const effectiveTurnId = turnId ?? this.activeTurnId;
-    const effectiveUserText = await this.buildAgentInputWithVoiceContext(
-      userText,
-      effectiveTurnId,
-    );
+    // TEMP MVP: pass the normalized transcript directly to VoiceConversationService.
+    const effectiveUserText = userText;
 
     this.markTiming('agent_processing_start', {
       turnId: effectiveTurnId,
@@ -1472,7 +1470,6 @@ class VoiceBridgeSession {
       }
 
       const reply = extractReplyText(result);
-      this.syncMemoryFromBookingSession(customerPhone);
 
       this.parentLogger.log(
         `[voice] agent reply callId=${this.meta.callId} customerPhone=${customerPhone} reply="${reply}"`,
@@ -1505,23 +1502,8 @@ class VoiceBridgeSession {
   }
 
   private async speakReply(replyText: string, turnId?: number) {
-    const openingGreeting = RealtimeBridgeService.openingGreeting;
-    const rewritten = rewriteAgentReplyForVoice(replyText);
-    const spoken =
-      rewritten === openingGreeting
-        ? openingGreeting
-        : shortenReplyForPhone(rewritten);
-    if (rewritten !== replyText) {
-      this.parentLogger.log(
-        `[voice] rewrite_shortened callId=${this.meta.callId} stage=rewrite replyBefore=${JSON.stringify(replyText)} replyAfter=${JSON.stringify(rewritten)}`,
-      );
-    }
-    if (spoken !== rewritten) {
-      this.parentLogger.log(
-        `[voice] rewrite_shortened callId=${this.meta.callId} stage=phone replyBefore=${JSON.stringify(rewritten)} replyAfter=${JSON.stringify(spoken)}`,
-      );
-    }
-    const clean = sanitizeReplyForVoice(spoken);
+    // TEMP MVP: send the agent reply to TTS with only minimal sanitization.
+    const clean = sanitizeReplyForVoice(replyText);
     const effectiveTurnId = turnId ?? this.activeTurnId;
     if (!clean) {
       this.parentLogger.warn(
