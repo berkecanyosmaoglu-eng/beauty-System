@@ -1480,7 +1480,7 @@ class VoiceBridgeSession {
     this.sendOpenAi({
       type: 'response.create',
       response: {
-        modalities: ['audio', 'text'],
+        modalities: ['audio'],
         voice:
           process.env.JARVIS_REALTIME_VOICE ||
           process.env.OPENAI_TTS_VOICE ||
