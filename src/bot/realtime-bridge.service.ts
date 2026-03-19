@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import WebSocket from 'ws';
 import { VoiceAgentService } from '../agent/voice-agent.service';
+import { rewriteAgentReplyForVoice } from '../agent/shared/voice-response-policy';
 
 type BridgeMeta = {
   tenantId: string;
@@ -1413,39 +1414,6 @@ class VoiceBridgeSession {
       inputLength: effectiveUserText.length,
     });
 
-    const deterministicReply = this.buildDeterministicShortReply(userText);
-    if (deterministicReply) {
-      if (
-        this.greeted &&
-        (deterministicReply.key === 'greeting' ||
-          deterministicReply.key === 'voice_check') &&
-        Date.now() - this.lastGreetingSuppressedAt > 1200
-      ) {
-        this.lastGreetingSuppressedAt = Date.now();
-        this.parentLogger.log(
-          `[voice] greeting_repeat_suppressed callId=${this.meta.callId} key=${deterministicReply.key}`,
-        );
-      }
-      this.parentLogger.log(
-        `[voice] deterministic_bypass_triggered callId=${this.meta.callId} key=${JSON.stringify(deterministicReply.key)} text="${deterministicReply.reply}"`,
-      );
-      this.markTiming('deterministic_bypass', {
-        turnId,
-        key: deterministicReply.key,
-        replyLength: deterministicReply.reply.length,
-      });
-      this.markTiming('agent_reply_ready', {
-        turnId,
-        source: 'deterministic_bypass',
-        replyLength: deterministicReply.reply.length,
-      });
-      this.logTurnLatency('agent_reply_ready', turnId, {
-        source: 'deterministic_bypass',
-        replyLength: deterministicReply.reply.length,
-      });
-      return deterministicReply.reply;
-    }
-
     const customerPhone = normalizePhone(
       this.meta.from ||
         this.meta.streamSid ||
@@ -1733,39 +1701,6 @@ class VoiceBridgeSession {
         this.currentTtsAbort = null;
       }
     }
-  }
-
-  private buildDeterministicShortReply(
-    userText: string,
-  ): { key: string; reply: string } | null {
-    const t = normalizeTurkishForTime(userText);
-    if (!t) return null;
-
-    const deterministicReplies: Array<{
-      key: string;
-      reply: string;
-      patterns: RegExp[];
-    }> = [
-      {
-        key: 'voice_check',
-        reply: 'Evet, sizi duyuyorum.',
-        patterns: [
-          /^sesim geliyor mu[.!? ]*$/,
-          /^beni duyuyor musunuz[.!? ]*$/,
-          /^sesim duyuluyor mu[.!? ]*$/,
-          /^ses geliyor mu[.!? ]*$/,
-          /^beni duyabiliyor musunuz[.!? ]*$/,
-        ],
-      },
-    ];
-
-    for (const item of deterministicReplies) {
-      if (item.patterns.some((pattern) => pattern.test(t))) {
-        return { key: item.key, reply: item.reply };
-      }
-    }
-
-    return null;
   }
 
   private async getOrCreateTtsAudio(
@@ -2411,67 +2346,6 @@ function detectRecentIntent(
     return 'info';
   }
   return 'general';
-}
-
-export function rewriteAgentReplyForVoice(replyText: string) {
-  let text = sanitizeReplyForVoice(String(replyText || '').trim())
-    .replace(/yazar mısınız/gi, 'söyler misiniz')
-    .replace(/yazar misiniz/gi, 'söyler misiniz')
-    .replace(/\(E\/H\)/gi, '')
-    .replace(/\bE\/H\b/gi, '');
-  const lower = text.toLocaleLowerCase('tr-TR');
-
-  if (lower.startsWith('randevu özeti:')) {
-    return 'Bilgiler doğruysa onaylayayım mı?';
-  }
-
-  if (lower.includes('o saat dolu') || lower.includes('şunlar uygun')) {
-    const slots = [
-      ...text.matchAll(/\b(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\b/g),
-    ].slice(0, 3);
-
-    if (slots.length) {
-      const spoken = slots
-        .map((m) => formatDateTimeForSpeech(`${m[1]} ${m[2]}`))
-        .join(', ');
-      return `O saat dolu. En yakın uygun saatler ${spoken}. İsterseniz başka bir saat de söyleyebilirsiniz.`;
-    }
-
-    return 'O saat dolu. Yakın bir saat söyleyebilir misiniz?';
-  }
-
-  if (
-    lower.includes('randevu tamam') ||
-    lower.includes('randevunuz oluşturuldu') ||
-    lower.includes('kayıt:')
-  ) {
-    const m = text.match(/\b(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\b/);
-    if (m) {
-      return `Tamamdır, randevunuzu ${formatDateTimeForSpeech(`${m[1]} ${m[2]}`)} için oluşturdum.`;
-    }
-    return 'Tamamdır, randevunuzu oluşturdum.';
-  }
-
-  if (
-    lower.includes('randevu oluştururken bir şey ters gitti') ||
-    lower.includes('başka bir saat dener misin') ||
-    lower.includes('bir hata oldu')
-  ) {
-    return 'Randevu oluşturulamadı. Başka bir saat deneyelim.';
-  }
-
-  text = text
-    .replace(/[•]/g, ' ')
-    .replace(/[()]/g, ' ')
-    .replace(/\s*\/\s*/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  text = humanizeBookingSummaryForSpeech(text);
-  text = humanizeConfirmationForSpeech(text);
-  text = formatDateTimeForSpeech(text);
-
-  return text;
 }
 
 export function shortenReplyForPhone(text: string) {

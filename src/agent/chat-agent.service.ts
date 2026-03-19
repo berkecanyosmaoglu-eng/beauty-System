@@ -1,14 +1,13 @@
 import { Injectable } from '@nestjs/common';
-import { BookingCoreService } from './shared/booking-core.service';
 import { AgentReplyRequest } from './shared/agent-types';
-import { withAgentChannel } from './shared/agent-helpers';
+import { ChatConversationService } from './chat/chat-conversation.service';
 
 @Injectable()
 export class ChatAgentService {
-  constructor(private readonly bookingCore: BookingCoreService) {}
+  constructor(private readonly chatConversation: ChatConversationService) {}
 
   replyText(payload: AgentReplyRequest): Promise<string> {
-    return this.bookingCore.replyText(withAgentChannel(payload, 'chat'));
+    return this.chatConversation.handleTurn(payload);
   }
 
   handleIncomingMessage(payload: AgentReplyRequest): Promise<string> {

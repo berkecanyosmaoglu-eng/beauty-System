@@ -1,5 +1,6 @@
 import { BookingCoreService } from './booking-core.service';
 import { VoiceAgentService } from '../voice-agent.service';
+import { VoiceConversationService } from '../voice/voice-conversation.service';
 
 describe('BookingCoreService voice booking flow', () => {
   const tenantId = 'tenant-1';
@@ -141,7 +142,8 @@ describe('BookingCoreService voice booking flow', () => {
 
   it('returns a shortened voice service list', async () => {
     const core = new BookingCoreService(createPrismaMock());
-    const voice = new VoiceAgentService(core);
+    const voiceConversation = new VoiceConversationService(core);
+    const voice = new VoiceAgentService(voiceConversation);
 
     const reply = await voice.replyText({
       tenantId,
