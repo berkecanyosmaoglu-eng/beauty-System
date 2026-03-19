@@ -158,8 +158,8 @@ class VoiceBridgeSession {
   private readonly maxSpeechEnergyThreshold = 1200;
   private readonly speechEnergyThreshold = 600;
   private readonly speechFramesForBargeIn = 8;
-  private readonly assistantGuardMs = 650;
-  private readonly openingGreetingBargeInGuardMs = 900;
+  private readonly assistantGuardMs = 1800;
+  private readonly openingGreetingBargeInGuardMs = 2200;
   private readonly minPlaybackBargeInMs = 1000;
 
   private lastTranscriptAt = 0;
@@ -193,7 +193,11 @@ class VoiceBridgeSession {
   private lastBargeInSuppressLogAt = 0;
   private lastBargeInSuppressReason = '';
   private lastChunkSummaryLogAt = 0;
-  private outboundAudioChunkCount = 0;
+  private outboundAudioQueue: Buffer[] = [];
+  private outboundAudioPumpRunning = false;
+  private openAiAudioDonePending = false;  
+
+private outboundAudioChunkCount = 0;
   private outboundAudioByteCount = 0;
   private readonly debugVoice = process.env.DEBUG_VOICE === '1';
   private lastCancellationReason:
@@ -388,6 +392,11 @@ class VoiceBridgeSession {
     }
   }
 
+
+
+
+
+
   private async onOpenAiEvent(evt: OpenAiEvent) {
     switch (evt.type) {
       case 'session.created':
@@ -412,6 +421,7 @@ class VoiceBridgeSession {
         );
         return;
 
+
       case 'response.output_audio.delta':
       case 'response.audio.delta':
         if (!evt.delta) return;
@@ -429,21 +439,28 @@ class VoiceBridgeSession {
             },
           );
         }
-        this.currentPlaybackDurationMs += this.ulawFrameMs;
 
-        this.sendBridge({
-          event: 'media',
-          media: { payload: evt.delta },
-        });
+        {
+          const audioBuf = Buffer.from(evt.delta, 'base64');
+          const frameCount = Math.ceil(audioBuf.length / 160);
+          this.currentPlaybackDurationMs += frameCount * this.ulawFrameMs;
+          this.enqueueAudioBuffer(audioBuf);
+        }
         return;
 
       case 'response.output_audio.done':
       case 'response.audio.done':
-      case 'response.done':
-        this.completeAssistantPlayback(`openai_${evt.type}`);
+        this.openAiAudioDonePending = true;
+        if (!this.outboundAudioPumpRunning && this.outboundAudioQueue.length === 0) {
+          this.openAiAudioDonePending = false;
+          this.completeAssistantPlayback(`openai_${evt.type}`);
+        }
         this.parentLogger.log(`[voice] ${evt.type} callId=${this.meta.callId}`);
         return;
 
+      case 'response.done':
+        this.parentLogger.log(`[voice] ${evt.type} callId=${this.meta.callId}`);
+        return;
       case 'conversation.item.input_audio_transcription.completed': {
         const rawTranscript = String(evt.transcript || '').trim();
         if (!rawTranscript) return;
@@ -503,6 +520,27 @@ class VoiceBridgeSession {
         return;
     }
   }
+
+
+
+
+private async sendAudioBufferRealtime(
+  audioBuf: Buffer,
+  source: 'streaming' | 'buffered' = 'buffered',
+) {
+  for (let i = 0; i < audioBuf.length; i += 160) {
+    const chunk = audioBuf.subarray(i, i + 160);
+    if (!chunk.length) continue;
+
+    this.currentPlaybackDurationMs += this.ulawFrameMs;
+    this.sendAudioChunk(chunk, source);
+
+    await new Promise((resolve) => setTimeout(resolve, this.ulawFrameMs));
+  }
+}
+
+
+
 
   private async handleCompletedTranscript(rawTranscript: string) {
     const currentState = this.getCurrentVoiceBookingState();
@@ -840,8 +878,48 @@ class VoiceBridgeSession {
     }
   }
 
+
+  private enqueueAudioBuffer(audioBuf: Buffer) {
+    for (let i = 0; i < audioBuf.length; i += 160) {
+      const chunk = audioBuf.subarray(i, i + 160);
+      if (!chunk.length) continue;
+      this.outboundAudioQueue.push(Buffer.from(chunk));
+    }
+
+    void this.pumpOutboundAudioQueue();
+  }
+
+  private async pumpOutboundAudioQueue() {
+    if (this.outboundAudioPumpRunning) return;
+    this.outboundAudioPumpRunning = true;
+
+    try {
+      while (this.outboundAudioQueue.length > 0) {
+        const chunk = this.outboundAudioQueue.shift();
+        if (!chunk) continue;
+
+        this.sendAudioChunk(chunk, 'buffered');
+        await new Promise((resolve) => setTimeout(resolve, this.ulawFrameMs));
+      }
+    } finally {
+      this.outboundAudioPumpRunning = false;
+
+      if (this.openAiAudioDonePending && this.outboundAudioQueue.length === 0) {
+        this.openAiAudioDonePending = false;
+        this.completeAssistantPlayback('openai_response.audio.done');
+      }
+    }
+  }
+
+
+
   private handlePossibleBargeIn(payloadB64: string) {
-    const rms = pcmuBase64Rms(payloadB64);
+    // TEMP HOTFIX:
+    // Echo yüzünden bot kendi sesini müşteri konuşması sanıp cevabı yarıda kesiyor.
+    // Önce akışı stabil hale getirelim; sonra barge-in'i düzgün geri açarız.
+    return;  
+
+  const rms = pcmuBase64Rms(payloadB64);
     this.lastObservedSpeechEnergy = rms;
     this.updateAmbientNoise(rms);
 
@@ -1283,7 +1361,11 @@ class VoiceBridgeSession {
   }
 
   private resetAssistantPlaybackState(reason: string) {
-    const hadPlayback =
+    this.outboundAudioQueue = [];
+    this.outboundAudioPumpRunning = false;
+    this.openAiAudioDonePending = false;  
+
+  const hadPlayback =
       this.assistantSpeaking ||
       this.currentPlaybackDurationMs > 0 ||
       this.currentPlaybackOffsetBytes > 0 ||
@@ -1455,7 +1537,6 @@ class VoiceBridgeSession {
       this.parentLogger.warn(
         `[voice] duplicate_assistant_message_skipped callId=${this.meta.callId} turnId=${effectiveTurnId} text=${JSON.stringify(clean)}`,
       );
-      return;
     }
 
     this.lastBotReplyText = clean;
@@ -1480,7 +1561,7 @@ class VoiceBridgeSession {
     this.sendOpenAi({
       type: 'response.create',
       response: {
-        modalities: ['audio'],
+modalities: ['audio', 'text'],
         voice:
           process.env.JARVIS_REALTIME_VOICE ||
           process.env.OPENAI_TTS_VOICE ||

@@ -101,22 +101,25 @@ export function isJarvisNegative(rawText: string): boolean {
 }
 
 export function buildJarvisDeterministicShortReply(rawText: string): string | null {
-  const text = normalizeJarvisText(rawText);
-  if (
-    [
-      /^sesim geliyor mu$/,
-      /^beni duyuyor musunuz$/,
-      /^sesim duyuluyor mu$/,
-      /^ses geliyor mu$/,
-      /^beni duyabiliyor musunuz$/,
-    ].some((pattern) => pattern.test(text))
-  ) {
-    return 'Evet, sizi duyuyorum.';
+  const text = String(rawText || '').trim().toLocaleLowerCase('tr-TR');
+
+  if (!text) return null;
+
+  if (text === 'alo' || text === 'alo?' || text === 'efendim') {
+    return 'Merhaba, sizi duyuyorum. Nasıl yardımcı olabilirim?';
+  }
+
+  if (text === 'konuş' || text === 'konus' || text.includes('bir şeyler anlat') || text.includes('birseyler anlat') || text.includes('bir şey söyle') || text.includes('birsey soyle')) {
+    return 'Tabii. Randevu oluşturabilir veya işlemler hakkında bilgi verebilirim. Hangi konuda yardımcı olayım?';
+  }
+
+  // Sadece isim/soyisim gibi görünüyorsa
+  if (/^[a-zçğıöşüA-ZÇĞİÖŞÜ]+(?:\s+[a-zçğıöşüA-ZÇĞİÖŞÜ]+){0,2}$/.test(rawText.trim())) {
+    return 'Memnun oldum. Hangi işlem için yardımcı olayım?';
   }
 
   return null;
 }
-
 export function normalizeJarvisText(value: string): string {
   return String(value || '')
     .toLocaleLowerCase('tr-TR')

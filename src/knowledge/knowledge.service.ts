@@ -66,7 +66,7 @@ export class KnowledgeService {
         : `${businessName} için yardımcı olabilirim. İsterseniz randevu oluşturabiliriz.`;
     }
 
-    return 'Kısa bilgi verebilirim veya randevu oluşturabilirim. Randevu için ad soyad, hizmet ve tarih/saat ile başlayalım.';
+return 'Size işlemler hakkında bilgi verebilirim ya da randevu oluşturabilirim. Hangi konuda yardımcı olayım?';
   }
 
   private async getServices(tenantId: string): Promise<ServiceInfo[]> {
