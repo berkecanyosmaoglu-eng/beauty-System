@@ -1,5 +1,6 @@
 import { BookingCoreService } from './booking-core.service';
 import { VoiceAgentService } from '../voice-agent.service';
+import { VoiceConversationService } from '../voice/voice-conversation.service';
 
 describe('BookingCoreService voice booking flow', () => {
   const tenantId = 'tenant-1';
@@ -139,9 +140,38 @@ describe('BookingCoreService voice booking flow', () => {
     expect(reply).not.toMatch(/personel|uzman|kim olsun/i);
   });
 
+  it('asks for datetime instead of service when draft already has service in whatsapp booking flow', async () => {
+    const service = new BookingCoreService(createPrismaMock());
+
+    const sessionKey = `${tenantId}:${from}`;
+    (service as any).sessions.set(sessionKey, {
+      state: 'BROKEN_STATE',
+      draft: {
+        tenantId,
+        customerPhone: from,
+        serviceId: 'svc-1',
+      },
+      pendingDateOnly: undefined,
+      pendingStartAt: undefined,
+    });
+
+    const reply = await service.replyText({
+      tenantId,
+      from,
+      text: 'devam',
+      channel: 'whatsapp',
+    });
+
+    expect(reply).toMatch(/hangi gün|ne zamana|gün ve saat|tarih/i);
+    expect(reply).not.toMatch(/hangi hizmet|hangi işlem|hangi islem/i);
+    const session = (service as any).sessions.get(sessionKey);
+    expect(session.state).toBe('AWAITING_DATETIME');
+  });
+
   it('returns a shortened voice service list', async () => {
     const core = new BookingCoreService(createPrismaMock());
-    const voice = new VoiceAgentService(core);
+    const voiceConversation = new VoiceConversationService(core);
+    const voice = new VoiceAgentService(voiceConversation);
 
     const reply = await voice.replyText({
       tenantId,
