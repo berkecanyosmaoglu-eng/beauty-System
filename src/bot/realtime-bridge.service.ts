@@ -74,12 +74,7 @@ type VoiceTimingStage =
   | 'transcript_normalized'
   | 'agent_processing_start'
   | 'agent_reply_ready'
-  | 'elevenlabs_request_start'
-  | 'elevenlabs_first_byte'
-  | 'elevenlabs_success'
   | 'final_audio_send_start'
-  | 'tts_cache_hit'
-  | 'tts_cache_miss'
   | 'deterministic_bypass'
   | 'bridge_context_loaded';
 
@@ -97,76 +92,7 @@ export class RealtimeBridgeService {
   }
 
   private async prewarmOpeningGreetingCache() {
-    if (RealtimeBridgeService.openingGreetingAudio) {
-      return;
-    }
-
-    if (RealtimeBridgeService.openingGreetingPromise) {
-      await RealtimeBridgeService.openingGreetingPromise;
-      return;
-    }
-
-    const apiKey = process.env.ELEVENLABS_API_KEY;
-    const voiceId = process.env.ELEVENLABS_VOICE_ID;
-    if (!apiKey || !voiceId) {
-      this.logger.warn(
-        '[voice] opening_greeting_prewarm_skipped missing_elevenlabs_config',
-      );
-      return;
-    }
-
-    this.logger.log('[voice] opening_greeting_prewarm_start');
-    const promise = fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'xi-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          text: RealtimeBridgeService.openingGreeting,
-          model_id: process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2',
-          language_code: 'tr',
-          voice_settings: {
-            stability: 0.35,
-            similarity_boost: 0.8,
-            speed: 0.96,
-          },
-        }),
-      },
-    )
-      .then(async (response) => {
-        if (!response.ok) {
-          const bodyText = await response.text();
-          throw new Error(
-            `prewarm_failed status=${response.status} body=${bodyText}`,
-          );
-        }
-
-        const audioBuffer = Buffer.from(await response.arrayBuffer());
-        RealtimeBridgeService.openingGreetingAudio = audioBuffer;
-        RealtimeBridgeService.shortReplyAudioCache.set(
-          normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting),
-          audioBuffer,
-        );
-        this.logger.log(
-          `[voice] opening_greeting_prewarm_success bytes=${audioBuffer.length}`,
-        );
-        return audioBuffer;
-      })
-      .catch((err: any) => {
-        this.logger.warn(
-          `[voice] opening_greeting_prewarm_failed error=${err?.message || err}`,
-        );
-        return null;
-      })
-      .finally(() => {
-        RealtimeBridgeService.openingGreetingPromise = null;
-      });
-
-    RealtimeBridgeService.openingGreetingPromise = promise;
-    await promise;
+    return;
   }
 
   handleBridgeSocket(clientWs: WebSocket, meta: BridgeMeta) {
@@ -392,7 +318,10 @@ class VoiceBridgeSession {
         ].join(' '),
 
         modalities: ['audio', 'text'],
-        voice: process.env.JARVIS_REALTIME_VOICE || 'cedar',
+        voice:
+          process.env.JARVIS_REALTIME_VOICE ||
+          process.env.OPENAI_TTS_VOICE ||
+          'shimmer',
 
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
@@ -488,8 +417,20 @@ class VoiceBridgeSession {
         if (!evt.delta) return;
 
         this.markAssistantPlaybackStarted('openai_realtime');
+        if (!this.currentPlaybackDurationMs) {
+          this.markTiming('final_audio_send_start', {
+            source: 'openai_realtime',
+          });
+          this.logTurnLatency(
+            'assistant_first_audio_openai',
+            this.currentReplyTurnId || this.activeTurnId,
+            {
+              source: 'openai_realtime',
+            },
+          );
+        }
+        this.currentPlaybackDurationMs += this.ulawFrameMs;
 
-        // This path is only used when ElevenLabs fails and OpenAI TTS fallback is active.
         this.sendBridge({
           event: 'media',
           media: { payload: evt.delta },
@@ -1383,9 +1324,7 @@ class VoiceBridgeSession {
     this.lastChunkSummaryLogAt = 0;
   }
 
-  private markAssistantPlaybackStarted(
-    source: 'openai_realtime' | 'elevenlabs_buffered' | 'elevenlabs_streaming',
-  ) {
+  private markAssistantPlaybackStarted(source: 'openai_realtime') {
     if (this.assistantSpeaking) {
       return;
     }
@@ -1451,9 +1390,7 @@ class VoiceBridgeSession {
     };
 
     try {
-      const reply = String(
-        await this.agentService.replyText(payload),
-      ).trim();
+      const reply = String(await this.agentService.replyText(payload)).trim();
 
       this.parentLogger.log(
         `[voice] agent reply callId=${this.meta.callId} customerPhone=${customerPhone} reply="${reply}"`,
@@ -1486,19 +1423,10 @@ class VoiceBridgeSession {
   }
 
   private async speakReply(replyText: string, turnId?: number) {
-    // TEMP MVP: send the agent reply to TTS with only minimal sanitization.
+    // TEMP MVP: send the agent reply to OpenAI realtime with only minimal sanitization.
     const clean = sanitizeReplyForVoice(replyText);
     const effectiveTurnId = turnId ?? this.activeTurnId;
-    if (!clean) {
-      this.parentLogger.warn(
-        `[voice] tts_skipped callId=${this.meta.callId} reason=empty_reply`,
-      );
-      return;
-    }
-    if (!this.sessionReady) {
-      this.parentLogger.warn(
-        `[voice] tts_skipped callId=${this.meta.callId} reason=session_not_ready`,
-      );
+    if (!clean || !this.sessionReady) {
       return;
     }
     if (!this.canPlaybackStaleTurn(effectiveTurnId, 'pre_tts')) {
@@ -1536,9 +1464,11 @@ class VoiceBridgeSession {
     this.outboundAudioChunkCount = 0;
     this.outboundAudioByteCount = 0;
     this.lastChunkSummaryLogAt = 0;
+    this.currentPlaybackDurationMs = 0;
+    this.currentPlaybackOffsetBytes = 0;
 
     this.parentLogger.log(
-      `[voice] final_outgoing_text_before_elevenlabs callId=${this.meta.callId} text="${clean}"`,
+      `[voice] final_outgoing_text_before_openai callId=${this.meta.callId} text="${clean}"`,
     );
 
     if (clean === RealtimeBridgeService.openingGreeting) {
@@ -1547,334 +1477,23 @@ class VoiceBridgeSession {
       );
     }
 
-    try {
-      const token = ++this.playbackToken;
-      const ttsResult = await this.getOrCreateTtsAudio(
-        clean,
-        token,
-        effectiveTurnId,
-      );
-
-      if (!this.canPlaybackStaleTurn(effectiveTurnId, 'tts_ready')) {
-        this.resetAssistantPlaybackState('stale_turn_tts_ready');
-        return;
-      }
-
-      if (ttsResult?.audioBuffer && token === this.playbackToken) {
-        this.parentLogger.log(
-          `[voice] ElevenLabs success callId=${this.meta.callId} bytes=${ttsResult.audioBuffer.length} streamed=${ttsResult.streamed ? 'yes' : 'no'}`,
-        );
-        if (!ttsResult.streamed) {
-          this.streamUlawBuffer(ttsResult.audioBuffer, token, effectiveTurnId);
-        }
-        return;
-      }
-
-      this.resetAssistantPlaybackState('tts_empty');
-    } catch (err) {
-      this.parentLogger.error(
-        `[voice] ElevenLabs failure callId=${this.meta.callId}: ${err}`,
-      );
-    }
-
-    this.resetAssistantPlaybackState(
-      this.lastCancellationReason
-        ? `tts_cancelled_${this.lastCancellationReason}`
-        : 'tts_unavailable',
-    );
-    this.parentLogger.warn(
-      `[voice] tts_skipped callId=${this.meta.callId} reason=${this.lastCancellationReason ? `cancelled_${this.lastCancellationReason}` : 'elevenlabs_unavailable'}`,
-    );
-  }
-
-  private async generateElevenLabsAudio(
-    text: string,
-    token?: number,
-    turnId?: number,
-  ): Promise<{ audioBuffer: Buffer | null; streamed: boolean }> {
-    this.markTiming('elevenlabs_request_start', {
-      textLength: text.length,
+    this.sendOpenAi({
+      type: 'response.create',
+      response: {
+        modalities: ['audio'],
+        voice:
+          process.env.JARVIS_REALTIME_VOICE ||
+          process.env.OPENAI_TTS_VOICE ||
+          'shimmer',
+        output_audio_format: 'g711_ulaw',
+        instructions: [
+          'Speak exactly the following approved Turkish assistant reply.',
+          'Do not add or remove words.',
+          'Use a calm, warm, professional, female-sounding Turkish phone voice.',
+          `Approved reply: ${clean}`,
+        ].join(' '),
+      },
     });
-
-    const apiKey = process.env.ELEVENLABS_API_KEY;
-    const voiceId = process.env.ELEVENLABS_VOICE_ID;
-    if (!apiKey || !voiceId) {
-      this.parentLogger.error('[voice] ElevenLabs API key or voice ID missing');
-      return { audioBuffer: null, streamed: false };
-    }
-
-    const controller = new AbortController();
-    this.currentTtsAbort = controller;
-
-    try {
-      const modelId =
-        process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
-
-      const response = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'xi-api-key': apiKey,
-          },
-          body: JSON.stringify({
-            text,
-            model_id: modelId,
-            language_code: 'tr',
-            voice_settings: {
-              stability: 0.35,
-              similarity_boost: 0.8,
-              speed: 0.96,
-            },
-          }),
-          signal: controller.signal,
-        },
-      );
-
-      this.markTiming('elevenlabs_first_byte', {
-        status: response.status,
-        ok: response.ok,
-      });
-
-      if (!response.ok) {
-        const bodyText = await response.text();
-        this.parentLogger.error(
-          `[voice] ElevenLabs TTS error: ${response.status} ${bodyText}`,
-        );
-        return { audioBuffer: null, streamed: false };
-      }
-
-      this.parentLogger.log(
-        `[voice] tts_stream_start callId=${this.meta.callId} streaming=${this.realtimeTtsStreamingEnabled ? 'enabled' : 'disabled'} turnId=${turnId ?? this.activeTurnId}`,
-      );
-
-      const streamed =
-        this.realtimeTtsStreamingEnabled &&
-        !!response.body &&
-        token != null &&
-        turnId != null
-          ? await this.streamElevenLabsResponse(response, token, turnId)
-          : null;
-
-      if (streamed?.audioBuffer) {
-        this.markTiming('elevenlabs_success', {
-          bytes: streamed.audioBuffer.length,
-          streamed: true,
-        });
-        return { audioBuffer: streamed.audioBuffer, streamed: true };
-      }
-
-      const arrayBuffer = await response.arrayBuffer();
-      const audioBuffer = Buffer.from(arrayBuffer);
-      this.markTiming('elevenlabs_success', {
-        bytes: audioBuffer.length,
-        streamed: false,
-      });
-      return { audioBuffer, streamed: false };
-    } catch (err: any) {
-      if (err?.name === 'AbortError') {
-        this.parentLogger.warn(
-          `[voice] ElevenLabs synthesis aborted callId=${this.meta.callId} reason=${this.lastCancellationReason || 'cancelled'}`,
-        );
-        return { audioBuffer: null, streamed: false };
-      }
-      this.parentLogger.error(`[voice] ElevenLabs TTS error: ${err}`);
-      return { audioBuffer: null, streamed: false };
-    } finally {
-      if (this.currentTtsAbort === controller) {
-        this.currentTtsAbort = null;
-      }
-    }
-  }
-
-  private async getOrCreateTtsAudio(
-    text: string,
-    token?: number,
-    turnId?: number,
-  ): Promise<{ audioBuffer: Buffer | null; streamed: boolean } | null> {
-    const normalizedText = normalizeTtsCacheKey(text);
-    const isOpeningGreeting =
-      text === RealtimeBridgeService.openingGreeting ||
-      normalizedText ===
-        normalizeTtsCacheKey(RealtimeBridgeService.openingGreeting);
-
-    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingAudio) {
-      this.parentLogger.log(
-        `[voice] opening_greeting_cache_hit callId=${this.meta.callId} bytes=${RealtimeBridgeService.openingGreetingAudio.length}`,
-      );
-      this.markTiming('tts_cache_hit', {
-        cache: 'opening_greeting',
-        textLength: text.length,
-      });
-      return {
-        audioBuffer: RealtimeBridgeService.openingGreetingAudio,
-        streamed: false,
-      };
-    }
-
-    const cached =
-      RealtimeBridgeService.shortReplyAudioCache.get(normalizedText);
-    if (cached) {
-      this.parentLogger.log(
-        `[voice] tts_cache_hit callId=${this.meta.callId} key=${JSON.stringify(normalizedText)} bytes=${cached.length}`,
-      );
-      this.markTiming('tts_cache_hit', {
-        cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
-        textLength: text.length,
-      });
-      return { audioBuffer: cached, streamed: false };
-    }
-
-    if (isOpeningGreeting) {
-      this.parentLogger.log(
-        `[voice] opening_greeting_cache_miss callId=${this.meta.callId}`,
-      );
-    } else {
-      this.parentLogger.log(
-        `[voice] tts_cache_miss callId=${this.meta.callId} key=${JSON.stringify(normalizedText)}`,
-      );
-    }
-
-    this.markTiming('tts_cache_miss', {
-      cache: isOpeningGreeting ? 'opening_greeting' : 'short_reply',
-      textLength: text.length,
-    });
-
-    if (isOpeningGreeting && RealtimeBridgeService.openingGreetingPromise) {
-      return (
-        RealtimeBridgeService.openingGreetingPromise?.then((audioBuffer) => ({
-          audioBuffer,
-          streamed: false,
-        })) || null
-      );
-    }
-
-    const synthesisPromise = this.generateElevenLabsAudio(text, token, turnId)
-      .then((result) => {
-        const audioBuffer = result?.audioBuffer || null;
-        if (audioBuffer) {
-          RealtimeBridgeService.shortReplyAudioCache.set(
-            normalizedText,
-            audioBuffer,
-          );
-          if (isOpeningGreeting) {
-            RealtimeBridgeService.openingGreetingAudio = audioBuffer;
-          }
-        }
-        return { audioBuffer, streamed: Boolean(result?.streamed) };
-      })
-      .finally(() => {
-        if (isOpeningGreeting) {
-          RealtimeBridgeService.openingGreetingPromise = null;
-        }
-      });
-
-    if (isOpeningGreeting) {
-      RealtimeBridgeService.openingGreetingPromise = synthesisPromise.then(
-        (result) => result.audioBuffer,
-      );
-    }
-
-    return synthesisPromise;
-  }
-
-  private async streamElevenLabsResponse(
-    response: Response,
-    token: number,
-    turnId: number,
-  ): Promise<{ audioBuffer: Buffer; streamed: boolean } | null> {
-    const reader = response.body?.getReader();
-    if (!reader) return null;
-
-    const chunks: Buffer[] = [];
-    let pending = Buffer.alloc(0);
-    let totalBytes = 0;
-    let sentBytes = 0;
-    let firstChunkSent = false;
-
-    const flushPending = (force = false) => {
-      const flushable = force
-        ? pending.length
-        : pending.length >= this.minBufferedAudioChunkBytes
-          ? pending.length - (pending.length % this.minBufferedAudioChunkBytes)
-          : 0;
-      if (!flushable) return;
-
-      let outbound = pending.subarray(0, flushable);
-      pending = pending.subarray(flushable);
-
-      if (force && outbound.length % this.ulawFrameBytes !== 0) {
-        const padded = Buffer.alloc(
-          outbound.length +
-            (this.ulawFrameBytes - (outbound.length % this.ulawFrameBytes)),
-          0xff,
-        );
-        outbound.copy(padded);
-        outbound = padded;
-      }
-
-      if (force && outbound.length < this.minBufferedAudioChunkBytes) {
-        const padded = Buffer.alloc(this.minBufferedAudioChunkBytes, 0xff);
-        outbound.copy(padded);
-        outbound = padded;
-      }
-
-      if (
-        this.closed ||
-        token !== this.playbackToken ||
-        !this.isTurnStillActive(turnId)
-      ) {
-        return;
-      }
-
-      this.currentPlaybackOffsetBytes = sentBytes;
-      this.lastAssistantAudioAt = Date.now();
-      if (!firstChunkSent) {
-        firstChunkSent = true;
-        this.markAssistantPlaybackStarted('elevenlabs_streaming');
-        this.markTiming('final_audio_send_start', {
-          bytes: totalBytes,
-          streaming: true,
-        });
-        this.logTurnLatency('assistant_first_audio_streaming', turnId, {
-          ttsBufferedBytes: totalBytes,
-        });
-      }
-
-      this.sendAudioChunk(outbound, 'streaming');
-      sentBytes += outbound.length;
-    };
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value?.length) continue;
-
-      const chunk = Buffer.from(value);
-      chunks.push(chunk);
-      totalBytes += chunk.length;
-      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-
-      flushPending(false);
-    }
-
-    if (pending.length > 0) {
-      flushPending(true);
-    }
-
-    this.currentPlaybackDurationMs =
-      Math.ceil(sentBytes / this.ulawFrameBytes) * this.ulawFrameMs;
-    this.currentPlaybackOffsetBytes = sentBytes;
-    if (firstChunkSent) {
-      this.completeAssistantPlayback('streaming_finished');
-    } else {
-      this.resetAssistantPlaybackState('streaming_no_audio');
-    }
-    return {
-      audioBuffer: Buffer.concat(chunks, totalBytes),
-      streamed: firstChunkSent,
-    };
   }
 
   private logTurnLatency(
@@ -1899,67 +1518,6 @@ class VoiceBridgeSession {
       ...Object.entries(extra).map(([key, value]) => `${key}=${String(value)}`),
     ].filter(Boolean);
     this.parentLogger.log(`[voice][latency] ${parts.join(' ')}`);
-  }
-
-  private streamUlawBuffer(buf: Buffer, token: number, turnId: number) {
-    if (!buf.length || token !== this.playbackToken) return;
-    if (!this.canPlaybackStaleTurn(turnId, 'audio_playback')) {
-      return;
-    }
-
-    this.currentPlaybackDurationMs =
-      Math.ceil(buf.length / this.ulawFrameBytes) * this.ulawFrameMs;
-    this.currentPlaybackOffsetBytes = 0;
-    let offset = 0;
-    const tick = () => {
-      if (this.closed) return;
-      if (token !== this.playbackToken) return;
-      if (!this.canPlaybackStaleTurn(turnId, 'audio_playback_tick')) {
-        this.resetAssistantPlaybackState('stale_turn_audio_playback');
-        return;
-      }
-
-      this.currentPlaybackOffsetBytes = offset;
-      const chunk = buf.subarray(
-        offset,
-        offset + this.minBufferedAudioChunkBytes,
-      );
-      if (!chunk.length) {
-        this.playbackTimer = null;
-        this.completeAssistantPlayback('buffered_finished');
-        return;
-      }
-
-      this.lastAssistantAudioAt = Date.now();
-      if (offset === 0) {
-        this.markAssistantPlaybackStarted('elevenlabs_buffered');
-        this.markTiming('final_audio_send_start', {
-          bytes: buf.length,
-          streaming: false,
-        });
-        this.logTurnLatency('assistant_first_audio_buffered', turnId, {
-          totalBytes: buf.length,
-        });
-        if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
-          this.parentLogger.log(
-            `[voice] opening_greeting_audio_sent callId=${this.meta.callId} bytes=${buf.length}`,
-          );
-        }
-      }
-
-      this.sendAudioChunk(chunk, 'buffered');
-
-      offset += chunk.length;
-      this.playbackTimer = setTimeout(
-        tick,
-        Math.max(
-          this.ulawFrameMs,
-          (chunk.length / this.ulawFrameBytes) * this.ulawFrameMs,
-        ),
-      );
-    };
-
-    tick();
   }
 
   private sendOpenAi(obj: any) {
