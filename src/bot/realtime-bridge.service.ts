@@ -910,12 +910,22 @@ class VoiceBridgeSession {
         ? now - this.assistantStartedAt
         : 0;
       const protectionRemaining = this.getAssistantProtectionMsRemaining();
-      // TEMP: Disable barge-in cancellation entirely until voice playback is stable.
-      this.logBargeInSuppressed(
-        'temp_disabled',
-        `playbackElapsedMs=${playbackElapsedMs} protectionMsRemaining=${protectionRemaining} rms=${this.formatEnergy(rms)}`,
-      );
-      return;
+      if (
+        protectionRemaining > 0 ||
+        playbackElapsedMs < this.minPlaybackBargeInMs
+      ) {
+        this.logBargeInSuppressed(
+          protectionRemaining > 0
+            ? 'inside_protection_window'
+            : 'early_playback_guard',
+          `playbackElapsedMs=${playbackElapsedMs} protectionMsRemaining=${protectionRemaining} rms=${this.formatEnergy(rms)}`,
+        );
+        return;
+      }
+
+      this.cancelAssistantAudio('barge_in');
+      this.resetAssistantPlaybackState('force_barge_in');
+      this.lastBargeInAt = now;
     }
 
     this.openingGreetingProtectionUntil = 0;
