@@ -81,6 +81,10 @@ export function shapeVoiceAgentReply(reply: string): string {
     .trim();
 }
 
+export function rewriteAgentReplyForVoice(reply: string): string {
+  return shapeVoiceAgentReply(reply);
+}
+
 function shapeSlotSuggestion(text: string): string | null {
   const itemMatch = text.match(/(?:^|\n)\s*1\)\s*([^\n]+)/);
   if (!itemMatch) return null;
