@@ -222,7 +222,7 @@ class VoiceBridgeSession {
   private lastAssistantAudioAt = 0;
   private assistantSpeaking = false;
   private assistantStartedAt = 0;
-  private activeResponse = false;
+  private lastAssistantMessage = '';
 
   private speechEnergyFrames = 0;
   private lastObservedSpeechEnergy = 0;
@@ -450,13 +450,6 @@ class VoiceBridgeSession {
       this.handlePossibleBargeIn(payload);
       this.refreshSpeechFailsafe();
 
-      if (
-        this.assistantSpeaking &&
-        !this.shouldPassInboundDuringAssistant(payload)
-      ) {
-        return;
-      }
-
       this.sendOpenAi({
         type: 'input_audio_buffer.append',
         audio: payload,
@@ -483,9 +476,6 @@ class VoiceBridgeSession {
         return;
 
       case 'response.created':
-        this.activeResponse = true;
-        this.assistantSpeaking = true;
-        this.assistantStartedAt = Date.now();
         this.parentLogger.log(
           `[voice] response.created callId=${this.meta.callId}`,
         );
@@ -495,8 +485,7 @@ class VoiceBridgeSession {
       case 'response.audio.delta':
         if (!evt.delta) return;
 
-        this.lastAssistantAudioAt = Date.now();
-        this.assistantSpeaking = true;
+        this.markAssistantPlaybackStarted('openai_realtime');
 
         // This path is only used when ElevenLabs fails and OpenAI TTS fallback is active.
         this.sendBridge({
@@ -525,11 +514,7 @@ class VoiceBridgeSession {
         this.parentLogger.log(
           `[voice] speech_started callId=${this.meta.callId}`,
         );
-        if (
-          this.agentTurnInFlight ||
-          this.assistantSpeaking ||
-          this.activeResponse
-        ) {
+        if (this.agentTurnInFlight) {
           this.parentLogger.debug(
             `[voice] speech_ignored_during_assistant callId=${this.meta.callId}`,
           );
@@ -642,11 +627,7 @@ class VoiceBridgeSession {
     transcript: string,
     state: string | null,
   ) {
-    if (
-      this.agentTurnInFlight ||
-      this.assistantSpeaking ||
-      this.activeResponse
-    ) {
+    if (this.agentTurnInFlight || this.assistantSpeaking) {
       this.parentLogger.debug(
         `[voice] transcript_ignored_during_assistant callId=${this.meta.callId} state=${state || '-'} text="${transcript}"`,
       );
@@ -921,31 +902,15 @@ class VoiceBridgeSession {
     this.lastObservedSpeechEnergy = rms;
     this.updateAmbientNoise(rms);
 
-    if (this.assistantSpeaking || this.activeResponse) {
-      this.parentLogger.debug(
-        `[voice] barge_in_blocked_assistant_speaking callId=${this.meta.callId}`,
-      );
-      this.speechEnergyFrames = 0;
-      return;
+    if (this.assistantSpeaking) {
+      this.cancelAssistantAudio('barge_in');
+      this.resetAssistantPlaybackState('force_barge_in');
+      this.lastBargeInAt = Date.now();
     }
 
     this.openingGreetingProtectionUntil = 0;
     this.assistantPlaybackProtectionUntil = 0;
     this.speechEnergyFrames = 0;
-
-    const now = Date.now();
-    if (now - this.lastAssistantAudioAt < 1500) {
-      this.parentLogger.debug(
-        `[voice] barge_in_blocked_cooldown callId=${this.meta.callId}`,
-      );
-    }
-  }
-
-  private shouldPassInboundDuringAssistant(_payloadB64: string) {
-    // Temporary stabilization mode: always allow inbound audio to continue to
-    // the realtime session while transcript guards prevent assistant echo from
-    // creating a new turn.
-    return true;
   }
 
   private maybeStartOpeningGreeting() {
@@ -1326,19 +1291,6 @@ class VoiceBridgeSession {
   private cancelAssistantAudio(
     reason: 'barge_in' | 'new_reply' | 'close' = 'new_reply',
   ) {
-    if (
-      reason === 'barge_in' &&
-      this.assistantStartedAt &&
-      Date.now() - this.assistantStartedAt < 1200
-    ) {
-      this.parentLogger.debug(
-        `[voice] cancellation_blocked_recent_tts_start callId=${this.meta.callId} reason=${reason}`,
-      );
-      return;
-    }
-
-    this.playbackToken += 1;
-
     if (this.playbackTimer) {
       clearTimeout(this.playbackTimer);
       this.playbackTimer = null;
@@ -1359,30 +1311,38 @@ class VoiceBridgeSession {
       `[voice] cancellation_applied callId=${this.meta.callId} reason=${this.lastCancellationReason}`,
     );
 
-    if (this.activeResponse) {
-      this.sendOpenAi({ type: 'response.cancel' });
-      this.parentLogger.warn(
-        `[voice] response cancelled callId=${this.meta.callId} reason=${reason}`,
-      );
-    }
+    this.sendOpenAi({ type: 'response.cancel' });
+    this.parentLogger.warn(
+      `[voice] response cancelled callId=${this.meta.callId} reason=${reason}`,
+    );
 
     this.parentLogger.log(
       `[voice] assistant output cleared callId=${this.meta.callId} reason=${reason}`,
     );
-
-    this.resetAssistantPlaybackState(`cancel_${reason}`);
   }
 
   private resetAssistantPlaybackState(reason: string) {
     const hadPlayback =
       this.assistantSpeaking ||
-      this.activeResponse ||
       this.currentPlaybackDurationMs > 0 ||
       this.currentPlaybackOffsetBytes > 0 ||
       this.outboundAudioChunkCount > 0;
 
+    this.playbackToken += 1;
+
+    if (this.playbackTimer) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+
+    if (this.currentTtsAbort) {
+      try {
+        this.currentTtsAbort.abort();
+      } catch {}
+      this.currentTtsAbort = null;
+    }
+
     this.assistantSpeaking = false;
-    this.activeResponse = false;
     this.assistantStartedAt = 0;
     this.currentPlaybackDurationMs = 0;
     this.currentPlaybackOffsetBytes = 0;
@@ -1401,6 +1361,33 @@ class VoiceBridgeSession {
     this.outboundAudioChunkCount = 0;
     this.outboundAudioByteCount = 0;
     this.lastChunkSummaryLogAt = 0;
+  }
+
+  private markAssistantPlaybackStarted(
+    source: 'openai_realtime' | 'elevenlabs_buffered' | 'elevenlabs_streaming',
+  ) {
+    if (this.assistantSpeaking) {
+      return;
+    }
+
+    this.assistantSpeaking = true;
+    this.assistantStartedAt = Date.now();
+    this.lastAssistantAudioAt = this.assistantStartedAt;
+    this.lastAssistantMessage = normalizeVoiceComparisonText(
+      this.lastBotReplyText,
+    );
+
+    this.assistantPlaybackProtectionUntil =
+      this.assistantStartedAt + this.assistantGuardMs;
+
+    if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
+      this.openingGreetingProtectionUntil =
+        this.assistantStartedAt + this.openingGreetingBargeInGuardMs;
+    }
+
+    this.parentLogger.log(
+      `[voice] assistant_playback_started callId=${this.meta.callId} source=${source} turnId=${this.currentReplyTurnId || this.activeTurnId}`,
+    );
   }
 
   private completeAssistantPlayback(reason: string) {
@@ -1565,8 +1552,9 @@ class VoiceBridgeSession {
       return;
     }
 
-    if (this.assistantSpeaking || this.activeResponse) {
+    if (this.assistantSpeaking) {
       this.cancelAssistantAudio('new_reply');
+      this.resetAssistantPlaybackState('cancel_new_reply');
     }
 
     if (!this.ensureBridgeReady('speak_reply')) {
@@ -1578,12 +1566,20 @@ class VoiceBridgeSession {
 
     this.lastCancellationReason = null;
 
+    const normalizedAssistantMessage = normalizeVoiceComparisonText(clean);
+    if (
+      normalizedAssistantMessage &&
+      normalizedAssistantMessage === this.lastAssistantMessage
+    ) {
+      this.parentLogger.warn(
+        `[voice] duplicate_assistant_message_skipped callId=${this.meta.callId} turnId=${effectiveTurnId} text=${JSON.stringify(clean)}`,
+      );
+      return;
+    }
+
     this.lastBotReplyText = clean;
     this.currentReplyTurnId = effectiveTurnId;
     this.captureRecentContextsFromText(clean, effectiveTurnId, 'assistant');
-    this.assistantSpeaking = true;
-    this.activeResponse = true;
-    this.assistantStartedAt = Date.now();
     this.outboundAudioChunkCount = 0;
     this.outboundAudioByteCount = 0;
     this.lastChunkSummaryLogAt = 0;
@@ -1610,9 +1606,6 @@ class VoiceBridgeSession {
         this.resetAssistantPlaybackState('stale_turn_tts_ready');
         return;
       }
-
-      this.assistantSpeaking = true;
-      this.activeResponse = true;
 
       if (ttsResult?.audioBuffer && token === this.playbackToken) {
         this.parentLogger.log(
@@ -1919,6 +1912,7 @@ class VoiceBridgeSession {
       this.lastAssistantAudioAt = Date.now();
       if (!firstChunkSent) {
         firstChunkSent = true;
+        this.markAssistantPlaybackStarted('elevenlabs_streaming');
         this.markTiming('final_audio_send_start', {
           bytes: totalBytes,
           streaming: true,
@@ -1926,12 +1920,6 @@ class VoiceBridgeSession {
         this.logTurnLatency('assistant_first_audio_streaming', turnId, {
           ttsBufferedBytes: totalBytes,
         });
-        this.assistantPlaybackProtectionUntil =
-          this.lastAssistantAudioAt + this.assistantGuardMs;
-        if (this.lastBotReplyText === RealtimeBridgeService.openingGreeting) {
-          this.openingGreetingProtectionUntil =
-            this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
-        }
       }
 
       this.sendAudioChunk(outbound, 'streaming');
@@ -2011,8 +1999,6 @@ class VoiceBridgeSession {
         return;
       }
 
-      if (!this.assistantSpeaking) return;
-
       this.currentPlaybackOffsetBytes = offset;
       const chunk = buf.subarray(
         offset,
@@ -2025,16 +2011,8 @@ class VoiceBridgeSession {
       }
 
       this.lastAssistantAudioAt = Date.now();
-      if (
-        offset === 0 &&
-        this.lastBotReplyText === RealtimeBridgeService.openingGreeting
-      ) {
-        this.openingGreetingProtectionUntil =
-          this.lastAssistantAudioAt + this.openingGreetingBargeInGuardMs;
-      }
       if (offset === 0) {
-        this.assistantPlaybackProtectionUntil =
-          this.lastAssistantAudioAt + this.assistantGuardMs;
+        this.markAssistantPlaybackStarted('elevenlabs_buffered');
         this.markTiming('final_audio_send_start', {
           bytes: buf.length,
           streaming: false,
@@ -2099,6 +2077,7 @@ class VoiceBridgeSession {
     this.queuedTranscript = null;
 
     this.cancelAssistantAudio('close');
+    this.resetAssistantPlaybackState('cancel_close');
 
     try {
       if (this.openaiWs && this.openaiWs.readyState === WebSocket.OPEN) {
