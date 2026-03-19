@@ -234,6 +234,7 @@ class VoiceBridgeSession {
   private readonly speechFramesForBargeIn = 8;
   private readonly assistantGuardMs = 650;
   private readonly openingGreetingBargeInGuardMs = 900;
+  private readonly minPlaybackBargeInMs = 1000;
 
   private lastTranscriptAt = 0;
   private lastTranscriptText = '';
@@ -904,9 +905,27 @@ class VoiceBridgeSession {
     this.updateAmbientNoise(rms);
 
     if (this.assistantSpeaking) {
+      const now = Date.now();
+      const playbackElapsedMs = this.assistantStartedAt
+        ? now - this.assistantStartedAt
+        : 0;
+      const protectionRemaining = this.getAssistantProtectionMsRemaining();
+      if (
+        protectionRemaining > 0 ||
+        playbackElapsedMs < this.minPlaybackBargeInMs
+      ) {
+        this.logBargeInSuppressed(
+          protectionRemaining > 0
+            ? 'inside_protection_window'
+            : 'early_playback_guard',
+          `playbackElapsedMs=${playbackElapsedMs} protectionMsRemaining=${protectionRemaining} rms=${this.formatEnergy(rms)}`,
+        );
+        return;
+      }
+
       this.cancelAssistantAudio('barge_in');
       this.resetAssistantPlaybackState('force_barge_in');
-      this.lastBargeInAt = Date.now();
+      this.lastBargeInAt = now;
     }
 
     this.openingGreetingProtectionUntil = 0;

@@ -2507,6 +2507,16 @@ export class BookingCoreService {
       return successMsg;
     }
 
+    const nextMissingSlot = this.getNextMissingSlot(session);
+    if (nextMissingSlot === 'datetime') {
+      session.state = WaState.WAIT_DATETIME;
+      return await this.naturalAsk(session, 'datetime', {
+        services,
+        staff,
+        business: null,
+      });
+    }
+
     session.state = WaState.WAIT_SERVICE;
     return await this.naturalAsk(session, 'service', {
       services,
