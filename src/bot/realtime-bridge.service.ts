@@ -190,6 +190,7 @@ class VoiceBridgeSession {
   private cachedServices: any[] | null = null;
   private lastGreetingSuppressedAt = 0;
   private lastOpeningGreetingIgnoreLogAt = 0;
+  private lastSessionNotReadyLogAt = 0;
   private lastBargeInSuppressLogAt = 0;
   private lastBargeInSuppressReason = '';
   private lastChunkSummaryLogAt = 0;
@@ -309,41 +310,28 @@ private outboundAudioChunkCount = 0;
     this.sendOpenAi({
       type: 'session.update',
       session: {
+        type: 'realtime',
         instructions: [
           'You are the voice layer for a premium Turkish beauty center assistant.',
           'You do not decide business logic.',
           'You only speak the exact approved reply text provided by the app.',
           'Speak in Turkish unless the caller clearly speaks another language.',
-          'Speak naturally, calmly, warmly, professionally, and slightly slower than default phone assistants.',
-          'Keep sentences very short.',
-          'Do not add extra filler.',
-          'Do not invent bookings, confirmations, prices, or availability.',
-          'Never read emojis, markdown, symbols, or decorative characters.',
         ].join(' '),
-
-        modalities: ['audio', 'text'],
-        voice:
-          process.env.JARVIS_REALTIME_VOICE ||
-          process.env.OPENAI_TTS_VOICE ||
-          'shimmer',
-
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
-
-        input_audio_transcription: {
-          model: process.env.JARVIS_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
-          language: 'tr',
-          prompt:
-            'Bu bir Türkiye telefon görüşmesi. Güzellik merkezi, randevu, rezervasyon, lazer epilasyon, cilt bakımı, protez tırnak, saç, kaş, kirpik, tarih, saat, personel gibi kelimeler beklenir. Türkçe özel isimleri doğru yaz. Kısa isimleri ve personel isimlerini mümkün olduğunca doğru yaz.',
-        },
-
-        turn_detection: {
-          type: 'server_vad',
-          create_response: false,
-          interrupt_response: false,
-          threshold: 0.58,
-          prefix_padding_ms: 120,
-          silence_duration_ms: 140,
+        audio: {
+          input: {
+            format: {
+              type: 'audio/pcmu',
+            },
+          },
+          output: {
+            format: {
+              type: 'audio/pcmu',
+            },
+            voice:
+              process.env.JARVIS_REALTIME_VOICE ||
+              process.env.OPENAI_TTS_VOICE ||
+              'cedar',
+          },
         },
       },
     });
@@ -381,6 +369,16 @@ private outboundAudioChunkCount = 0;
     if (msg.event === 'media') {
       const payload = msg.media?.payload;
       if (!payload) return;
+      if (!this.sessionReady) {
+        const now = Date.now();
+        if (now - this.lastSessionNotReadyLogAt > 5000) {
+          this.lastSessionNotReadyLogAt = now;
+          this.parentLogger.debug(
+            `[voice] ignoring_media_before_session_ready callId=${this.meta.callId}`,
+          );
+        }
+        return;
+      }
 
       this.handlePossibleBargeIn(payload);
       this.refreshSpeechFailsafe();
