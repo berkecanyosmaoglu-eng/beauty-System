@@ -312,17 +312,24 @@ class VoiceBridgeSession {
     });
   }
 
+  private getPreferredRealtimeVoice() {
+    return (
+      process.env.JARVIS_REALTIME_VOICE ||
+      process.env.OPENAI_TTS_VOICE ||
+      'alloy'
+    );
+  }
+
   private configureOpenAiSession() {
     this.sendOpenAi({
       type: 'session.update',
       session: {
-        type: 'realtime',
         audio: {
           output: {
             format: {
               type: 'audio/pcmu',
             },
-            voice: 'cedar',
+            voice: this.getPreferredRealtimeVoice(),
           },
         },
       },
@@ -1541,18 +1548,9 @@ class VoiceBridgeSession {
             format: {
               type: 'audio/pcmu',
             },
-            voice:
-              process.env.JARVIS_REALTIME_VOICE ||
-              process.env.OPENAI_TTS_VOICE ||
-              'cedar',
           },
         },
-        instructions: [
-          'Speak exactly the following approved Turkish assistant reply.',
-          'Do not add or remove words.',
-          'Use a calm, warm, professional, female-sounding Turkish phone voice.',
-          `Approved reply: ${clean}`,
-        ].join(' '),
+        instructions: clean,
       },
     });
   }
