@@ -324,7 +324,18 @@ class VoiceBridgeSession {
     this.sendOpenAi({
       type: 'session.update',
       session: {
+        type: 'realtime',
         audio: {
+          input: {
+            format: {
+              type: 'audio/pcmu',
+            },
+            turn_detection: {
+              type: 'server_vad',
+              create_response: true,
+              interrupt_response: true,
+            },
+          },
           output: {
             format: {
               type: 'audio/pcmu',
