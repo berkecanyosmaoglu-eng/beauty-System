@@ -1,0 +1,62 @@
+[1mdiff --git a/src/jarvis/jarvis-brain.service.ts b/src/jarvis/jarvis-brain.service.ts[m
+[1mindex 19f5879..0274ea0 100644[m
+[1m--- a/src/jarvis/jarvis-brain.service.ts[m
+[1m+++ b/src/jarvis/jarvis-brain.service.ts[m
+[36m@@ -21,6 +21,8 @@[m [mtype JarvisSession = {[m
+   bookingIntentActive: boolean;[m
+   state: JarvisState;[m
+   updatedAt: number;[m
+[32m+[m[32m  lastServiceId?: string;[m
+[32m+[m[32m  lastServiceName?: string;[m
+   draft: {[m
+     customerName?: string;[m
+     serviceId?: string;[m
+[36m@@ -58,10 +60,18 @@[m [mexport class JarvisBrainService {[m
+     session.updatedAt = Date.now();[m
+ await this.tryFillDraft(session, rawText);[m
+ [m
+[31m-    if (!session.bookingIntentActive && looksLikeJarvisBookingIntent(rawText)) {[m
+[31m-      session.bookingIntentActive = true;[m
+[31m-    }[m
+[32m+[m[32mif (!session.bookingIntentActive && looksLikeJarvisBookingIntent(rawText)) {[m
+[32m+[m[32m  if ([m
+[32m+[m[32m    !session.draft.serviceId &&[m
+[32m+[m[32m    session.lastServiceId &&[m
+[32m+[m[32m    session.lastServiceName[m
+[32m+[m[32m  ) {[m
+[32m+[m[32m    session.draft.serviceId = session.lastServiceId;[m
+[32m+[m[32m    session.draft.serviceName = session.lastServiceName;[m
+[32m+[m[32m  }[m
+ [m
+[32m+[m[32m  session.bookingIntentActive = true;[m
+[32m+[m[32m}[m
+ [m
+     if (!session.bookingIntentActive) {[m
+       return this.knowledge.answer(payload);[m
+[36m@@ -122,14 +132,19 @@[m [mif (!session.draft.customerName) {[m
+   }[m
+ [m
+   private async tryFillDraft(session: JarvisSession, rawText: string): Promise<void> {[m
+[31m-    if (!session.draft.serviceId) {[m
+[31m-      const service = await this.findServiceMatch(session.tenantId, rawText);[m
+[31m-      if (service) {[m
+[31m-        session.draft.serviceId = String(service.id);[m
+[31m-        session.draft.serviceName = String(service.name);[m
+[31m-      }[m
+[31m-    }[m
+[32m+[m[32mif (!session.draft.serviceId) {[m
+[32m+[m[32m  const service = await this.findServiceMatch(session.tenantId, rawText);[m
+[32m+[m[32m  if (service) {[m
+[32m+[m[32m    const serviceId = String(service.id);[m
+[32m+[m[32m    const serviceName = String(service.name);[m
+[32m+[m
+[32m+[m[32m    session.lastServiceId = serviceId;[m
+[32m+[m[32m    session.lastServiceName = serviceName;[m
+ [m
+[32m+[m[32m    session.draft.serviceId = serviceId;[m
+[32m+[m[32m    session.draft.serviceName = serviceName;[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+     if (!session.draft.dateTimeText) {[m
+       const dateTimeText = extractJarvisDateTimeText(rawText);[m
+       if (dateTimeText) {[m

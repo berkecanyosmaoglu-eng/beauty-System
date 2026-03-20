@@ -320,16 +320,27 @@ class VoiceBridgeSession {
     );
   }
 
-  private configureOpenAiSession() {
-    const eventId = `session_update_${this.meta.callId}_${Date.now()}`;
-    this.sendOpenAi({
-      type: 'session.update',
-      event_id: eventId,
-      session: {
-        type: 'realtime',
+
+private configureOpenAiSession() {
+  const eventId = `session_update_${this.meta.callId}_${Date.now()}`;
+  this.sendOpenAi({
+    type: 'session.update',
+    event_id: eventId,
+    session: {
+      input_audio_format: 'g711_ulaw',
+      output_audio_format: 'g711_ulaw',
+      voice: this.getPreferredRealtimeVoice(),
+      input_audio_transcription: {
+        model: 'gpt-4o-mini-transcribe',
       },
-    });
-  }
+      turn_detection: {
+        type: 'server_vad',
+        create_response: false,
+        interrupt_response: true,
+      },
+    },
+  });
+}
 
   private async onBridgeMessage(msg: BridgeInboundMessage) {
     if (
@@ -477,36 +488,44 @@ class VoiceBridgeSession {
         }
         return;
 
-      case 'input_audio_buffer.speech_stopped':
-        this.lastSpeechStoppedAt = Date.now();
-        this.markTiming('speech_stopped');
-        this.refreshSpeechFailsafe();
-        this.parentLogger.log(
-          `[voice] speech_stopped callId=${this.meta.callId}`,
-        );
-        return;
+case 'input_audio_buffer.speech_stopped':
+  this.lastSpeechStoppedAt = Date.now();
+  this.markTiming('speech_stopped');
+  this.refreshSpeechFailsafe();
+  this.parentLogger.log(
+    `[voice] speech_stopped callId=${this.meta.callId}`,
+  );
 
-      case 'error': {
-        const code = String(evt?.error?.code || '');
-        if (code === 'response_cancel_not_active') return;
-        this.parentLogger.error(
-          `[voice] OpenAI error callId=${this.meta.callId} eventId=${String(
-            evt?.event_id || evt?.error?.event_id || '',
-          )} param=${String(evt?.error?.param || '')} code=${code}: ${JSON.stringify(
-            evt.error || evt,
-          )}`,
-        );
-        if (code === 'server_error') {
-          this.handleOpenAiServerError(code);
-        }
-        return;
-      }
+  this.sendOpenAi({
+    type: 'input_audio_buffer.commit',
+  });
 
-      default:
-        return;
-    }
+  return;
+
+case 'error': {
+  const code = String(evt?.error?.code || '');
+
+  if (
+    code === 'response_cancel_not_active' ||
+    code === 'input_audio_buffer_commit_empty'
+  ) {
+    return;
   }
 
+  this.parentLogger.error(
+    `[voice] OpenAI error callId=${this.meta.callId} eventId=${String(
+      evt?.event_id || evt?.error?.event_id || '',
+    )} param=${String(evt?.error?.param || '')} code=${code}: ${JSON.stringify(
+      evt.error || evt,
+    )}`,
+  );
+
+  if (code === 'server_error') {
+    this.handleOpenAiServerError(code);
+  }
+  return;
+}
+}
   private async sendAudioBufferRealtime(
     audioBuf: Buffer,
     source: 'streaming' | 'buffered' = 'buffered',
@@ -1041,11 +1060,11 @@ class VoiceBridgeSession {
 
     const throttleMs = reason === this.lastBargeInSuppressReason ? 2500 : 1200;
     if (now - this.lastBargeInSuppressLogAt < throttleMs) {
-      if (this.debugVoice) {
-        this.parentLogger.debug(
-          `[voice] barge_in_suppressed callId=${this.meta.callId} reason=${reason}${detail ? ` ${detail}` : ''}`,
-        );
-      }
+if (false && this.debugVoice) {
+  this.parentLogger.log(
+    `[voice-test] sendAudioChunk callId=${this.meta.callId} ...`,
+  );
+}
       return;
     }
 
@@ -1536,21 +1555,20 @@ class VoiceBridgeSession {
       );
     }
 
+
+
     this.responseCreatePending = true;
-    this.sendOpenAi({
-      type: 'response.create',
-      response: {
-        audio: {
-          output: {
-            format: {
-              type: 'audio/pcmu',
-            },
-          },
-        },
-        instructions: clean,
-      },
-    });
-  }
+
+    this.responseCreatePending = true;
+
+this.sendOpenAi({
+  type: 'response.create',
+  response: {
+    modalities: ['audio', 'text'],
+    instructions: `Aşağıdaki cümleyi Türkçe olarak aynen söyle, hiçbir ekleme yapma, hiçbir hizmet listeleme yapma, hiçbir açıklama ekleme: "${clean}"`,
+  },
+});
+}
 
   private logTurnLatency(
     label: string,
@@ -1576,19 +1594,28 @@ class VoiceBridgeSession {
     this.parentLogger.log(`[voice][latency] ${parts.join(' ')}`);
   }
 
-  private sendOpenAi(obj: any) {
-    if (!this.openaiWs || this.openaiWs.readyState !== WebSocket.OPEN) return;
-    this.parentLogger.log(
-      `[voice][openai_out] callId=${this.meta.callId} payload=${JSON.stringify(obj)}`,
-    );
-    this.openaiWs.send(JSON.stringify(obj));
+private sendOpenAi(obj: any) {
+  if (!this.openaiWs || this.openaiWs.readyState !== WebSocket.OPEN) return;
+
+  const type = String(obj?.type || '');
+
+   {
+if (obj?.type !== 'input_audio_buffer.append') {
+  this.parentLogger.log(
+    `[voice][openai_out] callId=${this.meta.callId} payload=${JSON.stringify(obj)}`,
+  );
+}
   }
+
+  this.openaiWs.send(JSON.stringify(obj));
+}
 
   private sendBridge(obj: any) {
     if (this.clientWs.readyState !== WebSocket.OPEN) {
-      this.parentLogger.warn(
-        `[voice] bridge_send_skipped callId=${this.meta.callId} readyState=${this.clientWs.readyState} event=${String(obj?.event || '-')}`,
-      );
+
+this.parentLogger.debug(
+  `[voice] media_buffering_before_session_ready callId=${this.meta.callId} queued=${this.pendingInputAudio.length} dropped=${this.pendingInputAudioDropped} sessionCreated=${this.sessionCreated}`,
+);
       return false;
     }
 

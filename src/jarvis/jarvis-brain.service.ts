@@ -21,6 +21,8 @@ type JarvisSession = {
   bookingIntentActive: boolean;
   state: JarvisState;
   updatedAt: number;
+  lastServiceId?: string;
+  lastServiceName?: string;
   draft: {
     customerName?: string;
     serviceId?: string;
@@ -58,10 +60,18 @@ export class JarvisBrainService {
     session.updatedAt = Date.now();
 await this.tryFillDraft(session, rawText);
 
-    if (!session.bookingIntentActive && looksLikeJarvisBookingIntent(rawText)) {
-      session.bookingIntentActive = true;
-    }
+if (!session.bookingIntentActive && looksLikeJarvisBookingIntent(rawText)) {
+  if (
+    !session.draft.serviceId &&
+    session.lastServiceId &&
+    session.lastServiceName
+  ) {
+    session.draft.serviceId = session.lastServiceId;
+    session.draft.serviceName = session.lastServiceName;
+  }
 
+  session.bookingIntentActive = true;
+}
 
     if (!session.bookingIntentActive) {
       return this.knowledge.answer(payload);
@@ -122,14 +132,19 @@ if (!session.draft.customerName) {
   }
 
   private async tryFillDraft(session: JarvisSession, rawText: string): Promise<void> {
-    if (!session.draft.serviceId) {
-      const service = await this.findServiceMatch(session.tenantId, rawText);
-      if (service) {
-        session.draft.serviceId = String(service.id);
-        session.draft.serviceName = String(service.name);
-      }
-    }
+if (!session.draft.serviceId) {
+  const service = await this.findServiceMatch(session.tenantId, rawText);
+  if (service) {
+    const serviceId = String(service.id);
+    const serviceName = String(service.name);
 
+    session.lastServiceId = serviceId;
+    session.lastServiceName = serviceName;
+
+    session.draft.serviceId = serviceId;
+    session.draft.serviceName = serviceName;
+  }
+}
     if (!session.draft.dateTimeText) {
       const dateTimeText = extractJarvisDateTimeText(rawText);
       if (dateTimeText) {
