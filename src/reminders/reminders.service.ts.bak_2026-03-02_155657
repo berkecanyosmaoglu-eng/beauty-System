@@ -1,0 +1,246 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
+import { PrismaService } from '../prisma/prisma.service';
+
+@Injectable()
+export class RemindersService {
+  private readonly logger = new Logger(RemindersService.name);
+
+  // Bizim reminder type sabiti (DB enum farklıysa da sorun değil, string basıyoruz)
+  private readonly REMINDER_TYPE = 'APPOINTMENT_REMINDER_2H';
+
+  constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Her dakika çalışır.
+   * Hedef: randevu saatine yaklaşık 2 saat kala (±1dk) müşteriye WhatsApp hatırlatma gönder.
+   *
+   * NOT:
+   * - DB'de date(DateTime) + time(String) kullandığımız için kesin filtreyi JS'te yapıyoruz.
+   * - Idempotency için DB'ye migration atmıyoruz; var olan "notifications" tablosuna log düşüyoruz.
+   * - WhatsApp gönderimi Twilio REST ile direkt buradan yapılır (WhatsappService'e dokunmuyoruz).
+   */
+  @Cron('*/1 * * * *')
+  async run2hReminders() {
+    try {
+      const now = new Date();
+
+      // 2 saat kala küçük pencere (kaçırmamak için ±1dk)
+      const windowStart = new Date(now.getTime() + 119 * 60 * 1000);
+      const windowEnd = new Date(now.getTime() + 121 * 60 * 1000);
+
+      // Bugün + yarın randevularını çekelim (yük küçük)
+      const day0 = new Date(now);
+      day0.setHours(0, 0, 0, 0);
+      const day2 = new Date(day0.getTime() + 2 * 24 * 60 * 60 * 1000);
+
+      // PROD delegate isimleri: appointments / customers / staff / services (plural)
+      const appts = await this.prisma.appointments.findMany({
+        where: {
+          date: { gte: day0, lt: day2 },
+          // status alanın varsa iptal olanları filtrelemek için aşağıdaki satırı açabiliriz:
+          // status: { not: 'CANCELED' } as any,
+        } as any,
+        include: {
+          customer: true,
+          service: true,
+          staff: true,
+        } as any,
+        take: 600,
+      });
+
+      if (!appts?.length) return;
+
+      const twilioClient = this.getTwilioClientSafe();
+      const twilioFrom = this.getTwilioWhatsappFromSafe();
+      if (!twilioClient || !twilioFrom) {
+        this.logger.warn(
+          `[2hReminder] Twilio env missing. Need TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN + TWILIO_WHATSAPP_FROM`,
+        );
+        return;
+      }
+
+      let sent = 0;
+
+      for (const a of appts as any[]) {
+        const startAt = this.combineDateAndTime(a.date, a.time);
+        if (!startAt) continue;
+
+        // pencere dışı
+        if (startAt < windowStart || startAt > windowEnd) continue;
+
+        const toPhone = String(a?.customer?.phoneNumber || '').trim();
+        if (!toPhone) continue;
+
+        // idempotency: notifications tablosunda bu appointment için reminder var mı?
+        const already = await this.findExistingReminder(a.tenantId, a.id, toPhone);
+        if (already) continue;
+
+        const serviceName = String(a?.service?.name || 'randevun');
+        const staffName = a?.staff?.name ? ` (${String(a.staff.name)})` : '';
+        const startText = this.prettyTr(startAt);
+
+        const msg =
+          `Selam 👋 Randevuna 2 saat kaldı.\n` +
+          `📅 ${startText}\n` +
+          `💅 ${serviceName}${staffName}\n\n` +
+          `Gelebilecek misin? (E/H)\n` +
+          `İptal/erteleme istersen buraya yazman yeter.`;
+
+        try {
+          const to = this.normalizeToWhatsapp(toPhone);
+
+          // WhatsApp gönder
+          const res = await twilioClient.messages.create({
+            from: twilioFrom,
+            to,
+            body: msg,
+          });
+
+          // idempotency log (başarılı gönderimden sonra)
+          await this.createReminderLog({
+            tenantId: a.tenantId,
+            appointmentId: a.id,
+            to: this.normalizePlainPhone(toPhone),
+            providerMessageId: String(res?.sid || ''),
+            payload: {
+              startAt: startAt.toISOString(),
+              serviceId: a.serviceId,
+              staffId: a.staffId,
+            },
+          });
+
+          sent++;
+        } catch (e: any) {
+          this.logger.error(
+            `[2hReminder] send failed apptId=${a?.id} to=${toPhone} err=${e?.message || e}`,
+          );
+        }
+      }
+
+      if (sent > 0) this.logger.log(`[2hReminder] sent=${sent}`);
+    } catch (e: any) {
+      this.logger.error(`[run2hReminders] ${e?.message || e}`);
+    }
+  }
+
+  // ---------------- helpers ----------------
+
+  private getTwilioClientSafe(): any | null {
+    const sid = process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID;
+    const token = process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
+    if (!sid || !token) return null;
+
+    try {
+      // Dinamik import
+      const twilio = require('twilio');
+      return twilio(sid, token);
+    } catch (e) {
+      this.logger.error(`[2hReminder] twilio package missing? ${String((e as any)?.message || e)}`);
+      return null;
+    }
+  }
+
+  private getTwilioWhatsappFromSafe(): string | null {
+    const from =
+      process.env.TWILIO_WHATSAPP_FROM ||
+      process.env.WHATSAPP_FROM ||
+      process.env.TWILIO_FROM_WHATSAPP ||
+      '';
+    if (!from) return null;
+    return this.normalizeToWhatsapp(from);
+  }
+
+  private normalizeToWhatsapp(raw: string): string {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+    if (/^whatsapp:/i.test(s)) return s;
+    if (s.startsWith('+')) return `whatsapp:${s}`;
+    if (s.startsWith('90')) return `whatsapp:+${s}`;
+    if (s.startsWith('0')) return `whatsapp:+9${s}`; // 0XXXXXXXXXX -> +90XXXXXXXXXX
+    return `whatsapp:+90${s}`;
+  }
+
+  private normalizePlainPhone(raw: string): string {
+    // whatsapp:+... -> +...
+    return String(raw || '').replace(/^whatsapp:/i, '').trim();
+  }
+
+  private combineDateAndTime(date: Date, timeStr: string): Date | null {
+    const t = String(timeStr || '').trim();
+    const m = t.match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (Number.isNaN(hh) || Number.isNaN(mm)) return null;
+
+    const d = new Date(date);
+    d.setHours(hh, mm, 0, 0);
+    return d;
+  }
+
+  private prettyTr(d: Date) {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const x = new Date(d);
+    return `${pad(x.getDate())}.${pad(x.getMonth() + 1)}.${x.getFullYear()} ${pad(
+      x.getHours(),
+    )}:${pad(x.getMinutes())}`;
+  }
+
+  private async findExistingReminder(tenantId: string, appointmentId: string, toPhone: string) {
+    // notifications tablosu drift listende var. Alan isimleri farklı çıkarsa try/catch ile yutacağız.
+    try {
+      return await (this.prisma as any).notifications.findFirst({
+        where: {
+          tenantId,
+          appointmentId,
+          type: this.REMINDER_TYPE,
+          to: this.normalizePlainPhone(toPhone),
+          status: 'SENT',
+        },
+        select: { id: true },
+      });
+    } catch {
+      // Bazı şemalarda alan adları farklı olabilir → en azından appointmentId+type ile arayalım
+      try {
+        return await (this.prisma as any).notifications.findFirst({
+          where: {
+            tenantId,
+            appointmentId,
+            type: this.REMINDER_TYPE,
+          },
+          select: { id: true },
+        });
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  private async createReminderLog(params: {
+    tenantId: string;
+    appointmentId: string;
+    to: string;
+    providerMessageId?: string;
+    payload?: any;
+  }) {
+    try {
+      await (this.prisma as any).notifications.create({
+        data: {
+          tenantId: params.tenantId,
+          appointmentId: params.appointmentId,
+          channel: 'WHATSAPP',
+          type: this.REMINDER_TYPE,
+          to: params.to,
+          status: 'SENT',
+          provider: 'twilio',
+          providerMessageId: params.providerMessageId || null,
+          payload: params.payload || {},
+        },
+      });
+    } catch (e) {
+      // log yazılamazsa bile gönderim oldu → cron’u kırmayalım
+      this.logger.warn(`[2hReminder] notifications log failed: ${(e as any)?.message || e}`);
+    }
+  }
+}

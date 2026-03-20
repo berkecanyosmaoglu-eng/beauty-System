@@ -1,0 +1,147 @@
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { CreateAppointmentDto } from './dto/create-appointment.dto';
+import { UpdateAppointmentDto } from './dto/update-appointment.dto';
+import { NotificationsService } from '../notifications/notifications.service';
+
+@Injectable()
+export class AppointmentsService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notificationsService: NotificationsService,
+  ) {}
+
+  // ⭐ Telefon botu için
+  async nextAvailable(
+    tenantId: string,
+    staffId: string,
+    serviceId: string,
+    from?: string,
+    stepMinutes = 15,
+    maxDays = 14,
+  ) {
+    if (!tenantId) throw new BadRequestException('tenantId gerekli');
+    if (!staffId) throw new BadRequestException('staffId gerekli');
+    if (!serviceId) throw new BadRequestException('serviceId gerekli');
+
+    const service = await this.prisma.service.findUnique({ where: { id: serviceId } });
+    if (!service) throw new BadRequestException('serviceId geçersiz');
+
+    const startFrom = from ? new Date(from) : new Date();
+    const rounded = new Date(startFrom);
+    rounded.setSeconds(0, 0);
+
+    const durationMs = service.duration * 60000;
+    const endLimit = new Date(rounded.getTime() + maxDays * 86400000);
+
+    let cursor = new Date(rounded);
+
+    while (cursor < endLimit) {
+      const endAt = new Date(cursor.getTime() + durationMs);
+
+      const conflict = await this.prisma.appointment.findFirst({
+        where: {
+          tenantId,
+          staffId,
+          startAt: { lt: endAt },
+          endAt: { gt: cursor },
+        },
+      });
+
+      if (!conflict) {
+        return { ok: true, startAt: cursor, endAt };
+      }
+
+      cursor = new Date(conflict.endAt);
+    }
+
+    return { ok: false };
+  }
+
+  async create(dto: CreateAppointmentDto) {
+    const service = await this.prisma.service.findUnique({ where: { id: dto.serviceId } });
+    if (!service) throw new BadRequestException('serviceId geçersiz');
+
+    const startAt = new Date(dto.startAt);
+    const endAt = new Date(startAt.getTime() + service.duration * 60000);
+
+    const appt = await this.prisma.appointment.create({
+      data: {
+        tenantId: dto.tenantId,
+        customerId: dto.customerId,
+        serviceId: dto.serviceId,
+        staffId: dto.staffId ?? null,
+        startAt,
+        endAt,
+        status: dto.status ?? 'scheduled',
+      },
+      include: { customer: true, service: true, staff: true },
+    });
+
+    // 📩 SMS ve bildirim: randevu oluşturulunca müşteriye onay mesajı
+    try {
+      const phone = appt.customer?.phone || '';
+      if (phone) {
+        await this.notificationsService.sendBookingConfirmation({
+          toPhone: phone,
+          salonName: 'Güzellik Merkezi',
+          serviceName: appt.service.name,
+          staffName: appt.staff?.fullName,
+          startAt: appt.startAt,
+        });
+      }
+    } catch (e) {
+      console.error('Bildirim/SMS gönderimi başarısız', e);
+    }
+
+    return appt;
+  }
+
+  async findAll(tenantId?: string, date?: string, status?: string, today?: boolean) {
+    const where: any = {};
+    if (tenantId) where.tenantId = tenantId;
+    if (status) where.status = status;
+
+    if (today) {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      end.setHours(23, 59, 59, 999);
+      where.startAt = { gte: start, lte: end };
+    }
+
+    if (date) {
+      const d = new Date(date);
+      if (Number.isNaN(d.getTime())) throw new BadRequestException('date geçersiz');
+
+      const start = new Date(d);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(d);
+      end.setHours(23, 59, 59, 999);
+      where.startAt = { gte: start, lte: end };
+    }
+
+    return this.prisma.appointment.findMany({
+      where,
+      include: { customer: true, service: true, staff: true },
+      orderBy: { startAt: 'asc' },
+    });
+  }
+
+  async findOne(id: string) {
+    const appt = await this.prisma.appointment.findUnique({ where: { id } });
+    if (!appt) throw new NotFoundException();
+    return appt;
+  }
+
+  async update(id: string, dto: UpdateAppointmentDto) {
+    return this.prisma.appointment.update({
+      where: { id },
+      data: dto,
+    });
+  }
+
+  async remove(id: string) {
+    return this.prisma.appointment.delete({ where: { id } });
+  }
+}

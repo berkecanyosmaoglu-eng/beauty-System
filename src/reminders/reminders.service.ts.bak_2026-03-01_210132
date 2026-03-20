@@ -1,0 +1,135 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
+import { PrismaService } from '../prisma/prisma.service';
+import { WhatsappService } from '../whatsapp/whatsapp.service';
+
+@Injectable()
+export class RemindersService {
+  private readonly logger = new Logger(RemindersService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly whatsapp: WhatsappService,
+  ) {}
+
+  /**
+   * Her dakika çalışır.
+   * Hedef: Randevu saatine ~2 saat kala (± 1 dk pencere) müşteriye WhatsApp reminder gönder.
+   *
+   * Production schema:
+   * - appointments: date (DateTime) + time (String "HH:mm")
+   * - customers: phoneNumber
+   * - staff: name
+   *
+   * Idempotency:
+   * - appointments.reminder2hSentAt DateTime?  (schema.prisma'ya eklenmeli)
+   */
+  @Cron('*/1 * * * *')
+  async run2hReminders() {
+    try {
+      const now = new Date();
+
+      // 2 saat kala: now + 119dk .. now + 121dk penceresi (kaçırma olmasın)
+      const targetFrom = new Date(now.getTime() + 119 * 60 * 1000);
+      const targetTo = new Date(now.getTime() + 121 * 60 * 1000);
+
+      // Bugün + yarın aralığında randevuları çekip, kesin filtreyi JS tarafında yapıyoruz.
+      // (date+time ayrı olduğu için DB'de tek query ile "2 saat kala" yakalamak zor; ölçek küçük, bu yeter.)
+      const day0 = new Date(now);
+      day0.setHours(0, 0, 0, 0);
+      const day2 = new Date(day0.getTime() + 2 * 24 * 60 * 60 * 1000);
+
+      const appts = await this.prisma.appointments.findMany({
+        where: {
+          date: { gte: day0, lt: day2 },
+          reminder2hSentAt: null, // idempotency
+          isCanceled: false as any, // eğer schema'da yoksa, bu satır build'de patlar → sil
+        } as any,
+        include: {
+          customer: true,
+          service: true,
+          staff: true,
+        } as any,
+        take: 500,
+      });
+
+      if (!appts?.length) return;
+
+      let sent = 0;
+
+      for (const a of appts as any[]) {
+        const startAt = this.combineDateAndTime(a.date, a.time);
+        if (!startAt) continue;
+
+        // pencere dışındaysa skip
+        if (startAt < targetFrom || startAt > targetTo) continue;
+
+        // müşteri telefonu
+        const toPhone =
+          String(a?.customer?.phoneNumber || a?.customerPhone || '').trim();
+        if (!toPhone) continue;
+
+        const serviceName = String(a?.service?.name || 'randevunuz');
+        const staffName = a?.staff?.name ? ` (${String(a.staff.name)})` : '';
+        const startText = this.prettyTr(startAt);
+        const timeText = String(a?.time || '').trim() || startText.split(' ')[1] || '';
+
+        const msg =
+          `Selam 👋 Randevuna 2 saat kaldı.\n` +
+          `📅 ${startText}\n` +
+          `💅 ${serviceName}${staffName}\n\n` +
+          `Gelebilecek misin? (E/H)\n` +
+          `İptal/erteleme istersen buraya yazman yeter.`;
+
+        try {
+          // Proactive WhatsApp send (Twilio REST)
+          await this.whatsapp.sendProactiveWhatsApp({
+            tenantId: a.tenantId,
+            toPhone,
+            body: msg,
+            appointmentId: a.id,
+          });
+
+          // idempotency işaretle
+          await this.prisma.appointments.update({
+            where: { id: a.id },
+            data: { reminder2hSentAt: new Date() },
+          });
+
+          sent++;
+        } catch (e: any) {
+          this.logger.error(
+            `[2hReminder] failed apptId=${a?.id} to=${toPhone} time=${timeText} err=${e?.message || e}`,
+          );
+          // Hata olursa reminder2hSentAt yazmıyoruz -> sonraki cron retry eder
+        }
+      }
+
+      if (sent > 0) this.logger.log(`[2hReminder] sent=${sent}`);
+    } catch (e: any) {
+      this.logger.error(`[run2hReminders] ${e?.message || e}`);
+    }
+  }
+
+  private combineDateAndTime(date: Date, timeStr: string): Date | null {
+    const t = String(timeStr || '').trim();
+    const m = t.match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (Number.isNaN(hh) || Number.isNaN(mm)) return null;
+
+    const d = new Date(date);
+    d.setHours(hh, mm, 0, 0);
+    return d;
+  }
+
+  private prettyTr(d: Date) {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const x = new Date(d);
+    return `${pad(x.getDate())}.${pad(x.getMonth() + 1)}.${x.getFullYear()} ${pad(
+      x.getHours(),
+    )}:${pad(x.getMinutes())}`;
+  }
+}

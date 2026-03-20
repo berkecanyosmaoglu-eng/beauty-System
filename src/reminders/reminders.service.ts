@@ -1,0 +1,289 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
+import { PrismaService } from '../prisma/prisma.service';
+import { DateTime } from 'luxon';
+import { WhatsappService } from '../whatsapp/whatsapp.service';
+
+@Injectable()
+export class RemindersService {
+  private readonly logger = new Logger(RemindersService.name);
+
+  private readonly NOTIF_TYPE: 'WHATSAPP' = 'WHATSAPP';
+  private readonly ZONE = process.env.REMINDERS_ZONE || 'Europe/Istanbul';
+
+  private readonly TARGET_MIN = this.readIntEnv('REMINDERS_TARGET_MINUTES', 120);
+  private readonly TOL_MIN = this.readIntEnv('REMINDERS_TOL_MINUTES', 1);
+  private readonly TAKE_LIMIT = this.readIntEnv('REMINDERS_TAKE', 800);
+
+  private readonly DEBUG = String(process.env.REMINDERS_DEBUG || '').trim() === '1';
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly wa: WhatsappService,
+  ) {}
+
+  @Cron('*/1 * * * *')
+  async run2hReminders() {
+    // ✅ saniye problemine karşı: "minute" bazına sabitle
+    const nowUtc = new Date();
+    const nowTr = DateTime.fromJSDate(nowUtc, { zone: 'utc' }).setZone(this.ZONE).startOf('minute');
+
+    const minLo = this.TARGET_MIN - this.TOL_MIN; // ör: 119
+    const minHi = this.TARGET_MIN + this.TOL_MIN; // ör: 121
+
+    const fromTr = nowTr.plus({ minutes: minLo });
+    const toTr = nowTr.plus({ minutes: minHi });
+
+    this.logger.log(
+      `[run2hReminders] nowTr=${nowTr.toFormat('yyyy-LL-dd HH:mm')} targetMin=${this.TARGET_MIN} tolMin=${this.TOL_MIN} windowTr(${fromTr.toFormat(
+        'HH:mm',
+      )}..${toTr.toFormat('HH:mm')})`,
+    );
+
+    try {
+      // Performans: bugünden +2 gün (TR gün başına göre)
+      const day0Tr = nowTr.startOf('day');
+      const day2Tr = day0Tr.plus({ days: 2 });
+
+      const day0Utc = day0Tr.toUTC().toJSDate();
+      const day2Utc = day2Tr.toUTC().toJSDate();
+
+      const appts = await this.prisma.appointments.findMany({
+        where: {
+          date: { gte: day0Utc, lt: day2Utc },
+          // ✅ iptal olanlara reminder atma
+          status: 'CONFIRMED',
+        } as any,
+        select: {
+          id: true,
+          tenantId: true,
+          date: true,
+          time: true,
+          staffId: true,
+          serviceId: true,
+          customerId: true,
+          customers: { select: { phoneNumber: true, name: true } },
+          services: { select: { name: true } },
+        } as any,
+        take: this.TAKE_LIMIT,
+      });
+
+      if (this.DEBUG) this.logger.log(`[run2hReminders][debug] apptsFetched=${appts.length}`);
+      if (!appts.length) return;
+
+      // Staff isimlerini toplu çek
+      const staffIds = Array.from(new Set(appts.map((a: any) => a.staffId).filter(Boolean)));
+      const staffRows = staffIds.length
+        ? await this.prisma.staff.findMany({
+            where: { id: { in: staffIds } } as any,
+            select: { id: true, name: true },
+          } as any)
+        : [];
+
+      const staffNameById = new Map<string, string>();
+      for (const s of staffRows as any[]) staffNameById.set(String(s.id), String(s.name || ''));
+
+      // window candidate
+      const candidates: { appt: any; startAtUtc: Date; diffMin: number }[] = [];
+      for (const a of appts as any[]) {
+        const startAtUtc = this.combineDateAndTimeTrToUtc(a.date, a.time);
+        if (!startAtUtc) continue;
+
+        // ✅ dakika bazlı karşılaştırma (saniye yüzünden kaçmasın)
+        const diffMin = Math.round((startAtUtc.getTime() - nowUtc.getTime()) / 60000);
+
+
+        if (diffMin < minLo || diffMin > minHi) {
+          if (this.DEBUG) {
+            this.logger.log(
+              `[run2hReminders][debug] skip apptId=${a.id} reason=out_of_window startAtTr=${this.prettyTrFromUtc(
+                startAtUtc,
+              )} diffMin=${diffMin}`,
+            );
+          }
+          continue;
+        }
+
+        candidates.push({ appt: a, startAtUtc, diffMin });
+      }
+
+      if (this.DEBUG) this.logger.log(`[run2hReminders][debug] candidates=${candidates.length}`);
+      if (!candidates.length) return;
+
+      // tenant bazlı idempotency
+      const byTenant = new Map<string, { appt: any; startAtUtc: Date; diffMin: number }[]>();
+      for (const c of candidates) {
+        const t = String(c.appt.tenantId);
+        if (!byTenant.has(t)) byTenant.set(t, []);
+        byTenant.get(t)!.push(c);
+      }
+
+      let sentCount = 0;
+
+      for (const [tenantId, rows] of byTenant.entries()) {
+        const apptIds = rows.map((r) => String(r.appt.id));
+
+        const alreadySent = await this.fetchAlreadySentAppointmentIds({
+          tenantId,
+          apptIds,
+          notifType: this.NOTIF_TYPE,
+        });
+
+        if (this.DEBUG) {
+          this.logger.log(
+            `[run2hReminders][debug] tenant=${tenantId} apptIds=${apptIds.length} alreadySent=${alreadySent.size}`,
+          );
+        }
+
+        for (const { appt: a, startAtUtc } of rows) {
+          if (alreadySent.has(String(a.id))) {
+            if (this.DEBUG) {
+              this.logger.log(`[run2hReminders][debug] skip apptId=${a.id} reason=already_sent`);
+            }
+            continue;
+          }
+
+          const toPhone = String(a?.customers?.phoneNumber || '').trim();
+          if (!toPhone) continue;
+
+          const serviceName = String(a?.services?.name || 'randevun');
+          const staffNameRaw = staffNameById.get(String(a.staffId)) || '';
+          const staffName = staffNameRaw ? ` (${staffNameRaw})` : '';
+          const startTextTr = this.prettyTrFromUtc(startAtUtc);
+
+          const body =
+            `Selam 👋 Randevuna ${this.TARGET_MIN >= 60 ? 'yaklaşık ' : ''}${this.prettyMinutes(this.TARGET_MIN)} kaldı.\n` +
+            `📅 ${startTextTr}\n` +
+            `💅 ${serviceName}${staffName}\n\n` +
+            `İptal/erteleme istersen buraya yazman yeter.`;
+
+          try {
+            await this.wa.sendProactiveWhatsApp({
+              tenantId,
+              toPhone,
+              body,
+              appointmentId: a.id,
+              subject: 'Randevu Hatırlatma',
+              metadata: {
+                appointmentId: String(a.id),
+                startAtUtc: startAtUtc.toISOString(),
+                serviceId: a.serviceId,
+                staffId: a.staffId,
+                targetMinutes: this.TARGET_MIN,
+              },
+            });
+
+            sentCount++;
+            this.logger.log(
+              `[2hReminder] sent apptId=${a.id} to=${toPhone} startTr=${this.prettyTrFromUtc(startAtUtc)}`,
+            );
+          } catch (e: any) {
+            const msg = e?.message || e?.toString?.() || 'unknown error';
+            const extra = (() => {
+              try {
+                return JSON.stringify(e);
+              } catch {
+                return String(e);
+              }
+            })();
+            this.logger.error(
+              `[2hReminder] send failed apptId=${a?.id} to=${toPhone} msg=${msg} extra=${extra}`,
+              e?.stack,
+            );
+          }
+        }
+      }
+
+      if (sentCount > 0) this.logger.log(`[2hReminder] sent=${sentCount}`);
+    } catch (e: any) {
+      const msg = e?.message || e?.toString?.() || 'unknown error';
+      const extra = (() => {
+        try {
+          return JSON.stringify(e);
+        } catch {
+          return String(e);
+        }
+      })();
+      this.logger.error(
+        `[run2hReminders] ${e?.code ? `code=${e.code} ` : ''}${msg} extra=${extra}`,
+        e?.stack,
+      );
+    }
+  }
+
+  private async fetchAlreadySentAppointmentIds(opts: {
+    tenantId: string;
+    apptIds: string[];
+    notifType: string;
+  }): Promise<Set<string>> {
+    const { tenantId, apptIds, notifType } = opts;
+
+    // ✅ tenant_id yok → sadece "tenantId" kullan
+    const sql = `
+      SELECT metadata
+      FROM notifications
+      WHERE "tenantId" = $1
+        AND type = $2::"NotificationType"
+        AND status = 'sent'
+        AND (metadata->>'appointmentId') = ANY($3)
+      LIMIT 2000
+    `;
+
+    try {
+      const rows = await this.prisma.$queryRawUnsafe<any[]>(sql, tenantId, notifType, apptIds);
+      const set = new Set<string>();
+      for (const r of rows || []) {
+        const apptId = (r as any)?.metadata?.appointmentId;
+        if (apptId) set.add(String(apptId));
+      }
+      return set;
+    } catch (e: any) {
+      this.logger.warn(
+        `[2hReminder] fetchAlreadySent failed: ${e?.message || e?.toString?.() || e}`,
+      );
+      return new Set<string>();
+    }
+  }
+
+  // date+time (TR local) -> UTC Date
+  private combineDateAndTimeTrToUtc(dateOnly: Date, timeStr: string): Date | null {
+    const t = String(timeStr || '').trim();
+    const m = t.match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (Number.isNaN(hh) || Number.isNaN(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+
+    // dateOnly DB’den gelir (UTC Date). İstanbul gününü alıyoruz.
+    const trDay = DateTime.fromJSDate(dateOnly, { zone: 'utc' }).setZone(this.ZONE);
+    const yyyy = trDay.year;
+    const mon = trDay.month;
+    const day = trDay.day;
+
+    const tr = DateTime.fromObject(
+      { year: yyyy, month: mon, day, hour: hh, minute: mm, second: 0, millisecond: 0 },
+      { zone: this.ZONE },
+    );
+
+    if (!tr.isValid) return null;
+    return tr.toUTC().toJSDate();
+  }
+
+  private prettyTrFromUtc(utc: Date) {
+    return DateTime.fromJSDate(utc, { zone: 'utc' }).setZone(this.ZONE).toFormat('dd.LL.yyyy HH:mm');
+  }
+
+  private readIntEnv(key: string, fallback: number): number {
+    const v = String(process.env[key] || '').trim();
+    if (!v) return fallback;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  private prettyMinutes(min: number) {
+    if (min % 60 === 0) return `${min / 60} saat`;
+    if (min > 60) return `${Math.floor(min / 60)} saat ${min % 60} dk`;
+    return `${min} dk`;
+  }
+}

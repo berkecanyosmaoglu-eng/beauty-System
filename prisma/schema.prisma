@@ -1,0 +1,263 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model appointments {
+  id String @id @default(cuid())
+  tenantId         String
+  customerId       String
+  serviceId        String
+  staffId          String
+  date             DateTime
+  time             String
+  endTime          String?
+  status           AppointmentStatus @default(PENDING)
+  notes            String?
+  channel          SessionChannel?
+  messageSessionId String?
+  callSessionId    String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime
+  call_sessions    call_sessions?    @relation(fields: [callSessionId], references: [id])
+  customers        customers         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  message_sessions message_sessions? @relation(fields: [messageSessionId], references: [id])
+  services         services          @relation(fields: [serviceId], references: [id])
+  staff            staff             @relation(fields: [staffId], references: [id])
+  tenants          tenants           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reminder2hSentAt DateTime?
+startAtUtc DateTime? @db.Timestamptz(6)
+endAtUtc   DateTime? @db.Timestamptz(6)
+
+@@index([tenantId, startAtUtc])
+  @@unique([tenantId, staffId, date, time])
+  @@index([tenantId, customerId])
+  @@index([tenantId, date, status])
+}
+
+model call_sessions {
+  id           String         @id
+  tenantId     String
+  customerId   String?
+  callSid      String         @unique
+  from         String
+  to           String?
+  status       String?
+  duration     Int?
+  transcript   String?
+  context      Json?
+  createdAt    DateTime       @default(now())
+updatedAt    DateTime @updatedAt
+  appointments appointments[]
+  customers    customers?     @relation(fields: [customerId], references: [id])
+  tenants      tenants        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, callSid])
+}
+
+model customers {
+  id               String             @id
+  tenantId         String
+  phoneNumber      String
+  name             String?
+  email            String?
+  notes            String?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime
+  appointments     appointments[]
+  call_sessions    call_sessions[]
+  tenants          tenants            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  message_sessions message_sessions[]
+
+  @@unique([tenantId, phoneNumber])
+  @@index([tenantId, phoneNumber])
+}
+
+model message_sessions {
+  id              String         @id
+  tenantId        String
+  customerId      String
+  channel         SessionChannel @default(WHATSAPP)
+  conversationId  String         @unique
+  context         Json?
+  lastSuggestions Json?
+  lastMessageAt   DateTime?
+  isActive        Boolean        @default(true)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime
+  appointments    appointments[]
+  customers       customers      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  tenants         tenants        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+  @@index([tenantId, conversationId])
+}
+
+model notifications {
+  id        String           @id
+  tenantId  String
+  type      NotificationType
+  recipient String
+  subject   String?
+  body      String
+  sentAt    DateTime?
+  status    String           @default("pending")
+  metadata  Json?
+  createdAt DateTime         @default(now())
+  tenants   tenants          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, status])
+}
+
+model services {
+  id           String         @id
+  tenantId     String
+  name         String
+  description  String?
+  duration     Int
+  price        Float
+  isActive     Boolean        @default(true)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime
+  appointments appointments[]
+  tenants      tenants        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, isActive])
+}
+
+model staff {
+  id           String         @id
+  tenantId     String
+  name         String
+  phone        String?
+  email        String?
+  isActive     Boolean        @default(true)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime
+  appointments appointments[]
+  tenants      tenants        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, isActive])
+}
+
+model subscription_plans {
+  id                String               @id
+  tenantId          String
+  planType          SubscriptionPlanType
+  status            SubscriptionStatus   @default(TRIAL)
+  startDate         DateTime
+  endDate           DateTime?
+  monthlyPrice      Float
+  voiceMinutesQuota Int?
+  messageQuota      Int?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime
+  tenants           tenants              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, status])
+}
+
+model system_logs {
+  id        String   @id
+  tenantId  String?
+  level     String
+  message   String
+  context   Json?
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+}
+
+model tenant_settings {
+  id                    String   @id
+  tenantId              String   @unique
+  botEnabled            Boolean  @default(true)
+  voiceEnabled          Boolean  @default(true)
+  whatsappEnabled       Boolean  @default(true)
+  workingHoursStart     String   @default("09:00")
+  workingHoursEnd       String   @default("18:00")
+  workingDays           String   @default("1,2,3,4,5")
+  slotDurationMinutes   Int      @default(30)
+  bufferMinutes         Int      @default(0)
+  maxAdvanceBookingDays Int      @default(30)
+  timezone              String   @default("Europe/Istanbul")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime
+  tenants               tenants  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+model tenants {
+  id                 String               @id
+  name               String
+  domain             String?              @unique
+  isActive           Boolean              @default(true)
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime
+  appointments       appointments[]
+  call_sessions      call_sessions[]
+  customers          customers[]
+  message_sessions   message_sessions[]
+  notifications      notifications[]
+  services           services[]
+  staff              staff[]
+  subscription_plans subscription_plans[]
+  tenant_settings    tenant_settings?
+  users              users[]
+}
+
+model users {
+  id        String   @id
+  tenantId  String
+  email     String
+  password  String
+  fullName  String
+  role      UserRole @default(OWNER)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime
+  tenants   tenants  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, email])
+}
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum NotificationType {
+  WHATSAPP
+  SMS
+  EMAIL
+}
+
+enum SessionChannel {
+  WHATSAPP
+  VOICE
+}
+
+enum SubscriptionPlanType {
+  CHATBOT_ONLY
+  CHATBOT_VOICE
+  ENTERPRISE
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+  TRIAL
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  OWNER
+  STAFF
+}

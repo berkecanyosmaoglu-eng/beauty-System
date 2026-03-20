@@ -1,0 +1,274 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/**
+ * Multi-tenant beauty SaaS core schema
+ * - Jarvis (voice) + WhatsApp bot same DB
+ * - same tenantId, same routing & business rules
+ */
+
+enum Channel {
+  VOICE
+  WHATSAPP
+  SMS
+  WEB
+}
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  NO_SHOW
+}
+
+enum MessageRole {
+  USER
+  BOT
+  SYSTEM
+}
+
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business      Business?
+  services      Service[]
+  staff         Staff[]
+  customers     Customer[]
+  appointments  Appointment[]
+  conversations BotConversation[]
+}
+
+model Business {
+  id       String  @id @default(cuid())
+  tenantId String  @unique
+  name     String
+  phone    String?
+  address  String?
+  city     String?
+  timezone String  @default("Europe/Istanbul")
+
+  // owner notification channels
+  ownerName         String?
+  ownerPhoneE164    String? // SMS fallback
+  ownerWhatsappE164 String? // WhatsApp primary
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+model Service {
+  id          String  @id @default(cuid())
+  tenantId    String
+  name        String
+  description String?
+  durationMin Int     @default(30)
+  price       Int? // store as integer (TRY cents or TRY unit) - your choice
+  currency    String  @default("TRY")
+  isActive    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  staffLinks   StaffService[]
+  appointments Appointment[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+}
+
+model Staff {
+  id       String  @id @default(cuid())
+  tenantId String
+  name     String
+  title    String?
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  services     StaffService[]
+  workingHours WorkingHours[]
+  timeOffs     TimeOff[]
+  appointments Appointment[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+}
+
+model StaffService {
+  id        String  @id @default(cuid())
+  tenantId  String
+  staffId   String
+  serviceId String
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  staff   Staff   @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, staffId, serviceId])
+  @@index([tenantId])
+  @@index([tenantId, staffId])
+  @@index([tenantId, serviceId])
+}
+
+model WorkingHours {
+  id       String @id @default(cuid())
+  tenantId String
+  staffId  String
+
+  // 1=Mon ... 7=Sun (ISO)
+  dayOfWeek Int
+
+  // minutes from 00:00 local time (business timezone)
+  startMin Int
+  endMin   Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  staff Staff @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, staffId, dayOfWeek, startMin, endMin])
+  @@index([tenantId, staffId])
+}
+
+model TimeOff {
+  id       String @id @default(cuid())
+  tenantId String
+  staffId  String
+
+  // exact timestamps (stored UTC)
+  startAt DateTime
+  endAt   DateTime
+  reason  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  staff Staff @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, staffId, startAt])
+}
+
+model Customer {
+  id       String @id @default(cuid())
+  tenantId String
+
+  name         String?
+  phoneE164    String? // normalize e.g. +905331483470
+  whatsappE164 String? // if different than phoneE164
+  email        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  appointments  Appointment[]
+  conversations BotConversation[]
+
+  @@unique([tenantId, phoneE164])
+  @@index([tenantId])
+  @@index([tenantId, phoneE164])
+}
+
+model Appointment {
+  id       String @id @default(cuid())
+  tenantId String
+
+  customerId String?
+  staffId    String
+  serviceId  String
+
+  // appointment window (stored UTC)
+  startAt DateTime
+  endAt   DateTime
+
+  status AppointmentStatus @default(CONFIRMED)
+  notes  String?
+
+  // source channel
+  channel Channel @default(WHATSAPP)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  staff    Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict)
+  service  Service   @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  /**
+   * Important for "same slot" duplicates:
+   * This prevents two CONFIRMED appointments from starting at the same exact time for the same staff.
+   * Overlap conflicts (startAt/endAt range overlap) is enforced in service logic.
+   */
+  @@unique([tenantId, staffId, startAt])
+  @@index([tenantId, staffId, startAt])
+  @@index([tenantId, customerId, startAt])
+  @@index([tenantId, status])
+}
+
+model BotConversation {
+  id       String  @id @default(cuid())
+  tenantId String
+  channel  Channel
+
+  customerId     String?
+  externalUserId String? // e.g. WhatsApp "From" or Twilio caller id
+  isOpen         Boolean @default(true)
+
+  // lightweight state machine
+  state       String? // e.g. "ASK_SERVICE" | "ASK_STAFF" | "ASK_DATE" | "ASK_TIME" | "CONFIRM"
+  contextJson Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  messages BotMessage[]
+
+  @@index([tenantId, channel, isOpen])
+  @@index([tenantId, externalUserId])
+}
+
+model BotMessage {
+  id             String @id @default(cuid())
+  tenantId       String
+  conversationId String
+
+  role    MessageRole
+  text    String
+  rawJson Json?
+
+  createdAt DateTime @default(now())
+
+  conversation BotConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, conversationId, createdAt])
+}
