@@ -321,17 +321,12 @@ class VoiceBridgeSession {
   }
 
   private configureOpenAiSession() {
+    const eventId = `session_update_${this.meta.callId}_${Date.now()}`;
     this.sendOpenAi({
       type: 'session.update',
+      event_id: eventId,
       session: {
-        audio: {
-          output: {
-            format: {
-              type: 'audio/pcmu',
-            },
-            voice: this.getPreferredRealtimeVoice(),
-          },
-        },
+        type: 'realtime',
       },
     });
   }
@@ -495,7 +490,9 @@ class VoiceBridgeSession {
         const code = String(evt?.error?.code || '');
         if (code === 'response_cancel_not_active') return;
         this.parentLogger.error(
-          `[voice] OpenAI error callId=${this.meta.callId}: ${JSON.stringify(
+          `[voice] OpenAI error callId=${this.meta.callId} eventId=${String(
+            evt?.event_id || evt?.error?.event_id || '',
+          )} param=${String(evt?.error?.param || '')} code=${code}: ${JSON.stringify(
             evt.error || evt,
           )}`,
         );
