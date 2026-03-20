@@ -87,8 +87,6 @@ export class RealtimeBridgeService {
   static openingGreetingPromise: Promise<Buffer | null> | null = null;
   static readonly shortReplyAudioCache = new Map<string, Buffer>();
 
-
-
   constructor(private readonly agentService: VoiceAgentService) {
     void this.prewarmOpeningGreetingCache();
   }
@@ -122,10 +120,9 @@ export class RealtimeBridgeService {
     const to = qs.get('to') || undefined;
     const streamSid = qs.get('streamSid') || callId;
 
-
-this.logger.log(
-  `[voice] compat handleTwilioWebSocket tenantId=${tenantId} callId=${callId} from=${from || '-'} to=${to || '-'}`,
-);
+    this.logger.log(
+      `[voice] compat handleTwilioWebSocket tenantId=${tenantId} callId=${callId} from=${from || '-'} to=${to || '-'}`,
+    );
     return this.handleBridgeSocket(ws, {
       tenantId,
       callId,
@@ -142,9 +139,16 @@ class VoiceBridgeSession {
   private closed = false;
 
   private sessionReady = false;
-private pendingInputAudio: string[] = [];
-private readonly maxPendingInputAudioChunks = 120;  
-private greeted = false;
+  private sessionCreated = false;
+  private pendingInputAudio: string[] = [];
+  private pendingInputAudioBytes = 0;
+  private pendingInputAudioDropped = 0;
+  private lastPendingInputAudioLogAt = 0;
+  private responseCreatePending = false;
+  private readonly maxPendingInputAudioChunks = 25;
+  private readonly maxPendingInputAudioMs = 500;
+  private readonly maxPendingInputAudioBytes = 4000;
+  private greeted = false;
   private bridgeReady = false;
   private greetingInFlight = false;
   private turnSequence = 0;
@@ -199,9 +203,9 @@ private greeted = false;
   private lastChunkSummaryLogAt = 0;
   private outboundAudioQueue: Buffer[] = [];
   private outboundAudioPumpRunning = false;
-  private openAiAudioDonePending = false;  
+  private openAiAudioDonePending = false;
 
-private outboundAudioChunkCount = 0;
+  private outboundAudioChunkCount = 0;
   private outboundAudioByteCount = 0;
   private readonly debugVoice = process.env.DEBUG_VOICE === '1';
   private lastCancellationReason:
@@ -229,8 +233,7 @@ private outboundAudioChunkCount = 0;
     private readonly clientWs: WebSocket,
     private readonly meta: BridgeMeta,
   ) {
-const model =
-  process.env.JARVIS_REALTIME_MODEL || 'gpt-realtime';
+    const model = process.env.JARVIS_REALTIME_MODEL || 'gpt-realtime';
     this.openaiUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
   }
 
@@ -309,24 +312,29 @@ const model =
     });
   }
 
+  private getPreferredRealtimeVoice() {
+    return (
+      process.env.JARVIS_REALTIME_VOICE ||
+      process.env.OPENAI_TTS_VOICE ||
+      'alloy'
+    );
+  }
 
-
-private configureOpenAiSession() {
-  this.sendOpenAi({
-    type: 'session.update',
-    session: {
-      type: 'realtime',
-      audio: {
-        output: {
-          format: {
-            type: 'audio/pcmu',
+  private configureOpenAiSession() {
+    this.sendOpenAi({
+      type: 'session.update',
+      session: {
+        audio: {
+          output: {
+            format: {
+              type: 'audio/pcmu',
+            },
+            voice: this.getPreferredRealtimeVoice(),
           },
-          voice: 'cedar',
         },
       },
-    },
-  });
-}
+    });
+  }
 
   private async onBridgeMessage(msg: BridgeInboundMessage) {
     if (
@@ -361,60 +369,41 @@ private configureOpenAiSession() {
       if (!payload) return;
 
       if (!this.sessionReady) {
-        this.parentLogger.warn(
-          `[voice] media_dropped_before_session_ready callId=${this.meta.callId}`,
-        );
+        this.bufferInboundAudio(payload);
         return;
       }
 
-      this.handlePossibleBargeIn(payload);
-      this.refreshSpeechFailsafe();
-
-      this.sendOpenAi({
-        type: 'input_audio_buffer.append',
-        audio: payload,
-      });
+      this.appendInputAudio(payload);
       return;
     }
-
   }
 
   private async onOpenAiEvent(evt: OpenAiEvent) {
     switch (evt.type) {
       case 'session.created':
+        this.sessionCreated = true;
         this.markTiming('session_created');
         this.parentLogger.log(
           `[voice] session.created callId=${this.meta.callId}`,
         );
         return;
 
-case 'session.updated':
-  this.sessionReady = true;
-  this.markTiming('session_updated');
-  this.parentLogger.log(
-    `[voice] session.updated callId=${this.meta.callId}`,
-  );
+      case 'session.updated':
+        this.sessionReady = true;
+        this.markTiming('session_updated');
+        this.parentLogger.log(
+          `[voice] session.updated callId=${this.meta.callId}`,
+        );
+        this.flushPendingInputAudio('session.updated');
+        this.maybeStartOpeningGreeting();
+        return;
 
-  if (this.pendingInputAudio.length) {
-    const buffered = [...this.pendingInputAudio];
-    this.pendingInputAudio = [];
-
-    for (const chunk of buffered) {
-      this.sendOpenAi({
-        type: 'input_audio_buffer.append',
-        audio: chunk,
-      });
-    }
-  }
-
-  this.maybeStartOpeningGreeting();
-  return;
       case 'response.created':
+        this.responseCreatePending = false;
         this.parentLogger.log(
           `[voice] response.created callId=${this.meta.callId}`,
         );
         return;
-
 
       case 'response.output_audio.delta':
       case 'response.audio.delta':
@@ -445,7 +434,10 @@ case 'session.updated':
       case 'response.output_audio.done':
       case 'response.audio.done':
         this.openAiAudioDonePending = true;
-        if (!this.outboundAudioPumpRunning && this.outboundAudioQueue.length === 0) {
+        if (
+          !this.outboundAudioPumpRunning &&
+          this.outboundAudioQueue.length === 0
+        ) {
           this.openAiAudioDonePending = false;
           this.completeAssistantPlayback(`openai_${evt.type}`);
         }
@@ -507,6 +499,9 @@ case 'session.updated':
             evt.error || evt,
           )}`,
         );
+        if (code === 'server_error') {
+          this.handleOpenAiServerError(code);
+        }
         return;
       }
 
@@ -515,26 +510,20 @@ case 'session.updated':
     }
   }
 
+  private async sendAudioBufferRealtime(
+    audioBuf: Buffer,
+    source: 'streaming' | 'buffered' = 'buffered',
+  ) {
+    for (let i = 0; i < audioBuf.length; i += 160) {
+      const chunk = audioBuf.subarray(i, i + 160);
+      if (!chunk.length) continue;
 
+      this.currentPlaybackDurationMs += this.ulawFrameMs;
+      this.sendAudioChunk(chunk, source);
 
-
-private async sendAudioBufferRealtime(
-  audioBuf: Buffer,
-  source: 'streaming' | 'buffered' = 'buffered',
-) {
-  for (let i = 0; i < audioBuf.length; i += 160) {
-    const chunk = audioBuf.subarray(i, i + 160);
-    if (!chunk.length) continue;
-
-    this.currentPlaybackDurationMs += this.ulawFrameMs;
-    this.sendAudioChunk(chunk, source);
-
-    await new Promise((resolve) => setTimeout(resolve, this.ulawFrameMs));
+      await new Promise((resolve) => setTimeout(resolve, this.ulawFrameMs));
+    }
   }
-}
-
-
-
 
   private async handleCompletedTranscript(rawTranscript: string) {
     const currentState = this.getCurrentVoiceBookingState();
@@ -673,12 +662,12 @@ private async sendAudioBufferRealtime(
     const sessions = bookingCore?.sessions as Map<string, any> | undefined;
     if (!sessions?.get) return null;
 
-const rawCaller =
-  String(this.meta.from || '').trim() ||
-  String(this.meta.callId || '').trim() ||
-  'unknown-voice-caller';
+    const rawCaller =
+      String(this.meta.from || '').trim() ||
+      String(this.meta.callId || '').trim() ||
+      'unknown-voice-caller';
 
-const customerPhone = normalizePhone(rawCaller);
+    const customerPhone = normalizePhone(rawCaller);
 
     const session = sessions.get(`${this.meta.tenantId}:${customerPhone}`);
     return session?.state ? String(session.state) : null;
@@ -874,7 +863,6 @@ const customerPhone = normalizePhone(rawCaller);
     }
   }
 
-
   private enqueueAudioBuffer(audioBuf: Buffer) {
     for (let i = 0; i < audioBuf.length; i += 160) {
       const chunk = audioBuf.subarray(i, i + 160);
@@ -907,15 +895,13 @@ const customerPhone = normalizePhone(rawCaller);
     }
   }
 
-
-
   private handlePossibleBargeIn(payloadB64: string) {
     // TEMP HOTFIX:
     // Echo yüzünden bot kendi sesini müşteri konuşması sanıp cevabı yarıda kesiyor.
     // Önce akışı stabil hale getirelim; sonra barge-in'i düzgün geri açarız.
-    return;  
+    return;
 
-  const rms = pcmuBase64Rms(payloadB64);
+    const rms = pcmuBase64Rms(payloadB64);
     this.lastObservedSpeechEnergy = rms;
     this.updateAmbientNoise(rms);
 
@@ -1346,10 +1332,9 @@ const customerPhone = normalizePhone(rawCaller);
       `[voice] cancellation_applied callId=${this.meta.callId} reason=${this.lastCancellationReason}`,
     );
 
-        this.sendOpenAi({
+    this.sendOpenAi({
       type: 'response.cancel',
     });
-
 
     this.parentLogger.log(
       `[voice] assistant output cleared callId=${this.meta.callId} reason=${reason}`,
@@ -1359,9 +1344,9 @@ const customerPhone = normalizePhone(rawCaller);
   private resetAssistantPlaybackState(reason: string) {
     this.outboundAudioQueue = [];
     this.outboundAudioPumpRunning = false;
-    this.openAiAudioDonePending = false;  
+    this.openAiAudioDonePending = false;
 
-  const hadPlayback =
+    const hadPlayback =
       this.assistantSpeaking ||
       this.currentPlaybackDurationMs > 0 ||
       this.currentPlaybackOffsetBytes > 0 ||
@@ -1448,12 +1433,12 @@ const customerPhone = normalizePhone(rawCaller);
       inputLength: effectiveUserText.length,
     });
 
-const rawCaller =
-  String(this.meta.from || '').trim() ||
-  String(this.meta.callId || '').trim() ||
-  'unknown-voice-caller';
+    const rawCaller =
+      String(this.meta.from || '').trim() ||
+      String(this.meta.callId || '').trim() ||
+      'unknown-voice-caller';
 
-const customerPhone = normalizePhone(rawCaller);
+    const customerPhone = normalizePhone(rawCaller);
 
     const payload = {
       tenantId: this.meta.tenantId,
@@ -1554,6 +1539,7 @@ const customerPhone = normalizePhone(rawCaller);
       );
     }
 
+    this.responseCreatePending = true;
     this.sendOpenAi({
       type: 'response.create',
       response: {
@@ -1562,22 +1548,11 @@ const customerPhone = normalizePhone(rawCaller);
             format: {
               type: 'audio/pcmu',
             },
-            voice:
-              process.env.JARVIS_REALTIME_VOICE ||
-              process.env.OPENAI_TTS_VOICE ||
-              'cedar',
           },
         },
-        instructions: [
-          'Speak exactly the following approved Turkish assistant reply.',
-          'Do not add or remove words.',
-          'Use a calm, warm, professional, female-sounding Turkish phone voice.',
-          `Approved reply: ${clean}`,
-        ].join(' '),
+        instructions: clean,
       },
     });
-
-
   }
 
   private logTurnLatency(
@@ -1608,8 +1583,8 @@ const customerPhone = normalizePhone(rawCaller);
     if (!this.openaiWs || this.openaiWs.readyState !== WebSocket.OPEN) return;
     this.parentLogger.log(
       `[voice][openai_out] callId=${this.meta.callId} payload=${JSON.stringify(obj)}`,
-    );  
-  this.openaiWs.send(JSON.stringify(obj));
+    );
+    this.openaiWs.send(JSON.stringify(obj));
   }
 
   private sendBridge(obj: any) {
@@ -1625,10 +1600,89 @@ const customerPhone = normalizePhone(rawCaller);
     return true;
   }
 
-  private safeClose() {
-    if (this.closed) return;
-    this.closed = true;
+  private bufferInboundAudio(payload: string) {
+    const chunkBytes = Math.floor((payload.length * 3) / 4);
 
+    if (this.pendingInputAudio.length >= this.maxPendingInputAudioChunks) {
+      const removed = this.pendingInputAudio.shift();
+      if (removed) {
+        this.pendingInputAudioBytes = Math.max(
+          0,
+          this.pendingInputAudioBytes - Math.floor((removed.length * 3) / 4),
+        );
+      }
+      this.pendingInputAudioDropped += 1;
+    }
+
+    this.pendingInputAudio.push(payload);
+    this.pendingInputAudioBytes += chunkBytes;
+
+    while (
+      this.pendingInputAudioBytes > this.maxPendingInputAudioBytes &&
+      this.pendingInputAudio.length > 0
+    ) {
+      const removed = this.pendingInputAudio.shift();
+      if (!removed) break;
+      this.pendingInputAudioBytes = Math.max(
+        0,
+        this.pendingInputAudioBytes - Math.floor((removed.length * 3) / 4),
+      );
+      this.pendingInputAudioDropped += 1;
+    }
+
+    const now = Date.now();
+    if (now - this.lastPendingInputAudioLogAt >= 2000) {
+      this.lastPendingInputAudioLogAt = now;
+      this.parentLogger.warn(
+        `[voice] media_buffering_before_session_ready callId=${this.meta.callId} queued=${this.pendingInputAudio.length} dropped=${this.pendingInputAudioDropped} sessionCreated=${this.sessionCreated}`,
+      );
+    }
+  }
+
+  private appendInputAudio(payload: string) {
+    this.handlePossibleBargeIn(payload);
+    this.refreshSpeechFailsafe();
+    this.sendOpenAi({
+      type: 'input_audio_buffer.append',
+      audio: payload,
+    });
+  }
+
+  private flushPendingInputAudio(reason: string) {
+    if (!this.pendingInputAudio.length) return;
+
+    const buffered = [...this.pendingInputAudio];
+    const bufferedBytes = this.pendingInputAudioBytes;
+    const dropped = this.pendingInputAudioDropped;
+
+    this.pendingInputAudio = [];
+    this.pendingInputAudioBytes = 0;
+    this.pendingInputAudioDropped = 0;
+
+    this.parentLogger.log(
+      `[voice] media_buffer_flush callId=${this.meta.callId} reason=${reason} chunks=${buffered.length} bytes=${bufferedBytes} dropped=${dropped}`,
+    );
+
+    for (const chunk of buffered) {
+      this.appendInputAudio(chunk);
+    }
+  }
+
+  private resetSessionState(reason: string) {
+    this.sessionReady = false;
+    this.sessionCreated = false;
+    this.responseCreatePending = false;
+    this.pendingInputAudio = [];
+    this.pendingInputAudioBytes = 0;
+    this.pendingInputAudioDropped = 0;
+    this.lastPendingInputAudioLogAt = 0;
+    this.bridgeReady = false;
+    this.greetingInFlight = false;
+    this.greeted = false;
+    this.agentTurnInFlight = false;
+    this.pendingTranscriptText = '';
+    this.pendingTranscriptState = null;
+    this.queuedTranscript = null;
     if (this.pendingTranscriptTimer) {
       clearTimeout(this.pendingTranscriptTimer);
       this.pendingTranscriptTimer = null;
@@ -1637,12 +1691,35 @@ const customerPhone = normalizePhone(rawCaller);
       clearTimeout(this.speechFailsafeTimer);
       this.speechFailsafeTimer = null;
     }
-    this.pendingTranscriptText = '';
-    this.pendingTranscriptState = null;
-    this.queuedTranscript = null;
-this.pendingInputAudio = [];
     this.cancelAssistantAudio('close');
-    this.resetAssistantPlaybackState('cancel_close');
+    this.resetAssistantPlaybackState(reason);
+  }
+
+  private handleOpenAiServerError(code: string) {
+    this.parentLogger.warn(
+      `[voice] session_reset_after_openai_error callId=${this.meta.callId} code=${code}`,
+    );
+    this.resetSessionState(`openai_${code}`);
+
+    try {
+      if (this.openaiWs) {
+        this.openaiWs.removeAllListeners();
+        if (this.openaiWs.readyState === WebSocket.OPEN) {
+          this.openaiWs.close();
+        } else if (this.openaiWs.readyState === WebSocket.CONNECTING) {
+          this.openaiWs.terminate();
+        }
+      }
+    } catch {}
+    this.openaiWs = null;
+    this.safeClose();
+  }
+
+  private safeClose() {
+    if (this.closed) return;
+    this.closed = true;
+
+    this.resetSessionState('cancel_close');
 
     try {
       if (this.openaiWs && this.openaiWs.readyState === WebSocket.OPEN) {
