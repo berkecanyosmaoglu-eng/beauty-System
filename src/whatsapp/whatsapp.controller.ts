@@ -11,6 +11,8 @@ function normalizeWa(v: any): string {
 @Controller('whatsapp')
 export class WhatsappController {
   private readonly logger = new Logger(WhatsappController.name);
+  private readonly inboundDedupeTtlMs = 30_000;
+  private readonly inboundDedupe = new Map<string, number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -53,6 +55,44 @@ export class WhatsappController {
 
   private isMetaPayload(body: any): boolean {
     return !!body && (body.object === 'whatsapp_business_account' || Array.isArray(body.entry));
+  }
+
+  private cleanupInboundDedupe(now: number) {
+    for (const [key, ts] of this.inboundDedupe.entries()) {
+      if (now - ts > this.inboundDedupeTtlMs) this.inboundDedupe.delete(key);
+    }
+  }
+
+  private normalizeInboundText(text: string): string {
+    return String(text || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
+  private buildInboundDedupeKey(params: {
+    tenantId: string;
+    msgId?: any;
+    fromWaId: string;
+    text: string;
+  }): string {
+    const tenantId = String(params.tenantId || '').trim();
+    const msgId = String(params.msgId || '').trim();
+    if (tenantId && msgId) return `${tenantId}:${msgId}`;
+
+    const fromWaId = String(params.fromWaId || '').trim();
+    const normalizedText = this.normalizeInboundText(params.text);
+    return `${tenantId}:${fromWaId}:${normalizedText}`;
+  }
+
+  private shouldSkipDuplicateInbound(key: string): boolean {
+    const now = Date.now();
+    this.cleanupInboundDedupe(now);
+
+    const prev = this.inboundDedupe.get(key);
+    if (typeof prev === 'number' && now - prev <= this.inboundDedupeTtlMs) {
+      return true;
+    }
+
+    this.inboundDedupe.set(key, now);
+    return false;
   }
 
   private async sendMetaText(toWaIdOrMsisdn: string, text: string, phoneNumberId?: string): Promise<boolean> {
@@ -136,6 +176,20 @@ export class WhatsappController {
             for (const msg of messages) {
               const fromWaId = String(msg?.from || '').trim(); // wa_id (digits)
               const msgType = String(msg?.type || '').trim();
+              const dedupeKey = this.buildInboundDedupeKey({
+                tenantId,
+                msgId: msg?.id,
+                fromWaId,
+                text:
+                  msgType === 'text'
+                    ? String(msg?.text?.body || '').trim()
+                    : msgType === 'button'
+                      ? String(msg?.button?.text || '').trim()
+                      : msgType === 'interactive'
+                        ? String(msg?.interactive?.button_reply?.title || '').trim() ||
+                          String(msg?.interactive?.list_reply?.title || '').trim()
+                        : '',
+              });
 
               let text = '';
               if (msgType === 'text') text = String(msg?.text?.body || '').trim();
@@ -154,6 +208,11 @@ export class WhatsappController {
                 String(value?.contacts?.[0]?.profile?.name || '').trim();
 
               if (!fromWaId) continue;
+
+              if (this.shouldSkipDuplicateInbound(dedupeKey)) {
+                this.logger.log(`WA duplicate inbound skipped key=${dedupeKey}`);
+                continue;
+              }
 
               this.logger.log(`📩 META inbound tenantId=${tenantId} from=${fromWaId} type=${msgType} text="${text}"`);
 
