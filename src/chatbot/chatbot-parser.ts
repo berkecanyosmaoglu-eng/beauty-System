@@ -54,6 +54,32 @@ export function extractChatbotCustomerName(
   return null;
 }
 
+export function containsDay(rawText: string): boolean {
+  const normalized = normalizeChatbotText(String(rawText || ''));
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    /\b(bugun|bugün|yarin|yarın|pazartesi|sali|salı|carsamba|çarşamba|persembe|cuma|cumartesi|pazar)\b/.test(
+      normalized,
+    ) || /\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/.test(String(rawText || ''))
+  );
+}
+
+export function containsTime(rawText: string): boolean {
+  const normalized = normalizeChatbotText(String(rawText || ''));
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    /\b(?:saat\s*)?\d{1,2}[:.]\d{2}\b/.test(normalized) ||
+    /\bsaat\s*\d{1,2}\b/.test(normalized) ||
+    /\b\d{1,2}\b\s*(gibi|bucuk|buçuk)\b/.test(normalized)
+  );
+}
+
 export function extractChatbotDateTimeText(rawText: string): string | null {
   const text = String(rawText || '').trim();
   const normalized = normalizeChatbotText(text);
@@ -62,19 +88,10 @@ export function extractChatbotDateTimeText(rawText: string): string | null {
     return null;
   }
 
-  const hasRelativeDay =
-    /\b(bugun|bugün|yarin|yarın|pazartesi|sali|salı|carsamba|çarşamba|persembe|cuma|cumartesi|pazar)\b/.test(
-      normalized,
-    );
+  const hasDay = containsDay(text);
+  const hasTime = containsTime(text);
 
-  const hasCalendarDate = /\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/.test(text);
-
-  const hasClockTime =
-    /\b(?:saat\s*)?\d{1,2}[:.]\d{2}\b/.test(normalized) ||
-    /\bsaat\s*\d{1,2}\b/.test(normalized) ||
-    /\b\d{1,2}\b\s*(gibi|bucuk|buçuk)\b/.test(normalized);
-
-  if (!hasRelativeDay && !hasCalendarDate && !hasClockTime) {
+  if (!hasDay && !hasTime) {
     return null;
   }
 
