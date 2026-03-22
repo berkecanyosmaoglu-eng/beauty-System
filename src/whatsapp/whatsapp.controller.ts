@@ -117,7 +117,7 @@ export class WhatsappController {
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
+      const timeout = setTimeout(() => controller.abort(), 30000);
       try {
         const resp = await fetch(url, {
           method: 'POST',
@@ -138,8 +138,12 @@ export class WhatsappController {
         this.logger.error(`META send http_error to=${toWaIdOrMsisdn} status=${resp.status} attempt=${attempt} body=${raw}`);
         if (resp.status >= 400 && resp.status < 500) return false;
       } catch (e: any) {
-        const kind = e?.name === 'AbortError' ? 'timeout' : 'fetch_exception';
-        this.logger.error(`META send ${kind} to=${toWaIdOrMsisdn} attempt=${attempt} error=${e?.message || e}`);
+        if (e?.name === 'AbortError') {
+          this.logger.error(`META send timeout (no retry) to=${toWaIdOrMsisdn} attempt=${attempt} error=${e?.message || e}`);
+          return false;
+        }
+
+        this.logger.error(`META send fetch_exception to=${toWaIdOrMsisdn} attempt=${attempt} error=${e?.message || e}`);
       } finally {
         clearTimeout(timeout);
       }
