@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import WebSocket from 'ws';
 import { VoiceAgentService } from '../agent/voice-agent.service';
 import { rewriteAgentReplyForVoice } from '../agent/shared/voice-response-policy';
+import { normalizeJarvisText } from '../jarvis/jarvis-parser';
 
 type BridgeMeta = {
   tenantId: string;
@@ -82,7 +83,7 @@ type VoiceTimingStage =
 export class RealtimeBridgeService {
   private readonly logger = new Logger(RealtimeBridgeService.name);
   static readonly openingGreeting =
-    'Merhaba, ben güzellik merkezimizin sesli yapay zeka asistanıyım. Size nasıl yardımcı olabilirim?';
+    'Merhaba, Ben sesli yapay zeka asistanıyım size nasıl yardımcı olabilirim?';
   static openingGreetingAudio: Buffer | null = null;
   static openingGreetingPromise: Promise<Buffer | null> | null = null;
   static readonly shortReplyAudioCache = new Map<string, Buffer>();
@@ -274,6 +275,8 @@ class VoiceBridgeSession {
       }
     });
 
+
+
     this.openaiWs.on('close', () => {
       this.parentLogger.warn(
         `[voice] OpenAI WS closed callId=${this.meta.callId}`,
@@ -321,8 +324,11 @@ class VoiceBridgeSession {
   }
 
 
+
+
 private configureOpenAiSession() {
   const eventId = `session_update_${this.meta.callId}_${Date.now()}`;
+
   this.sendOpenAi({
     type: 'session.update',
     event_id: eventId,
@@ -331,16 +337,19 @@ private configureOpenAiSession() {
       output_audio_format: 'g711_ulaw',
       voice: this.getPreferredRealtimeVoice(),
       input_audio_transcription: {
-        model: 'gpt-4o-mini-transcribe',
+        model: 'gpt-4o-transcribe',
+        language: 'tr',
       },
       turn_detection: {
         type: 'server_vad',
         create_response: false,
-        interrupt_response: true,
       },
     },
   });
 }
+
+
+
 
   private async onBridgeMessage(msg: BridgeInboundMessage) {
     if (
@@ -460,72 +469,50 @@ private configureOpenAiSession() {
         return;
       }
 
-      case 'input_audio_buffer.speech_started':
-        this.markTiming('speech_started');
+
+
+
+      case 'input_audio_buffer.speech_stopped':
+        this.lastSpeechStoppedAt = Date.now();
+        this.markTiming('speech_stopped');
         this.refreshSpeechFailsafe();
         this.parentLogger.log(
-          `[voice] speech_started callId=${this.meta.callId}`,
+          `[voice] speech_stopped callId=${this.meta.callId}`,
         );
-        if (this.agentTurnInFlight) {
-          this.parentLogger.debug(
-            `[voice] speech_ignored_during_assistant callId=${this.meta.callId}`,
-          );
-          return;
-        }
-        const protectionRemaining = this.getAssistantProtectionMsRemaining();
-        if (protectionRemaining > 0) {
-          this.logBargeInSuppressed(
-            'inside_protection_window',
-            `protectionMsRemaining=${protectionRemaining}`,
-          );
-          return;
-        }
-        if (this.assistantSpeaking) {
-          this.logBargeInSuppressed(
-            'playback_guard',
-            `event=speech_started speechFrames=${this.speechEnergyFrames} rms=${this.formatEnergy(this.lastObservedSpeechEnergy)}`,
-          );
-        }
+
+        this.sendOpenAi({
+          type: 'input_audio_buffer.commit',
+        });
+
         return;
 
-case 'input_audio_buffer.speech_stopped':
-  this.lastSpeechStoppedAt = Date.now();
-  this.markTiming('speech_stopped');
-  this.refreshSpeechFailsafe();
-  this.parentLogger.log(
-    `[voice] speech_stopped callId=${this.meta.callId}`,
-  );
+      case 'error': {
+        const code = String(evt?.error?.code || '');
 
-  this.sendOpenAi({
-    type: 'input_audio_buffer.commit',
-  });
+        if (
+          code === 'response_cancel_not_active' ||
+          code === 'input_audio_buffer_commit_empty'
+        ) {
+          return;
+        }
 
-  return;
+        this.parentLogger.error(
+          `[voice] OpenAI error callId=${this.meta.callId} eventId=${String(
+            evt?.event_id || evt?.error?.event_id || '',
+          )} param=${String(evt?.error?.param || '')} code=${code}: ${JSON.stringify(
+            evt.error || evt,
+          )}`,
+        );
 
-case 'error': {
-  const code = String(evt?.error?.code || '');
-
-  if (
-    code === 'response_cancel_not_active' ||
-    code === 'input_audio_buffer_commit_empty'
-  ) {
-    return;
+        if (code === 'server_error') {
+          this.handleOpenAiServerError(code);
+        }
+        return;
+      }
+    }
   }
 
-  this.parentLogger.error(
-    `[voice] OpenAI error callId=${this.meta.callId} eventId=${String(
-      evt?.event_id || evt?.error?.event_id || '',
-    )} param=${String(evt?.error?.param || '')} code=${code}: ${JSON.stringify(
-      evt.error || evt,
-    )}`,
-  );
 
-  if (code === 'server_error') {
-    this.handleOpenAiServerError(code);
-  }
-  return;
-}
-}
   private async sendAudioBufferRealtime(
     audioBuf: Buffer,
     source: 'streaming' | 'buffered' = 'buffered',
@@ -541,137 +528,181 @@ case 'error': {
     }
   }
 
-  private async handleCompletedTranscript(rawTranscript: string) {
-    const currentState = this.getCurrentVoiceBookingState();
 
-    if (this.agentTurnInFlight || this.assistantSpeaking) {
-      this.parentLogger.debug(
-        `[voice] transcript_ignored_during_assistant callId=${this.meta.callId}`,
-      );
-      return;
-    }
 
-    if (this.shouldDropTranscript(rawTranscript, currentState)) {
-      this.parentLogger.warn(
-        `[voice] dropped transcript callId=${this.meta.callId} state=${currentState || '-'} text="${rawTranscript}"`,
-      );
-      return;
-    }
+private async handleCompletedTranscript(rawTranscript: string) {
+  const currentState = this.getCurrentVoiceBookingState();
 
-    const transcript = normalizeTranscriptForAgent(
-      rawTranscript,
-      this.lastBotReplyText,
-    );
-    if (!transcript) {
-      this.parentLogger.warn(
-        `[voice] normalized transcript empty after contamination filter callId=${this.meta.callId} raw="${rawTranscript}"`,
-      );
-      return;
-    }
-
-    const merged = mergeVoiceFragments(
-      this.pendingTranscriptText,
-      transcript,
-      currentState,
+  if (this.agentTurnInFlight || this.assistantSpeaking) {
+    this.parentLogger.debug(
+      `[voice] transcript_ignored_during_assistant callId=${this.meta.callId}`,
     );
 
-    if (shouldBufferShortVoiceTranscript(currentState, merged)) {
-      this.pendingTranscriptText = merged;
-      this.pendingTranscriptState = currentState;
-      if (this.pendingTranscriptTimer)
-        clearTimeout(this.pendingTranscriptTimer);
-      this.pendingTranscriptTimer = setTimeout(() => {
-        const buffered = this.pendingTranscriptText;
-        const bufferedState = this.pendingTranscriptState;
-        this.pendingTranscriptText = '';
-        this.pendingTranscriptState = null;
-        this.pendingTranscriptTimer = null;
-        void this.enqueueOrProcessTranscript(buffered, bufferedState);
-      }, 420);
-      this.parentLogger.log(
-        `[voice] transcript_buffered callId=${this.meta.callId} state=${currentState || '-'} text="${merged}"`,
+    if (this.shouldPreserveDroppedTranscript(rawTranscript)) {
+      this.queuedTranscript = {
+        text: rawTranscript,
+        state: currentState,
+      };
+      this.parentLogger.warn(
+        `[voice] transcript_queued_during_assistant callId=${this.meta.callId} state=${currentState || '-'} text="${rawTranscript}"`,
       );
+    }
+
+    return;
+  }
+
+  if (this.shouldDropTranscript(rawTranscript, currentState)) {
+    this.parentLogger.warn(
+      `[voice] dropped transcript callId=${this.meta.callId} state=${currentState || '-'} text="${rawTranscript}"`,
+    );
+
+    if (this.shouldPreserveDroppedTranscript(rawTranscript)) {
+      await this.enqueueOrProcessTranscript(rawTranscript, currentState);
       return;
     }
+
+    await this.speakReply('Sizi tam anlayamadım. Kısaca tekrar eder misiniz?');
+    return;
+  }
+
+
+
+  const transcript = normalizeTranscriptForAgent(
+    rawTranscript,
+    this.lastBotReplyText,
+  );
+
+  if (!transcript) {
+    this.parentLogger.warn(
+      `[voice] normalized transcript empty after contamination filter callId=${this.meta.callId} raw="${rawTranscript}"`,
+    );
+    await this.speakReply('Sizi tam anlayamadım. Kısaca tekrar eder misiniz?');
+    return;
+  }
+
+  const merged = mergeVoiceFragments(
+    this.pendingTranscriptText,
+    transcript,
+    currentState,
+  );
+
+  if (shouldBufferShortVoiceTranscript(currentState, merged)) {
+    this.pendingTranscriptText = merged;
+    this.pendingTranscriptState = currentState;
 
     if (this.pendingTranscriptTimer) {
       clearTimeout(this.pendingTranscriptTimer);
+    }
+
+    this.pendingTranscriptTimer = setTimeout(() => {
+      const buffered = this.pendingTranscriptText;
+      const bufferedState = this.pendingTranscriptState;
+      this.pendingTranscriptText = '';
+      this.pendingTranscriptState = null;
       this.pendingTranscriptTimer = null;
-    }
-    this.pendingTranscriptText = '';
-    this.pendingTranscriptState = null;
-    await this.enqueueOrProcessTranscript(merged, currentState);
-  }
-
-  private async enqueueOrProcessTranscript(
-    transcript: string,
-    state: string | null,
-  ) {
-    if (this.agentTurnInFlight || this.assistantSpeaking) {
-      this.parentLogger.debug(
-        `[voice] transcript_ignored_during_assistant callId=${this.meta.callId} state=${state || '-'} text="${transcript}"`,
-      );
-      return;
-    }
-
-    setTimeout(() => {
-      if (this.agentTurnInFlight || this.assistantSpeaking) {
-        this.parentLogger.debug(
-          `[voice] transcript_ignored_during_assistant callId=${this.meta.callId} state=${state || '-'} text="${transcript}" stage=debounce`,
-        );
-        return;
-      }
-
-      void this.processTranscriptTurn(transcript, state);
-    }, 300);
-  }
-
-  private async processTranscriptTurn(
-    transcript: string,
-    state: string | null,
-  ) {
-    const norm = normalizeTurkishForTime(transcript);
-    if (!norm || norm === this.lastTranscriptNorm) {
-      this.parentLogger.warn(
-        `[voice] duplicate transcript callId=${this.meta.callId} text="${transcript}"`,
-      );
-      return;
-    }
-
-    this.lastTranscriptAt = Date.now();
-    this.lastTranscriptText = transcript;
-    this.lastTranscriptNorm = norm;
-    const turnId = ++this.turnSequence;
-    this.activeTurnId = turnId;
-    this.agentTurnInFlight = true;
-    this.captureRecentContextsFromText(transcript, turnId, 'user');
-    this.markTiming('transcript_normalized', {
-      turnId,
-      state: state || '-',
-      normalizedLength: transcript.length,
-    });
+      void this.enqueueOrProcessTranscript(buffered, bufferedState);
+    }, 450);
 
     this.parentLogger.log(
-      `[voice] transcript normalized callId=${this.meta.callId} turnId=${turnId} state=${state || '-'} normalized="${transcript}"`,
+      `[voice] transcript_buffered callId=${this.meta.callId} state=${currentState || '-'} text="${merged}"`,
     );
+    return;
+  }
 
-    try {
-      const reply = await this.callAgentBrain(transcript, turnId);
-      if (!reply) return;
-      if (!this.canPlaybackStaleTurn(turnId, 'agent_reply')) {
-        return;
-      }
+  if (this.pendingTranscriptTimer) {
+    clearTimeout(this.pendingTranscriptTimer);
+    this.pendingTranscriptTimer = null;
+  }
 
-      await this.speakReply(reply, turnId);
-    } finally {
-      this.agentTurnInFlight = false;
-      if (this.queuedTranscript) {
-        const queued = this.queuedTranscript;
-        this.queuedTranscript = null;
-        await this.processTranscriptTurn(queued.text, queued.state);
-      }
+  this.pendingTranscriptText = '';
+  this.pendingTranscriptState = null;
+
+  await this.enqueueOrProcessTranscript(merged, currentState);
+}
+
+
+
+
+
+private async enqueueOrProcessTranscript(
+  transcript: string,
+  state: string | null,
+) {
+  if (this.agentTurnInFlight || this.assistantSpeaking) {
+    this.parentLogger.debug(
+      `[voice] transcript_ignored_during_assistant callId=${this.meta.callId} state=${state || '-'} text="${transcript}"`,
+    );
+    return;
+  }
+
+  setTimeout(() => {
+    if (this.agentTurnInFlight || this.assistantSpeaking) {
+      this.parentLogger.debug(
+        `[voice] transcript_ignored_during_assistant callId=${this.meta.callId} state=${state || '-'} text="${transcript}" stage=debounce`,
+      );
+      return;
+    }
+
+    void this.processTranscriptTurn(transcript, state);
+  }, 120);
+}
+
+
+
+
+private async processTranscriptTurn(
+  transcript: string,
+  state: string | null,
+) {
+  const norm = normalizeVoiceComparisonText(transcript);
+
+  if (!norm || norm === this.lastTranscriptNorm) {
+    this.parentLogger.warn(
+      `[voice] duplicate transcript callId=${this.meta.callId} text="${transcript}"`,
+    );
+    return;
+  }
+
+  this.lastTranscriptAt = Date.now();
+  this.lastTranscriptText = transcript;
+  this.lastTranscriptNorm = norm;
+  const turnId = ++this.turnSequence;
+  this.activeTurnId = turnId;
+  this.agentTurnInFlight = true;
+  this.captureRecentContextsFromText(transcript, turnId, 'user');
+
+  this.markTiming('transcript_normalized', {
+    turnId,
+    state: state || '-',
+    normalizedLength: transcript.length,
+  });
+
+  this.parentLogger.log(
+    `[voice] transcript normalized callId=${this.meta.callId} turnId=${turnId} state=${state || '-'} normalized="${transcript}"`,
+  );
+
+  try {
+    const reply = await this.callAgentBrain(transcript, turnId);
+
+    if (!this.canPlaybackStaleTurn(turnId, 'agent_reply')) {
+      return;
+    }
+
+    await this.speakReply(reply, turnId);
+  } finally {
+    this.agentTurnInFlight = false;
+
+    if (this.queuedTranscript) {
+      const queued = this.queuedTranscript;
+      this.queuedTranscript = null;
+      await this.processTranscriptTurn(queued.text, queued.state);
     }
   }
+}
+
+
+
+
 
   private getCurrentVoiceBookingState(): string | null {
     const bookingCore = (this.agentService as any)?.bookingCore as any;
@@ -683,88 +714,124 @@ case 'error': {
       String(this.meta.callId || '').trim() ||
       'unknown-voice-caller';
 
-    const customerPhone = normalizePhone(rawCaller);
+    const normalizedPhone = normalizePhone(rawCaller);
+    const customerPhone =
+      normalizedPhone ||
+      String(this.meta.from || '').trim() ||
+      `voice:${String(this.meta.callId || this.meta.streamSid || 'unknown').trim()}`;
 
     const session = sessions.get(`${this.meta.tenantId}:${customerPhone}`);
     return session?.state ? String(session.state) : null;
   }
 
-  private shouldDropTranscript(text: string, state?: string | null) {
-    const normalized = text.trim();
-    const normalizedTranscript = normalizeVoiceComparisonText(normalized);
 
-    if (!normalized) return true;
-    if (normalized.length <= 1 && !isCriticalVoiceState(state)) return true;
-    if (this.ghostRegex.test(normalized)) return true;
+private shouldDropTranscript(text: string, state?: string | null) {
+  const normalized = text.trim();
+  const normalizedTranscript = normalizeVoiceComparisonText(normalized);
 
-    const preservePartialBooking =
-      this.isMeaningfulPartialBookingTranscript(normalized);
-    if (preservePartialBooking) {
-      this.parentLogger.log(
-        `[voice] partial_booking_transcript_preserved callId=${this.meta.callId} text="${normalized}"`,
-      );
-    }
+  if (!normalized) return true;
+  if (normalized.length <= 1 && !isCriticalVoiceState(state)) return true;
+  if (this.ghostRegex.test(normalized)) return true;
 
-    const now = Date.now();
-    const msSinceAssistantAudio = now - this.lastAssistantAudioAt;
-    const msSinceBargeIn = now - this.lastBargeInAt;
-    const msSinceSpeechStopped = now - this.lastSpeechStoppedAt;
+  const preservePartialBooking =
+    this.isMeaningfulPartialBookingTranscript(normalized);
+  const preserveDropped = this.shouldPreserveDroppedTranscript(normalized);
+  const preserveListIntent = looksLikeAppointmentListIntent(normalized);
 
-    if (
-      !preservePartialBooking &&
-      !isCriticalVoiceState(state) &&
-      msSinceBargeIn < 180 &&
-      normalized.length < 18
-    )
-      return true;
-    if (
-      !preservePartialBooking &&
-      !isCriticalVoiceState(state) &&
-      msSinceSpeechStopped > 0 &&
-      msSinceSpeechStopped < 120 &&
-      normalized.length < 3
-    )
-      return true;
-
-    if (
-      !preservePartialBooking &&
-      !isCriticalVoiceState(state) &&
-      msSinceAssistantAudio < 280 &&
-      normalized.length < 16
-    ) {
-      return true;
-    }
-
-    if (
-      normalized.toLowerCase() === this.lastTranscriptText.toLowerCase() &&
-      now - this.lastTranscriptAt < 1400
-    ) {
-      return true;
-    }
-
-    const assistantEchoSimilarity = Math.max(
-      similarityScore(
-        normalizedTranscript,
-        normalizeVoiceComparisonText(this.lastBotReplyText),
-      ),
-      similarityScore(
-        normalizedTranscript,
-        normalizeVoiceComparisonText(RealtimeBridgeService.openingGreeting),
-      ),
+  if (preservePartialBooking) {
+    this.parentLogger.log(
+      `[voice] partial_booking_transcript_preserved callId=${this.meta.callId} text="${normalized}"`,
     );
-    if (
-      !preservePartialBooking &&
-      assistantEchoSimilarity >= 0.92 &&
-      normalizedTranscript.length >= 8
-    ) {
-      this.parentLogger.warn(
-        `[voice] assistant_echo_suppressed callId=${this.meta.callId} similarity=${assistantEchoSimilarity.toFixed(2)} text="${normalized}"`,
-      );
-      return true;
-    }
-
-    return false;
   }
+
+  if (preserveListIntent) {
+    this.parentLogger.log(
+      `[voice] list_intent_transcript_preserved callId=${this.meta.callId} text="${normalized}"`,
+    );
+  }
+
+  if (
+    !preservePartialBooking &&
+    !preserveDropped &&
+    !preserveListIntent &&
+    shouldDropNonTurkishTranscript(normalized)
+  ) {
+    return true;
+  }
+
+  const now = Date.now();
+  const msSinceAssistantAudio = now - this.lastAssistantAudioAt;
+  const msSinceBargeIn = now - this.lastBargeInAt;
+  const msSinceSpeechStopped = now - this.lastSpeechStoppedAt;
+
+  if (
+    !preservePartialBooking &&
+    !preserveDropped &&
+    !preserveListIntent &&
+    !isCriticalVoiceState(state) &&
+    msSinceBargeIn < 180 &&
+    normalized.length < 10
+  ) {
+    return true;
+  }
+
+  if (
+    !preservePartialBooking &&
+    !preserveDropped &&
+    !preserveListIntent &&
+    !isCriticalVoiceState(state) &&
+    msSinceSpeechStopped > 0 &&
+    msSinceSpeechStopped < 120 &&
+    normalized.length < 2
+  ) {
+    return true;
+  }
+
+  if (
+    !preservePartialBooking &&
+    !preserveDropped &&
+    !preserveListIntent &&
+    !isCriticalVoiceState(state) &&
+    msSinceAssistantAudio < 280 &&
+    normalized.length < 10
+  ) {
+    return true;
+  }
+
+  if (
+    normalized.toLowerCase() === this.lastTranscriptText.toLowerCase() &&
+    now - this.lastTranscriptAt < 1400
+  ) {
+    return true;
+  }
+
+  const assistantEchoSimilarity = Math.max(
+    similarityScore(
+      normalizedTranscript,
+      normalizeVoiceComparisonText(this.lastBotReplyText),
+    ),
+    similarityScore(
+      normalizedTranscript,
+      normalizeVoiceComparisonText(RealtimeBridgeService.openingGreeting),
+    ),
+  );
+
+  if (
+    !preservePartialBooking &&
+    !preserveDropped &&
+    !preserveListIntent &&
+    assistantEchoSimilarity >= 0.92 &&
+    normalizedTranscript.length >= 8
+  ) {
+    this.parentLogger.warn(
+      `[voice] assistant_echo_suppressed callId=${this.meta.callId} similarity=${assistantEchoSimilarity.toFixed(2)} text="${normalized}"`,
+    );
+    return true;
+  }
+
+  return false;
+}
+
 
   private formatEnergy(value: number | null | undefined) {
     return (value ?? 0).toFixed(0);
@@ -817,6 +884,7 @@ case 'error': {
     }, 2000);
   }
 
+
   private async forceResponseAfterSilence() {
     if (this.closed || this.agentTurnInFlight || this.assistantSpeaking) return;
 
@@ -841,11 +909,54 @@ case 'error': {
       : Number.POSITIVE_INFINITY;
     if (sinceSpeechStopped < 1900 || sinceSpeechStopped > 2600) return;
 
-    this.parentLogger.warn(
-      `[voice] speech_failsafe_no_transcript callId=${this.meta.callId} sinceSpeechStopped=${sinceSpeechStopped}`,
-    );
-    await this.speakReply('Buyurun, sizi dinliyorum.');
+this.parentLogger.warn(
+  `[voice] speech_failsafe_no_transcript callId=${this.meta.callId} sinceSpeechStopped=${sinceSpeechStopped}`,
+);
+
+await this.speakReply(
+  'Sizi tam anlayamadım. Randevu, fiyat, adres ya da işlem bilgisinden hangisi için yardımcı olayım?',
+);
   }
+
+
+
+
+private shouldPreserveDroppedTranscript(text: string): boolean {
+  const normalized = String(text || '')
+    .toLocaleLowerCase('tr-TR')
+    .replace(/[ıİ]/g, 'i')
+    .replace(/[ğĞ]/g, 'g')
+    .replace(/[şŞ]/g, 's')
+    .replace(/[çÇ]/g, 'c')
+    .replace(/[öÖ]/g, 'o')
+    .replace(/[üÜ]/g, 'u')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalized) return false;
+
+  if (
+    /\b(randevu|rezervasyon|rezervosyon|rezarvasyon|zarbasyon|zervasyon|ayirt|ayirtmak|ayırt|ayırtmak|almak istiyorum|gelebilirim|musait|müsait|uygun mu|uygun musunuz|yarin|yarın|bugun|bugün|saat|fiyat|ucret|ücret|adres|calisma saati|çalışma saati|bilgi|islem|işlem|lazer|epilasyon|cilt bakimi|cilt bakımı|protez tirnak|protez tırnak|manikur|manikür|pedikur|pedikür|ipek kirpik|kas|kaş|biyik|bıyık)\b/.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+
+  if (looksLikeAppointmentListIntent(normalized)) {
+    return true;
+  }
+
+  if (looksLikePossiblePersonName(normalized)) {
+    return true;
+  }
+
+  return false;
+}
+
 
   private sendAudioChunk(
     chunk: Buffer,
@@ -945,8 +1056,9 @@ case 'error': {
       this.lastBargeInAt = now;
     }
 
-    this.openingGreetingProtectionUntil = 0;
-    this.assistantPlaybackProtectionUntil = 0;
+this.assistantPlaybackProtectionUntil = Date.now() + 1200;
+
+  this.openingGreetingProtectionUntil = Date.now() + 1200;
     this.speechEnergyFrames = 0;
   }
 
@@ -1501,13 +1613,17 @@ if (false && this.debugVoice) {
     }
   }
 
+
+
+
   private async speakReply(replyText: string, turnId?: number) {
-    // TEMP MVP: send the agent reply to OpenAI realtime with only minimal sanitization.
     const clean = sanitizeReplyForVoice(replyText);
     const effectiveTurnId = turnId ?? this.activeTurnId;
+
     if (!clean || !this.sessionReady) {
       return;
     }
+
     if (!this.canPlaybackStaleTurn(effectiveTurnId, 'pre_tts')) {
       return;
     }
@@ -1555,20 +1671,29 @@ if (false && this.debugVoice) {
       );
     }
 
-
-
     this.responseCreatePending = true;
 
-    this.responseCreatePending = true;
+    this.sendOpenAi({
+      type: 'response.create',
+      response: {
+        modalities: ['audio', 'text'],
+        instructions: `Aşağıdaki metni Türkçe olarak doğal telefon konuşması tonunda oku.
+Yalnızca verilen metni söyle.
+Kesinlikle ekleme yapma.
+Kesinlikle açıklama yapma.
+Kesinlikle yeni cümle üretme.
+Kesinlikle hizmet listeleme yapma.
+Metni uzatma.
+Gereksiz duraklama verme.
+Ekstra sessizlik bırakma.
+Hızlı ama anlaşılır konuş.
+Tek seferde kısa ve net söyle.
 
-this.sendOpenAi({
-  type: 'response.create',
-  response: {
-    modalities: ['audio', 'text'],
-    instructions: `Aşağıdaki cümleyi Türkçe olarak aynen söyle, hiçbir ekleme yapma, hiçbir hizmet listeleme yapma, hiçbir açıklama ekleme: "${clean}"`,
-  },
-});
-}
+Metin: "${clean}"`,
+      },
+    });
+  }
+
 
   private logTurnLatency(
     label: string,
@@ -1829,6 +1954,76 @@ export function normalizeTranscriptForAgent(
   }
 
   return text;
+}
+
+
+function shouldDropNonTurkishTranscript(text: string) {
+  const value = String(text || '').trim();
+  if (!value) return true;
+
+  const normalized = normalizeVoiceComparisonText(value);
+  if (!normalized) return true;
+
+  const allowedShortTokens = new Set([
+    'evet',
+    'hayir',
+    'hayır',
+    'tamam',
+    'olur',
+    'lazer',
+    'cilt',
+    'tirnak',
+    'tırnak',
+    'bugun',
+    'bugün',
+    'yarin',
+    'yarın',
+    'alo',
+  ]);
+
+  if (allowedShortTokens.has(normalized)) {
+    return false;
+  }
+
+  if (/\d/.test(normalized)) {
+    return false;
+  }
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (!words.length) return true;
+
+  const turkishHints =
+    /\b(merhaba|selam|alo|evet|hayir|hayır|tamam|olur|lazer|epilasyon|cilt|bakim|bakım|tirnak|tırnak|randevu|rezervasyon|yarin|yarın|bugun|bugün|saat|uc|üç|dort|dört|bes|beş|alti|altı|yedi|sekiz|dokuz|on|ad|soyad|isim|sesim|geliyor|duyuyor|musun|müsün|mu|mü)\b/.test(
+      normalized,
+    );
+
+  if (turkishHints) {
+    return false;
+  }
+
+  const latinOnly = /^[a-z\s]+$/.test(normalized);
+  if (!latinOnly) {
+    return true;
+  }
+
+  const looksLikePersonName =
+    words.length >= 1 &&
+    words.length <= 3 &&
+    words.every((word) => word.length >= 2 && word.length <= 15);
+
+  if (looksLikePersonName) {
+    return false;
+  }
+
+  if (words.length <= 2 && normalized.length <= 12) {
+    return true;
+  }
+
+  if (words.length <= 3 && normalized.length <= 18) {
+    return true;
+  }
+
+  return false;
 }
 
 function isCriticalVoiceState(state?: string | null) {
@@ -2407,6 +2602,44 @@ function ulawToLinear16(uVal: number) {
   let sample = ((mantissa << 3) + 0x84) << exponent;
   sample -= 0x84;
   return sign ? -sample : sample;
+}
+
+
+function looksLikeAppointmentListIntent(text: string) {
+  const normalized = normalizeTurkishForTime(text);
+  if (!normalized) return false;
+
+  return /\b(randevularimi|randevularımı|randevulari|randevuları|aldigim randevular|aldığım randevular|listele|listeler misin|soyler misin|söyler misin|hangi randevum var|hangi randevularim var|hangi randevularım var|randevu saatim|randevu saatlerim)\b/.test(
+    normalized,
+  );
+}
+
+function looksLikePossiblePersonName(text: string) {
+  const normalized = normalizeVoiceComparisonText(text);
+  if (!normalized) return false;
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 3) return false;
+
+  const banned = new Set([
+    'randevu',
+    'rezervasyon',
+    'fiyat',
+    'adres',
+    'bilgi',
+    'lazer',
+    'epilasyon',
+    'bugun',
+    'yarin',
+    'saat',
+    'tamam',
+    'evet',
+    'hayir',
+  ]);
+
+  if (words.some((w) => banned.has(w))) return false;
+
+  return words.every((word) => word.length >= 2 && word.length <= 15);
 }
 
 function serializeTimingExtras(extra: Record<string, unknown>) {

@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { BookingCoreService } from '../booking/booking-core.service';
+import { BookingOrchestratorService } from '../booking/booking-orchestrator.service';
 import { AgentReplyRequest } from '../agent/shared/agent-types';
 import { withAgentChannel } from '../agent/shared/agent-helpers';
 import { KnowledgeService } from '../knowledge/knowledge.service';
@@ -12,7 +13,12 @@ import {
   looksLikeChatbotBookingIntent,
 } from './chatbot-parser';
 
-type ChatState = 'IDLE' | 'COLLECTING_NAME' | 'COLLECTING_SERVICE' | 'COLLECTING_DATETIME' | 'WAITING_CONFIRMATION';
+type ChatState =
+  | 'IDLE'
+  | 'COLLECTING_NAME'
+  | 'COLLECTING_SERVICE'
+  | 'COLLECTING_DATETIME'
+  | 'WAITING_CONFIRMATION';
 
 type ChatSession = {
   key: string;
@@ -31,8 +37,10 @@ type ChatSession = {
 @Injectable()
 export class ChatbotBrainService {
   private readonly sessions = new Map<string, ChatSession>();
+
   constructor(
     private readonly bookingCore: BookingCoreService,
+    private readonly bookingOrchestrator: BookingOrchestratorService,
     private readonly knowledge: KnowledgeService,
   ) {}
 
@@ -40,6 +48,7 @@ export class ChatbotBrainService {
     const normalized = withAgentChannel(payload, 'chat');
     const session = this.getOrInitSession(normalized);
     const rawText = String(normalized.text || '').trim();
+    const lowered = rawText.toLocaleLowerCase('tr-TR');
 
     if (!rawText) {
       return 'Mesajınızı tekrar yazar mısınız?';
@@ -47,50 +56,141 @@ export class ChatbotBrainService {
 
     session.updatedAt = Date.now();
 
-    if (looksLikeChatbotBookingIntent(rawText)) {
-      session.mode = 'BOOKING';
+    // Kullanıcı sessizce genel moda dönebilir
+    if (this.isExitIntent(lowered)) {
+      this.resetSession(session, false);
+      return this.knowledge.answer({
+        ...normalized,
+        text: 'güzellik merkezi hizmetleri hakkında bilgi ver',
+      });
     }
 
-    if (session.mode !== 'BOOKING') {
-      return this.knowledge.answer(payload);
+    // Her mesajda SADECE mesaj içinden adayları çıkar
+    const serviceCandidate = await this.findServiceMatch(
+      session.tenantId,
+      rawText,
+    );
+    const hasServiceInMessage = Boolean(serviceCandidate);
+
+    const dateTimeCandidate = extractChatbotDateTimeText(rawText);
+    const hasDateTimeInMessage = Boolean(dateTimeCandidate);
+
+    const explicitBookingIntent = looksLikeChatbotBookingIntent(rawText);
+    const beautyQuestion = this.isBeautyInfoQuestion(lowered);
+
+    // Booking içindeyken beauty sorusu geldiyse draftı koru, sadece cevap ver
+    if (
+      session.mode === 'BOOKING' &&
+      beautyQuestion &&
+      !explicitBookingIntent &&
+      !hasDateTimeInMessage
+    ) {
+      return this.knowledge.answer(normalized);
     }
 
+    // Auto booking:
+    // 1) açık booking intent
+    // 2) aynı mesajda hizmet + tarih/saat
+// booking başlatıldıysa ASLA düşme
+
+if (
+  explicitBookingIntent ||
+  (hasServiceInMessage && hasDateTimeInMessage) ||
+  session.mode === 'BOOKING'
+) {
+  session.mode = 'BOOKING';
+}
+
+
+const hasDraft =
+  session.draft.serviceId ||
+  session.draft.dateTimeText ||
+  session.draft.customerName;
+
+if (session.mode !== 'BOOKING' && !hasDraft) {
+  return this.knowledge.answer(normalized);
+}
+    // Mesajdan draft alanlarını doldur
+    await this.tryFillDraft(session, rawText, serviceCandidate, dateTimeCandidate);
+
+    // Confirmation ekranı
     if (session.state === 'WAITING_CONFIRMATION') {
+      if (rawText.length <= 2) {
+        return 'Onay için evet, değiştirmek için hayır yazabilirsiniz.';
+      }
+
       if (isChatbotAffirmative(rawText)) {
         return this.completeBooking(session, normalized);
       }
+
       if (isChatbotNegative(rawText)) {
-        this.resetSession(session, true);
-        session.state = 'COLLECTING_SERVICE';
-        return 'Tamam. Hangi hizmet için randevu istiyorsunuz?';
+        session.state = 'COLLECTING_DATETIME';
+        session.draft.dateTimeText = undefined;
+        return 'Tabii, yeni gün ve saat yazar mısınız?';
       }
+
+      // Confirmation ekranında yeni tarih yazılırsa kabul et
+      const maybeDateTime = extractChatbotDateTimeText(rawText);
+      if (maybeDateTime) {
+        session.draft.dateTimeText = maybeDateTime;
+        return this.buildConfirmationPrompt(session);
+      }
+
+      // Confirmation ekranında service değişirse override et
+      const maybeService = await this.findServiceMatch(session.tenantId, rawText);
+      if (maybeService) {
+        session.draft.serviceId = String(maybeService.id);
+        session.draft.serviceName = String(maybeService.name);
+        return this.buildConfirmationPrompt(session);
+      }
+
       return `${this.buildConfirmationPrompt(session)} Onaylıyorsanız “evet” yazın.`;
     }
+if (
+  session.draft.serviceId &&
+  session.draft.dateTimeText &&
+  session.draft.customerName
+) {
+  session.state = 'WAITING_CONFIRMATION';
+  return this.buildConfirmationPrompt(session);
+}
+    const step = await this.bookingOrchestrator.processStep(session.draft, {
+      tenantId: normalized.tenantId,
+      customerPhone: normalized.from,
+      channel: 'WHATSAPP',
+    });
 
-    await this.tryFillDraft(session, rawText);
-
-    if (!session.draft.customerName) {
-      session.state = 'COLLECTING_NAME';
-      return 'Ad soyadınızı paylaşır mısınız?';
-    }
-
-    if (!session.draft.serviceId || !session.draft.serviceName) {
+    if (step.type === 'ASK_SERVICE') {
       session.state = 'COLLECTING_SERVICE';
       return 'Hangi hizmet için randevu istiyorsunuz?';
     }
 
-    if (!session.draft.dateTimeText) {
+    if (step.type === 'ASK_DATETIME') {
       session.state = 'COLLECTING_DATETIME';
       return 'Hangi gün ve saat uygundur?';
     }
 
-    session.state = 'WAITING_CONFIRMATION';
-    return this.buildConfirmationPrompt(session);
+    if (step.type === 'ASK_NAME') {
+      session.state = 'COLLECTING_NAME';
+      return 'Ad soyadınızı paylaşır mısınız?';
+    }
+
+    if (step.type === 'ASK_CONFIRMATION') {
+      session.state = 'WAITING_CONFIRMATION';
+      return `Özet: ${step.summary}. Onaylıyor musunuz?`;
+    }
+
+    return 'Bilgileri tekrar yazar mısınız?';
   }
 
-  private getOrInitSession(payload: AgentReplyRequest & { from: string }): ChatSession {
-    const customerKey = String(payload.customerPhone || payload.from || 'unknown-chat').trim();
+  private getOrInitSession(
+    payload: AgentReplyRequest & { from: string },
+  ): ChatSession {
+    const customerKey = String(
+      payload.customerPhone || payload.from || 'unknown-chat',
+    ).trim();
     const key = `${payload.tenantId}:${customerKey}`;
+
     const existing = this.sessions.get(key);
     if (existing) {
       return existing;
@@ -104,20 +204,29 @@ export class ChatbotBrainService {
       updatedAt: Date.now(),
       draft: {},
     };
+
     this.sessions.set(key, created);
     return created;
   }
 
-  private async tryFillDraft(session: ChatSession, rawText: string): Promise<void> {
-    if (!session.draft.serviceId) {
-      const service = await this.findServiceMatch(session.tenantId, rawText);
-      if (service) {
-        session.draft.serviceId = String(service.id);
-        session.draft.serviceName = String(service.name);
-      }
+  private async tryFillDraft(
+    session: ChatSession,
+    rawText: string,
+    preMatchedService?: { id: string; name: string } | null,
+    preMatchedDateTime?: string | null,
+  ): Promise<void> {
+    const service =
+      preMatchedService || (await this.findServiceMatch(session.tenantId, rawText));
+
+    if (service) {
+      // Her yeni mesajda service override edilebilir
+      session.draft.serviceId = String(service.id);
+      session.draft.serviceName = String(service.name);
     }
 
-    if (!session.draft.dateTimeText) {
+    if (preMatchedDateTime) {
+      session.draft.dateTimeText = preMatchedDateTime;
+    } else if (!session.draft.dateTimeText) {
       const dateTimeText = extractChatbotDateTimeText(rawText);
       if (dateTimeText) {
         session.draft.dateTimeText = dateTimeText;
@@ -125,7 +234,10 @@ export class ChatbotBrainService {
     }
 
     if (!session.draft.customerName) {
-      const name = extractChatbotCustomerName(rawText, session.draft.serviceName);
+      const name = extractChatbotCustomerName(
+        rawText,
+        session.draft.serviceName,
+      );
       if (name) {
         session.draft.customerName = name;
       }
@@ -136,43 +248,36 @@ export class ChatbotBrainService {
     session: ChatSession,
     payload: AgentReplyRequest & { from: string },
   ): Promise<string> {
-    const startAt = this.bookingCore.parseDateTimeForConversation(session.draft.dateTimeText || '');
-    if (!startAt || !session.draft.customerName || !session.draft.serviceId) {
-      session.state = 'COLLECTING_DATETIME';
-      return 'Tarih ve saati tekrar yazar mısınız?';
-    }
-
-    const result = await this.bookingCore.createBookingFromConversation({
+    const result = await this.bookingOrchestrator.confirmBooking(session.draft, {
       tenantId: payload.tenantId,
       customerPhone: payload.from,
-      customerName: session.draft.customerName,
-      serviceId: session.draft.serviceId,
-      startAt,
       channel: 'WHATSAPP',
     });
 
-    if (result.ok) {
-      const serviceName = session.draft.serviceName || 'hizmet';
+    if (result.type === 'SUCCESS') {
       this.resetSession(session, false);
-      return `Tamamdır, ${serviceName} için randevunuzu oluşturdum.`;
+      return result.message;
     }
 
-    if (result.code === 'OUT_OF_HOURS') {
-      session.state = 'COLLECTING_DATETIME';
-      return 'Bu saat çalışma saatleri dışında. Başka bir gün veya saat yazın.';
+    if (result.type === 'ERROR') {
+      const msg = result.message;
+
+      if (
+        msg.includes('Gün ve saati tekrar') ||
+        msg.includes('çalışma saatleri dışında') ||
+        msg.includes('dolu')
+      ) {
+        session.state = 'COLLECTING_DATETIME';
+      } else if (msg.includes('Ad soyad')) {
+        session.state = 'COLLECTING_NAME';
+      } else if (msg.includes('Hangi hizmet')) {
+        session.state = 'COLLECTING_SERVICE';
+      }
+
+      return msg;
     }
 
-    if (result.code === 'SLOT_TAKEN') {
-      session.state = 'COLLECTING_DATETIME';
-      return 'O saat dolu görünüyor. Başka bir gün veya saat yazın.';
-    }
-
-    if (result.code === 'STAFF_CONFIGURATION_REQUIRED') {
-      session.state = 'COLLECTING_DATETIME';
-      return 'Randevu ayarı tamamlanamadı. Lütfen işletme yöneticisi varsayılan personel tanımlasın.';
-    }
-
-    return 'Randevu oluşturulamadı. Bilgileri tekrar yazabilir misiniz?';
+    return 'Randevu oluşturulamadı. Bilgileri tekrar yazar mısınız?';
   }
 
   private async findServiceMatch(tenantId: string, rawText: string) {
@@ -181,14 +286,31 @@ export class ChatbotBrainService {
   }
 
   private buildConfirmationPrompt(session: ChatSession): string {
-    return `Özet: ${session.draft.customerName || '—'}, ${session.draft.serviceName || '—'}, ${session.draft.dateTimeText || '—'}. Onaylıyor musunuz?`;
+    const customer = session.draft.customerName || '—';
+    const service = session.draft.serviceName || '—';
+    const date = session.draft.dateTimeText || '—';
+    return `Özet: ${customer}, ${service}, ${date}. Onaylıyor musunuz?`;
   }
 
-  private resetSession(session: ChatSession, preserveBookingMode: boolean): void {
+  private resetSession(
+    session: ChatSession,
+    preserveBookingMode: boolean,
+  ): void {
     session.mode = preserveBookingMode ? 'BOOKING' : 'GENERAL';
     session.state = 'IDLE';
     session.updatedAt = Date.now();
     session.draft = {};
   }
 
+  private isExitIntent(text: string): boolean {
+    return /(vazgec|vazgeç|iptal|bosver|boşver|cik|çık|ana menü|menü)/i.test(
+      text,
+    );
+  }
+
+  private isBeautyInfoQuestion(text: string): boolean {
+    return /(fiyat|ucret|ücret|adres|nerede|calisma|çalışma|saat|konum|bilgi|kaç seans|kac seans|can yakar|acıtır|acitir|nasıl yapılır|nasil yapilir|ne kadar sürer|ne kadar surer)/i.test(
+      text,
+    );
+  }
 }

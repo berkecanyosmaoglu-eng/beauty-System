@@ -43,10 +43,7 @@ export class BookingCoreService {
       return null;
     }
 
-    const normalized = text
-      .toLocaleLowerCase('tr-TR')
-      .replace(/yarın/g, 'yarin')
-      .replace(/bugün/g, 'bugun');
+    const normalized = this.normalizeDateText(text);
 
     const now = new Date();
     const baseDate = new Date(now);
@@ -61,18 +58,9 @@ export class BookingCoreService {
       return this.applyClock(baseDate, normalized)?.toISOString() || null;
     }
 
-    const explicitDateMatch = text.match(/(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?/);
-    if (explicitDateMatch) {
-      const day = Number(explicitDateMatch[1]);
-      const month = Number(explicitDateMatch[2]) - 1;
-      const yearRaw = explicitDateMatch[3];
-      const year = yearRaw
-        ? yearRaw.length === 2
-          ? 2000 + Number(yearRaw)
-          : Number(yearRaw)
-        : now.getFullYear();
-      const dated = new Date(year, month, day);
-      return this.applyClock(dated, normalized)?.toISOString() || null;
+    const explicitDate = this.parseExplicitDate(normalized, now);
+    if (explicitDate) {
+      return this.applyClock(explicitDate, normalized)?.toISOString() || null;
     }
 
     const weekdayDate = this.parseWeekdayDate(normalized, now);
@@ -331,6 +319,79 @@ export class BookingCoreService {
     return suggestions;
   }
 
+  private normalizeDateText(text: string): string {
+    return String(text || '')
+      .toLocaleLowerCase('tr-TR')
+      .replace(/yarın/g, 'yarin')
+      .replace(/bugün/g, 'bugun')
+      .replace(/pazartesi/g, 'pazartesi')
+      .replace(/salı/g, 'sali')
+      .replace(/çarşamba/g, 'carsamba')
+      .replace(/perşembe/g, 'persembe')
+      .replace(/cuma/g, 'cuma')
+      .replace(/cumartesi/g, 'cumartesi')
+      .replace(/pazar/g, 'pazar')
+      .replace(/öğlen/g, '14:00')
+      .replace(/ogle/g, '14:00')
+      .replace(/öğleden sonra/g, '15:00')
+      .replace(/aksam/g, '19:00')
+      .replace(/akşam/g, '19:00');
+  }
+
+  private parseExplicitDate(text: string, now: Date): Date | null {
+    const numeric = text.match(/(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?/);
+    if (numeric) {
+      const day = Number(numeric[1]);
+      const month = Number(numeric[2]) - 1;
+      const yearRaw = numeric[3];
+      const year = yearRaw
+        ? yearRaw.length === 2
+          ? 2000 + Number(yearRaw)
+          : Number(yearRaw)
+        : now.getFullYear();
+
+      const dated = new Date(year, month, day);
+      dated.setSeconds(0, 0);
+      return dated;
+    }
+
+    const monthNames: Record<string, number> = {
+      ocak: 0,
+      subat: 1,
+      mart: 2,
+      nisan: 3,
+      mayis: 4,
+      haziran: 5,
+      temmuz: 6,
+      agustos: 7,
+      eylul: 8,
+      ekim: 9,
+      kasim: 10,
+      aralik: 11,
+    };
+
+    const verbal = text.match(
+      /(\d{1,2})\s+(ocak|subat|mart|nisan|mayis|haziran|temmuz|agustos|eylul|ekim|kasim|aralik)(?:\s+(\d{2,4}))?/,
+    );
+
+    if (!verbal) {
+      return null;
+    }
+
+    const day = Number(verbal[1]);
+    const month = monthNames[verbal[2]];
+    const yearRaw = verbal[3];
+    const year = yearRaw
+      ? yearRaw.length === 2
+        ? 2000 + Number(yearRaw)
+        : Number(yearRaw)
+      : now.getFullYear();
+
+    const dated = new Date(year, month, day);
+    dated.setSeconds(0, 0);
+    return dated;
+  }
+
   private parseWeekdayDate(text: string, now: Date): Date | null {
     const weekdays = [
       'pazar',
@@ -341,35 +402,69 @@ export class BookingCoreService {
       'cuma',
       'cumartesi',
     ];
+
     const index = weekdays.findIndex((weekday) => text.includes(weekday));
     if (index < 0) {
       return null;
     }
 
     const candidate = new Date(now);
-    candidate.setDate(now.getDate() + ((index - now.getDay() + 7) % 7 || 7));
+    const diff = (index - now.getDay() + 7) % 7 || 7;
+    candidate.setDate(now.getDate() + diff);
     candidate.setSeconds(0, 0);
+
     return candidate;
   }
+
 
   private applyClock(baseDate: Date, text: string): Date | null {
     const clock = text.match(/(?:saat\s*)?(\d{1,2})[:.](\d{2})/i);
     const half = text.match(/\b(\d{1,2})\s*(bucuk|buçuk)\b/i);
-    const whole = text.match(/\b(?:saat\s*)?(\d{1,2})\b/);
+    const saatWhole = text.match(/\bsaat\s*(\d{1,2})(?:\s*(de|da))?\b/i);
+    const bareWhole = text.match(/\b(\d{1,2})(?:\s*(de|da))\b/i);
 
     const date = new Date(baseDate);
+
     if (clock) {
-      date.setHours(Number(clock[1]), Number(clock[2]), 0, 0);
+      let hour = Number(clock[1]);
+      const minute = Number(clock[2]);
+
+      if (
+        hour >= 1 &&
+        hour <= 7 &&
+        !/\b(sabah|08|09|10|11)\b/i.test(text)
+      ) {
+        hour += 12;
+      }
+
+      date.setHours(hour, minute, 0, 0);
       return date;
     }
 
     if (half) {
-      date.setHours(Number(half[1]), 30, 0, 0);
+      let hour = Number(half[1]);
+      if (hour >= 1 && hour <= 7) {
+        hour += 12;
+      }
+      date.setHours(hour, 30, 0, 0);
       return date;
     }
 
-    if (whole && /\b(icin|için|olur mu|uygun|müsait|musait)\b/.test(text)) {
-      date.setHours(Number(whole[1]), 0, 0, 0);
+    if (saatWhole) {
+      let hour = Number(saatWhole[1]);
+      if (hour >= 1 && hour <= 7) {
+        hour += 12;
+      }
+      date.setHours(hour, 0, 0, 0);
+      return date;
+    }
+
+    if (bareWhole) {
+      let hour = Number(bareWhole[1]);
+      if (hour >= 1 && hour <= 7) {
+        hour += 12;
+      }
+      date.setHours(hour, 0, 0, 0);
       return date;
     }
 

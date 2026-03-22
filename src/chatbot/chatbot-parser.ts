@@ -32,9 +32,11 @@ export function extractChatbotCustomerName(
   serviceName?: string,
 ): string | null {
   const text = String(rawText || '').trim();
+
   const explicit = text.match(
     /\b(?:ben|ad[ıi]m|ismim|ad soyad[ıi]m|adım soyadım)\s+([^,.;:]+)/i,
   )?.[1];
+
   const candidate = cleanupNameCandidate(explicit || '', serviceName);
   if (candidate) {
     return candidate;
@@ -55,6 +57,7 @@ export function extractChatbotCustomerName(
 export function extractChatbotDateTimeText(rawText: string): string | null {
   const text = String(rawText || '').trim();
   const normalized = normalizeChatbotText(text);
+
   if (!normalized) {
     return null;
   }
@@ -63,16 +66,24 @@ export function extractChatbotDateTimeText(rawText: string): string | null {
     /\b(bugun|bugün|yarin|yarın|pazartesi|sali|salı|carsamba|çarşamba|persembe|cuma|cumartesi|pazar)\b/.test(
       normalized,
     );
+
   const hasCalendarDate = /\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/.test(text);
+
   const hasClockTime =
     /\b(?:saat\s*)?\d{1,2}[:.]\d{2}\b/.test(normalized) ||
+    /\bsaat\s*\d{1,2}\b/.test(normalized) ||
     /\b\d{1,2}\b\s*(gibi|bucuk|buçuk)\b/.test(normalized);
 
-  return hasRelativeDay || hasCalendarDate || hasClockTime ? text : null;
+  if (!hasRelativeDay && !hasCalendarDate && !hasClockTime) {
+    return null;
+  }
+
+  return normalizeDateTimeExpression(text);
 }
 
 export function looksLikeChatbotBookingIntent(rawText: string): boolean {
   const normalized = normalizeChatbotText(rawText);
+
   if (
     /\b(randevu|rezervasyon|olusturmak istiyorum|oluşturmak istiyorum|uygun musait|uygun müsait)\b/.test(
       normalized,
@@ -109,10 +120,154 @@ export function normalizeChatbotText(value: string): string {
     .trim();
 }
 
+function normalizeDateTimeExpression(rawValue: string): string {
+  let text = String(rawValue || '').trim();
+  if (!text) {
+    return text;
+  }
+
+  const normalized = normalizeChatbotText(text);
+
+  const context = {
+    saysMorning: /\b(sabah|erken)\b/.test(normalized),
+    saysNoon: /\b(ogle|öğle)\b/.test(normalized),
+    saysAfternoon: /\b(ogleden sonra|öğleden sonra|ikindi)\b/.test(normalized),
+    saysEvening: /\b(aksam|akşam|gece)\b/.test(normalized),
+  };
+
+  const fullClockMatch = normalized.match(/\b(?:saat\s*)?(\d{1,2})[:.](\d{2})\b/);
+  if (fullClockMatch) {
+    const original = fullClockMatch[0];
+    const parsedHour = Number(fullClockMatch[1]);
+    const parsedMinute = Number(fullClockMatch[2]);
+
+    if (
+      Number.isFinite(parsedHour) &&
+      Number.isFinite(parsedMinute) &&
+      parsedHour >= 0 &&
+      parsedHour <= 23 &&
+      parsedMinute >= 0 &&
+      parsedMinute <= 59
+    ) {
+      const normalizedHour = normalizeHourByContext(parsedHour, context);
+      const formatted = `saat ${pad2(normalizedHour)}:${pad2(parsedMinute)}`;
+      return replaceFirstClockExpression(text, original, formatted);
+    }
+  }
+
+  const halfMatch = normalized.match(/\b(?:saat\s*)?(\d{1,2})\s*(bucuk|buçuk)\b/);
+  if (halfMatch) {
+    const original = halfMatch[0];
+    const parsedHour = Number(halfMatch[1]);
+
+    if (Number.isFinite(parsedHour) && parsedHour >= 0 && parsedHour <= 23) {
+      const normalizedHour = normalizeHourByContext(parsedHour, context);
+      const formatted = `saat ${pad2(normalizedHour)}:30`;
+      return replaceFirstClockExpression(text, original, formatted);
+    }
+  }
+
+  const vagueMatch = normalized.match(/\b(?:saat\s*)?(\d{1,2})\s*gibi\b/);
+  if (vagueMatch) {
+    const original = vagueMatch[0];
+    const parsedHour = Number(vagueMatch[1]);
+
+    if (Number.isFinite(parsedHour) && parsedHour >= 0 && parsedHour <= 23) {
+      const normalizedHour = normalizeHourByContext(parsedHour, context);
+      const formatted = `saat ${pad2(normalizedHour)}:00`;
+      return replaceFirstClockExpression(text, original, formatted);
+    }
+  }
+
+  const plainHourMatch = normalized.match(/\bsaat\s*(\d{1,2})\b/);
+  if (plainHourMatch) {
+    const original = plainHourMatch[0];
+    const parsedHour = Number(plainHourMatch[1]);
+
+    if (Number.isFinite(parsedHour) && parsedHour >= 0 && parsedHour <= 23) {
+      const normalizedHour = normalizeHourByContext(parsedHour, context);
+      const formatted = `saat ${pad2(normalizedHour)}:00`;
+      return replaceFirstClockExpression(text, original, formatted);
+    }
+  }
+
+  return text;
+}
+
+function normalizeHourByContext(
+  hour: number,
+  context: {
+    saysMorning: boolean;
+    saysNoon: boolean;
+    saysAfternoon: boolean;
+    saysEvening: boolean;
+  },
+): number {
+  let result = hour;
+
+  if (context.saysMorning) {
+    if (result === 12) {
+      return 0;
+    }
+    return result;
+  }
+
+  if (context.saysNoon) {
+    if (result >= 1 && result <= 4) {
+      return result + 12;
+    }
+    if (result === 12) {
+      return 12;
+    }
+    return result;
+  }
+
+  if (context.saysAfternoon || context.saysEvening) {
+    if (result >= 1 && result <= 11) {
+      return result + 12;
+    }
+    return result;
+  }
+
+  // Türkiye kullanımında randevu bağlamında:
+  // 1-7 arası çoğunlukla öğleden sonra/akşam kastedilir.
+  if (result >= 1 && result <= 7) {
+    return result + 12;
+  }
+
+  return result;
+}
+
+function replaceFirstClockExpression(
+  originalText: string,
+  matchedNormalized: string,
+  replacement: string,
+): string {
+  const source = String(originalText || '');
+  const escaped = escapeRegExp(matchedNormalized)
+    .replace(/\\ /g, '\\s+')
+    .replace(/c/g, '[cç]')
+    .replace(/i/g, '[iıİI]')
+    .replace(/o/g, '[oö]')
+    .replace(/u/g, '[uü]')
+    .replace(/s/g, '[sş]')
+    .replace(/g/g, '[gğ]');
+
+  const regex = new RegExp(escaped, 'i');
+  if (regex.test(source)) {
+    return source.replace(regex, replacement);
+  }
+
+  return source;
+}
+
 function cleanupNameCandidate(rawValue: string, serviceName?: string): string | null {
   const text = String(rawValue || '')
     .replace(/\b(randevu|rezervasyon|yarin|yarın|bugun|bugün|icin|için)\b.*$/i, '')
-    .replace(/\b(saat\s*\d{1,2}[:.]\d{2}|\d{1,2}\s*(gibi|bucuk|buçuk))\b.*$/i, '')
+    .replace(
+      /\b(saat\s*\d{1,2}(?::|\.)?\d{0,2}|\d{1,2}\s*(gibi|bucuk|buçuk))\b.*$/i,
+      '',
+    )
     .trim();
 
   const parts = text
@@ -146,4 +301,12 @@ function toTitleCase(value: string): string {
         part.slice(1).toLocaleLowerCase('tr-TR'),
     )
     .join(' ');
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+function escapeRegExp(value: string): string {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
