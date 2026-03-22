@@ -66,6 +66,10 @@ export class BookingOrchestratorService {
     const startAt = this.bookingCore.parseDateTimeForConversation(
       draft.dateTimeText || '',
     );
+    const serviceDuration = await this.getServiceDuration(
+      payload.tenantId,
+      draft.serviceId,
+    );
 
     if (!draft.serviceId || !draft.serviceName) {
       return {
@@ -121,7 +125,12 @@ export class BookingOrchestratorService {
     if (result.code === 'OUT_OF_HOURS') {
       return {
         type: 'ERROR',
-        message: this.buildOutOfHoursMessage(payload.channel, result.suggestions),
+        message: this.buildOutOfHoursMessage(
+          payload.channel,
+          startAt,
+          serviceDuration,
+          result.suggestions,
+        ),
       };
     }
 
@@ -174,22 +183,92 @@ export class BookingOrchestratorService {
       .trim();
   }
 
+
+  private async getServiceDuration(
+    tenantId: string,
+    serviceId?: string,
+  ): Promise<number | null> {
+    if (!serviceId) {
+      return null;
+    }
+
+    const services = await this.bookingCore.listServicesForConversation(tenantId);
+    const service = services.find((item) => item.id === serviceId);
+    return typeof service?.duration === 'number' ? service.duration : null;
+  }
+
   private buildOutOfHoursMessage(
     channel: 'WHATSAPP' | 'VOICE',
+    requestedStartAt?: string | null,
+    serviceDuration?: number | null,
     suggestions?: BookingSlotSuggestion[],
   ): string {
+    const requestedLabel = requestedStartAt
+      ? this.formatTime(requestedStartAt)
+      : null;
+    const latestValidLabel = this.findLatestValidSuggestion(
+      requestedStartAt,
+      serviceDuration,
+      suggestions,
+    );
     const suggestionText = this.formatSuggestions(suggestions);
+
+    if (requestedLabel && latestValidLabel) {
+      return channel === 'VOICE'
+        ? `${requestedLabel} bu hizmet için geç bir başlangıç saati oluyor. En yakın uygun saat ${latestValidLabel}. İsterseniz o saate alabilirim.`
+        : `${requestedLabel} bu hizmet için geç bir başlangıç saati oluyor. En yakın uygun saat ${latestValidLabel}. İstersen o saate alabilirim.`;
+    }
 
     if (suggestionText) {
       return channel === 'VOICE'
-        ? `Bu saat çalışma saatleri dışında. Size en yakın uygun saatler: ${suggestionText}.`
-        : `Bu saat çalışma saatleri dışında görünüyor. En yakın uygun saatler: ${suggestionText}.`;
+        ? `Bu saat çalışma saatleri dışında kalıyor. Size en yakın uygun saatler: ${suggestionText}.`
+        : `Bu saat çalışma saatleri dışında kalıyor. En yakın uygun saatler: ${suggestionText}.`;
     }
 
     return channel === 'VOICE'
-      ? 'Bu saat çalışma saatleri dışında. Başka gün veya saat söyleyebilir misiniz?'
-      : 'Bu saat çalışma saatleri dışında görünüyor. Başka bir gün veya saat yazar mısınız?';
+      ? 'Bu saat çalışma saatleri dışında kalıyor. Başka gün veya saat söyleyebilir misiniz?'
+      : 'Bu saat çalışma saatleri dışında kalıyor. Başka bir gün veya saat yazar mısınız?';
   }
+
+  private findLatestValidSuggestion(
+    requestedStartAt?: string | null,
+    serviceDuration?: number | null,
+    suggestions?: BookingSlotSuggestion[],
+  ): string | null {
+    if (!requestedStartAt || !serviceDuration || !suggestions?.length) {
+      return null;
+    }
+
+    const requested = new Date(requestedStartAt);
+    if (Number.isNaN(requested.getTime())) {
+      return null;
+    }
+
+    const candidate = suggestions.find((slot) => {
+      const suggestedStart = new Date(slot.startAt);
+      const suggestedEnd = new Date(slot.endAt);
+
+      if (Number.isNaN(suggestedStart.getTime()) || Number.isNaN(suggestedEnd.getTime())) {
+        return false;
+      }
+
+      const closingTime = suggestedEnd.getTime();
+      const latestValidStart = new Date(closingTime - serviceDuration * 60_000);
+
+      return latestValidStart <= requested;
+    });
+
+    if (!candidate) {
+      return null;
+    }
+
+    const latestValidStart = new Date(
+      new Date(candidate.endAt).getTime() - serviceDuration * 60_000,
+    );
+
+    return this.formatTime(latestValidStart.toISOString());
+  }
+
 
   private buildSlotTakenMessage(
     channel: 'WHATSAPP' | 'VOICE',
@@ -206,6 +285,20 @@ export class BookingOrchestratorService {
     return channel === 'VOICE'
       ? 'O saat dolu görünüyor. Başka gün veya saat söyleyebilir misiniz?'
       : 'O saat dolu görünüyor. Başka bir gün veya saat yazar mısınız?';
+  }
+
+  private formatTime(iso: string): string | null {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) {
+      return null;
+    }
+
+    return new Intl.DateTimeFormat('tr-TR', {
+      timeZone: 'Europe/Istanbul',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(date);
   }
 
   private formatSuggestions(
