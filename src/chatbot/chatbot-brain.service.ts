@@ -5,6 +5,8 @@ import { AgentReplyRequest } from '../agent/shared/agent-types';
 import { withAgentChannel } from '../agent/shared/agent-helpers';
 import { KnowledgeService } from '../knowledge/knowledge.service';
 import {
+  containsDay,
+  containsTime,
   extractChatbotCustomerName,
   extractChatbotDateTimeText,
   findChatbotServiceMatch,
@@ -132,7 +134,12 @@ if (session.mode !== 'BOOKING' && !hasDraft) {
       // Confirmation ekranında yeni tarih yazılırsa kabul et
       const maybeDateTime = extractChatbotDateTimeText(rawText);
       if (maybeDateTime) {
-        session.draft.dateTimeText = maybeDateTime;
+        const currentDateTimeText = session.draft.dateTimeText;
+
+        session.draft.dateTimeText = currentDateTimeText
+          ? this.mergeDateTimeText(currentDateTimeText, maybeDateTime)
+          : maybeDateTime;
+
         return this.buildConfirmationPrompt(session);
       }
 
@@ -225,7 +232,10 @@ if (
     }
 
     if (preMatchedDateTime) {
-      session.draft.dateTimeText = preMatchedDateTime;
+      session.draft.dateTimeText = this.mergeDateTimeText(
+        session.draft.dateTimeText,
+        preMatchedDateTime,
+      );
     } else if (!session.draft.dateTimeText) {
       const dateTimeText = extractChatbotDateTimeText(rawText);
       if (dateTimeText) {
@@ -242,6 +252,57 @@ if (
         session.draft.customerName = name;
       }
     }
+  }
+
+  private mergeDateTimeText(
+    currentValue: string | undefined,
+    nextValue: string,
+  ): string {
+    const nextHasDay = containsDay(nextValue);
+    const nextHasTime = containsTime(nextValue);
+
+    if (nextHasDay && nextHasTime) {
+      return nextValue;
+    }
+
+    const current = String(currentValue || '').trim();
+    if (!current) {
+      return nextValue;
+    }
+
+    const currentHasDay = containsDay(current);
+    const currentHasTime = containsTime(current);
+
+    if (nextHasTime && !nextHasDay && currentHasDay) {
+      return `${this.extractDayPart(current)} ${this.extractTimePart(nextValue)}`.trim();
+    }
+
+    if (nextHasDay && !nextHasTime && currentHasTime) {
+      return `${this.extractDayPart(nextValue)} ${this.extractTimePart(current)}`.trim();
+    }
+
+    if (!nextHasDay && !nextHasTime) {
+      return current;
+    }
+
+    return nextValue;
+  }
+
+  private extractDayPart(value: string): string {
+    return String(value || '')
+      .replace(/\b(?:saat\s*)?\d{1,2}[:.]\d{2}\b/gi, ' ')
+      .replace(/\b(?:saat\s*)?\d{1,2}\s*(?:bucuk|buçuk|gibi)\b/gi, ' ')
+      .replace(/\bsaat\s*\d{1,2}\b/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private extractTimePart(value: string): string {
+    const match = String(value || '').match(
+      /\b(?:saat\s*)?\d{1,2}[:.]\d{2}\b|\b(?:saat\s*)?\d{1,2}\s*(?:bucuk|buçuk|gibi)\b|\bsaat\s*\d{1,2}\b/i,
+    );
+
+    return match ? match[0].trim() : '';
   }
 
   private async completeBooking(
