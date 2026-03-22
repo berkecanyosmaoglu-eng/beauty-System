@@ -80,38 +80,34 @@ export class ChatbotBrainService {
     const explicitBookingIntent = looksLikeChatbotBookingIntent(rawText);
     const beautyQuestion = this.isBeautyInfoQuestion(lowered);
 
-    // Booking içindeyken beauty sorusu geldiyse draftı koru, sadece cevap ver
-    if (
-      session.mode === 'BOOKING' &&
-      beautyQuestion &&
-      !explicitBookingIntent &&
-      !hasDateTimeInMessage
-    ) {
-      return this.knowledge.answer(normalized);
-    }
+    const hasDraft = Boolean(
+      session.draft.serviceId ||
+      session.draft.dateTimeText ||
+      session.draft.customerName,
+    );
+    const bookingLocked =
+      session.mode === 'BOOKING' ||
+      Boolean(session.draft.serviceId || session.draft.dateTimeText);
 
     // Auto booking:
     // 1) açık booking intent
     // 2) aynı mesajda hizmet + tarih/saat
-// booking başlatıldıysa ASLA düşme
+    // 3) booking başladıysa asla genel moda düşme
+    if (
+      explicitBookingIntent ||
+      (hasServiceInMessage && hasDateTimeInMessage) ||
+      bookingLocked
+    ) {
+      session.mode = 'BOOKING';
+    }
 
-if (
-  explicitBookingIntent ||
-  (hasServiceInMessage && hasDateTimeInMessage) ||
-  session.mode === 'BOOKING'
-) {
-  session.mode = 'BOOKING';
-}
+    if (!bookingLocked && beautyQuestion && !explicitBookingIntent && !hasDateTimeInMessage) {
+      return this.knowledge.answer(normalized);
+    }
 
-
-const hasDraft =
-  session.draft.serviceId ||
-  session.draft.dateTimeText ||
-  session.draft.customerName;
-
-if (session.mode !== 'BOOKING' && !hasDraft) {
-  return this.knowledge.answer(normalized);
-}
+    if (session.mode !== 'BOOKING' && !hasDraft) {
+      return this.knowledge.answer(normalized);
+    }
     // Mesajdan draft alanlarını doldur
     await this.tryFillDraft(session, rawText, serviceCandidate, dateTimeCandidate);
 
