@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import {
   BookingCoreService,
 } from './booking-core.service';
@@ -21,6 +21,8 @@ export type BookingStepResult =
 
 @Injectable()
 export class BookingOrchestratorService {
+  private readonly logger = new Logger(BookingOrchestratorService.name);
+
   constructor(private readonly bookingCore: BookingCoreService) {}
 
   async processStep(
@@ -71,6 +73,10 @@ export class BookingOrchestratorService {
       draft.serviceId,
     );
 
+    this.logger.log(
+      `[booking:confirmBooking:start] tenantId=${payload.tenantId} serviceId=${draft.serviceId || ''} serviceName=${draft.serviceName || ''} rawDateTimeText=${draft.dateTimeText || ''} parsedStartAt=${startAt || ''} channel=${payload.channel}`,
+    );
+
     if (!draft.serviceId || !draft.serviceName) {
       return {
         type: 'ERROR',
@@ -113,6 +119,9 @@ export class BookingOrchestratorService {
     });
 
     if (result.ok) {
+      this.logger.log(
+        `[booking:confirmBooking:success] tenantId=${payload.tenantId} serviceId=${draft.serviceId} staffId=${result.staffId} appointmentId=${result.appointmentId}`,
+      );
       return {
         type: 'SUCCESS',
         message:
@@ -123,6 +132,9 @@ export class BookingOrchestratorService {
     }
 
     if (result.code === 'OUT_OF_HOURS') {
+      this.logger.warn(
+        `[booking:confirmBooking:fail] kind=out_of_hours tenantId=${payload.tenantId} serviceId=${draft.serviceId} code=${result.code} suggestions=${result.suggestions?.length || 0} assignedStaffId=unknown`,
+      );
       return {
         type: 'ERROR',
         message: this.buildOutOfHoursMessage(
@@ -135,6 +147,9 @@ export class BookingOrchestratorService {
     }
 
     if (result.code === 'SLOT_TAKEN') {
+      this.logger.warn(
+        `[booking:confirmBooking:fail] kind=slot_taken tenantId=${payload.tenantId} serviceId=${draft.serviceId} code=${result.code} suggestions=${result.suggestions?.length || 0} assignedStaffId=unknown`,
+      );
       return {
         type: 'ERROR',
         message: this.buildSlotTakenMessage(payload.channel, result.suggestions),
@@ -142,6 +157,9 @@ export class BookingOrchestratorService {
     }
 
     if (result.code === 'STAFF_CONFIGURATION_REQUIRED') {
+      this.logger.warn(
+        `[booking:confirmBooking:fail] kind=no_staff tenantId=${payload.tenantId} serviceId=${draft.serviceId} code=${result.code} suggestions=${result.suggestions?.length || 0} assignedStaffId=unknown`,
+      );
       return {
         type: 'ERROR',
         message:
@@ -150,6 +168,10 @@ export class BookingOrchestratorService {
             : 'Randevu ayarı tamamlanamadı. Lütfen işletme yöneticisi varsayılan personel tanımlasın.',
       };
     }
+
+    this.logger.warn(
+      `[booking:confirmBooking:fail] kind=other tenantId=${payload.tenantId} serviceId=${draft.serviceId} code=${result.code} suggestions=${result.suggestions?.length || 0} assignedStaffId=unknown`,
+    );
 
     return {
       type: 'ERROR',

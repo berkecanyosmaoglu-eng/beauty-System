@@ -332,6 +332,7 @@ export class WhatsappService {
     const from = this.normalizeWa(input.from);
     const to = this.normalizeWa(input.to);
     const text = String(input.text || '').trim();
+    const correlationId = crypto.randomUUID();
 
     if (!tenantId)
       return this.replyTextOnly(
@@ -346,7 +347,7 @@ export class WhatsappService {
     }
 
     this.logger.log(
-      `📩 WA inbound tenantId=${tenantId} from=${from} to=${to} text="${text.slice(0, 200)}"`,
+      `📩 WA inbound correlationId=${correlationId} tenantId=${tenantId} from=${from} to=${to} text="${text.slice(0, 200)}"`,
     );
 
     void this.waLogSafe({
@@ -357,10 +358,15 @@ export class WhatsappService {
       text,
       raw: input.raw,
       tag: 'WA_IN',
+      extra: { correlationId },
     });
 
     try {
       const reply = await this.agent.replyText({ tenantId, from, text });
+
+      this.logger.log(
+        `📤 WA outbound correlationId=${correlationId} tenantId=${tenantId} from=${to} to=${from} inboundText="${text.slice(0, 120)}" reply="${String(reply || '').slice(0, 200)}"`,
+      );
 
       void this.waLogSafe({
         tenantId,
@@ -369,11 +375,12 @@ export class WhatsappService {
         to: from,
         text: reply,
         tag: 'WA_OUT_REPLY',
+        extra: { correlationId, inboundText: text },
       });
 
       return this.replyTextOnly(reply);
     } catch (e: any) {
-      this.logger.error(`Agent replyText failed: ${e?.message || e}`);
+      this.logger.error(`Agent replyText failed correlationId=${correlationId}: ${e?.message || e}`);
 
       void this.waLogSafe({
         tenantId,
@@ -382,7 +389,7 @@ export class WhatsappService {
         to: from,
         text: 'Şu an bir hata oluştu 😕 Lütfen tekrar dener misin?',
         tag: 'WA_ERR_AGENT',
-        extra: { error: String(e?.message || e) },
+        extra: { correlationId, inboundText: text, error: String(e?.message || e) },
       });
 
       return this.replyTextOnly(
@@ -440,6 +447,10 @@ export class WhatsappService {
     try {
       // ✅ Prefer META if configured (reminders için doğru olan bu)
       if (this.metaEnabled()) {
+        this.logger.log(
+          `WA proactive send start correlationId=${notif.id} tenantId=${tenantId} provider=meta to=${toE164} appointmentId=${params.appointmentId || ''}`,
+        );
+
         const metaRes = await this.metaSendText({
           tenantId,
           toPhone: toE164,
@@ -454,15 +465,25 @@ export class WhatsappService {
 
         // messageId yoksa sent sayma!
         if (!metaRes.ok) {
+          this.logger.warn(
+            `WA proactive send fail correlationId=${notif.id} provider=meta status=${metaRes.status} appointmentId=${params.appointmentId || ''} to=${toE164} messageId=${metaRes.messageId || ''}`,
+          );
           throw new Error(
             `META send failed: status=${metaRes.status} data=${this.safeOneLine(metaRes.data)}`,
           );
         }
         if (!metaRes.messageId) {
+          this.logger.warn(
+            `WA proactive send missing-message-id correlationId=${notif.id} provider=meta status=${metaRes.status} appointmentId=${params.appointmentId || ''} to=${toE164}`,
+          );
           throw new Error(
             `META send returned ok but missing messageId: data=${this.safeOneLine(metaRes.data)}`,
           );
         }
+
+        this.logger.log(
+          `WA proactive send success correlationId=${notif.id} provider=meta status=${metaRes.status} appointmentId=${params.appointmentId || ''} to=${toE164} messageId=${metaRes.messageId}`,
+        );
 
         await this.prisma.notifications.update({
           where: { id: notif.id },
@@ -501,6 +522,10 @@ export class WhatsappService {
       }
 
       // fallback: Twilio WhatsApp
+      this.logger.log(
+        `WA proactive send start correlationId=${notif.id} tenantId=${tenantId} provider=twilio to=${toE164} appointmentId=${params.appointmentId || ''}`,
+      );
+
       const client = await this.getTwilioClient();
       const fromTw = this.getWhatsappFrom();
       const toTw = this.normalizeToWhatsapp(toE164);
@@ -510,6 +535,10 @@ export class WhatsappService {
         to: toTw,
         body,
       });
+
+      this.logger.log(
+        `WA proactive send success correlationId=${notif.id} provider=twilio appointmentId=${params.appointmentId || ''} to=${toE164} messageId=${String(twilioRes?.sid || '')}`,
+      );
 
       await this.prisma.notifications.update({
         where: { id: notif.id },
@@ -545,7 +574,7 @@ export class WhatsappService {
 
       return twilioRes;
     } catch (e: any) {
-      this.logger.error(`sendProactiveWhatsApp failed: ${e?.message || e}`);
+      this.logger.error(`sendProactiveWhatsApp failed correlationId=${notif.id}: ${e?.message || e}`);
 
       void this.waLogSafe({
         tenantId,
@@ -555,7 +584,7 @@ export class WhatsappService {
         text: body,
         tag: 'WA_ERR_SEND',
         appointmentId: params.appointmentId || null,
-        extra: { error: String(e?.message || e) },
+        extra: { correlationId: notif.id, error: String(e?.message || e) },
       });
 
       try {

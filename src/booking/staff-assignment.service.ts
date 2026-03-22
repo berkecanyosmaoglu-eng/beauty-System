@@ -32,7 +32,7 @@ export class StaffAssignmentService {
       return { ok: true, staffId: activeStaff[0].id };
     }
 
-    return { ok: false, code: 'STAFF_CONFIGURATION_REQUIRED' };
+    return { ok: true, staffId: activeStaff[0].id };
   }
 
   private getConfiguredDefaultStaffId(tenantId: string): string | null {

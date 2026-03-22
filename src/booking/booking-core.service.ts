@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import {
@@ -24,6 +24,8 @@ type ServiceRecord = {
 
 @Injectable()
 export class BookingCoreService {
+  private readonly logger = new Logger(BookingCoreService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly staffAssignment: StaffAssignmentService,
@@ -74,6 +76,10 @@ export class BookingCoreService {
   async createBookingFromConversation(
     input: ConversationBookingRequest,
   ): Promise<ConversationBookingResult> {
+    this.logger.log(
+      `[booking:createBookingFromConversation:start] tenantId=${input.tenantId} serviceId=${input.serviceId} startAt=${input.startAt} channel=${input.channel}`,
+    );
+
     const result = await this.createBooking({
       tenantId: input.tenantId,
       customerPhone: input.customerPhone,
@@ -86,16 +92,29 @@ export class BookingCoreService {
     });
 
     if (result.ok) {
+      this.logger.log(
+        `[booking:createBookingFromConversation:success] tenantId=${input.tenantId} serviceId=${input.serviceId} staffId=${result.staffId} appointmentId=${result.appointmentId}`,
+      );
       return result;
     }
 
     if (result.code === 'OUTSIDE_WORKING_HOURS') {
+      this.logger.warn(
+        `[booking:createBookingFromConversation:fail] kind=out_of_hours tenantId=${input.tenantId} serviceId=${input.serviceId} code=${result.code} suggestions=${result.suggestions?.length || 0}`,
+      );
       return { ok: false, code: 'OUT_OF_HOURS', suggestions: result.suggestions };
     }
 
     if (result.code === 'SLOT_CONFLICT') {
+      this.logger.warn(
+        `[booking:createBookingFromConversation:fail] kind=slot_taken tenantId=${input.tenantId} serviceId=${input.serviceId} code=${result.code} suggestions=${result.suggestions?.length || 0}`,
+      );
       return { ok: false, code: 'SLOT_TAKEN', suggestions: result.suggestions };
     }
+
+    this.logger.warn(
+      `[booking:createBookingFromConversation:fail] kind=other tenantId=${input.tenantId} serviceId=${input.serviceId} code=${result.code} suggestions=${result.suggestions?.length || 0}`,
+    );
 
     return {
       ok: false,
@@ -129,16 +148,26 @@ export class BookingCoreService {
     }
 
     const window = await this.getWorkingWindow(request.tenantId);
+    this.logger.log(
+      `[booking:createBooking:working-hours] tenantId=${request.tenantId} serviceId=${request.serviceId} workingHoursStart=${this.toTimeString(window.startMinutes)} workingHoursEnd=${this.toTimeString(window.endMinutes)} workingDays=${Array.from(window.workingDays).join(',')} timezone=${window.timezone} serviceDuration=${service.duration}`,
+    );
     if (!this.isInsideWorkingHours(startAt, service, window)) {
+      const suggestions = this.buildSuggestions(startAt, service.duration, window);
+      this.logger.warn(
+        `[booking:createBooking:fail] kind=out_of_hours tenantId=${request.tenantId} serviceId=${request.serviceId} code=OUTSIDE_WORKING_HOURS suggestions=${suggestions.length} assignedStaffId=none`,
+      );
       return {
         ok: false,
         code: 'OUTSIDE_WORKING_HOURS',
-        suggestions: this.buildSuggestions(startAt, service.duration, window),
+        suggestions,
       };
     }
 
     const assignedStaff = await this.staffAssignment.resolveStaffId(request.tenantId);
     if (!assignedStaff.ok) {
+      this.logger.warn(
+        `[booking:createBooking:fail] kind=no_staff tenantId=${request.tenantId} serviceId=${request.serviceId} code=${assignedStaff.code} suggestions=0 assignedStaffId=none`,
+      );
       return { ok: false, code: assignedStaff.code };
     }
 
@@ -201,6 +230,10 @@ export class BookingCoreService {
         select: { id: true },
       });
 
+      this.logger.log(
+        `[booking:createBooking:success] tenantId=${request.tenantId} serviceId=${request.serviceId} appointmentId=${appointment.id} staffId=${assignedStaff.staffId} startAt=${startAt.toISOString()}`,
+      );
+
       return {
         ok: true,
         appointmentId: appointment.id,
@@ -211,13 +244,21 @@ export class BookingCoreService {
       };
     } catch (error: any) {
       if (!this.isUniqueConflict(error)) {
+        this.logger.error(
+          `[booking:createBooking:error] tenantId=${request.tenantId} serviceId=${request.serviceId} assignedStaffId=${assignedStaff.staffId} message=${error?.message || error}`,
+        );
         throw error;
       }
+
+      const suggestions = this.buildSuggestions(startAt, service.duration, window);
+      this.logger.warn(
+        `[booking:createBooking:fail] kind=slot_taken tenantId=${request.tenantId} serviceId=${request.serviceId} code=SLOT_CONFLICT suggestions=${suggestions.length} assignedStaffId=${assignedStaff.staffId}`,
+      );
 
       return {
         ok: false,
         code: 'SLOT_CONFLICT',
-        suggestions: this.buildSuggestions(startAt, service.duration, window),
+        suggestions,
       };
     }
   }
