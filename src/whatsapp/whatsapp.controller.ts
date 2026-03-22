@@ -98,7 +98,13 @@ export class WhatsappController {
   private async sendMetaText(toWaIdOrMsisdn: string, text: string, phoneNumberId?: string): Promise<boolean> {
     const token = String(process.env.META_WA_TOKEN || '').trim();
     const version = String(process.env.META_WA_VERSION || 'v25.0').trim();
+    const pniSource = phoneNumberId ? 'param' : 'env';
     const pni = String(phoneNumberId || process.env.META_WA_PHONE_NUMBER_ID || '').trim();
+
+    const url = `https://graph.facebook.com/${version}/${pni}/messages`;
+    this.logger.log(
+      `META send debug sendMetaText_start url=${url} version=${version} phoneNumberIdSource=${pniSource} pni=${pni} to=${toWaIdOrMsisdn} textLength=${String(text || '').length}`,
+    );
 
     if (!token || !pni) {
       this.logger.error(
@@ -107,7 +113,6 @@ export class WhatsappController {
       return false;
     }
 
-    const url = `https://graph.facebook.com/${version}/${pni}/messages`;
     const payload = {
       messaging_product: 'whatsapp',
       to: String(toWaIdOrMsisdn),
@@ -143,7 +148,9 @@ export class WhatsappController {
           return false;
         }
 
-        this.logger.error(`META send fetch_exception to=${toWaIdOrMsisdn} attempt=${attempt} error=${e?.message || e}`);
+        this.logger.error(
+          `META send debug fetch_exception to=${toWaIdOrMsisdn} attempt=${attempt} name=${e?.name || ''} message=${e?.message || e} code=${e?.code || ''} cause=${String(e?.cause || '')} causeCode=${e?.cause?.code || ''} causeErrno=${e?.cause?.errno || ''} causeSyscall=${e?.cause?.syscall || ''}`,
+        );
       } finally {
         clearTimeout(timeout);
       }
